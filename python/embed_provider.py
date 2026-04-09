@@ -44,9 +44,13 @@ class SentenceTransformerBackend:
         # Detect best device
         if torch.cuda.is_available():
             device = 'cuda'
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
-            print(f"[embed] CUDA: {gpu_name} ({gpu_mem:.1f} GB)")
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+                props = torch.cuda.get_device_properties(0)
+                gpu_mem = getattr(props, 'total_mem', None) or getattr(props, 'total_global_memory', 0) / 1024**3
+                print(f"[embed] CUDA: {gpu_name} ({gpu_mem:.1f} GB)")
+            except Exception:
+                print(f"[embed] CUDA: {torch.cuda.get_device_name(0)}")
         else:
             device = 'cpu'
             print(f"[embed] CPU only (no CUDA detected)")
