@@ -62,22 +62,32 @@ echo "  $NEURAL_DIR: OK"
 
 # 4. Install Hermes plugin
 echo ""
-echo "[4/5] Installing Hermes plugin..."
+echo "[4/6] Installing Hermes plugin..."
 mkdir -p "$PLUGIN_DIR"
 
 # Copy plugin files
-cp "$PROJECT_DIR/python/memory_client.py" "$PLUGIN_DIR/"
-cp "$PROJECT_DIR/python/embed_provider.py" "$PLUGIN_DIR/"
-cp "$PROJECT_DIR/python/mssql_store.py" "$PLUGIN_DIR/" 2>/dev/null || true
+cp "$PROJECT_DIR/hermes-plugin/__init__.py" "$PLUGIN_DIR/"
+cp "$PROJECT_DIR/hermes-plugin/config.py" "$PLUGIN_DIR/"
+cp "$PROJECT_DIR/hermes-plugin/plugin.yaml" "$PLUGIN_DIR/"
+cp "$PROJECT_DIR/hermes-plugin/memory_client.py" "$PLUGIN_DIR/"
+cp "$PROJECT_DIR/hermes-plugin/embed_provider.py" "$PLUGIN_DIR/"
 
-# Copy plugin __init__.py if not already there
-if [ ! -f "$PLUGIN_DIR/__init__.py" ]; then
-    echo "  ERROR: __init__.py missing - plugin files corrupted"
-    exit 1
-fi
+# Install .pth for banner monkey-patch (runs before banner display)
+SITE_PKG=$(python3 -c "import site; print(site.getsitepackages()[0])")
+cp "$PROJECT_DIR/hermes-plugin/neural_memory_banner.pth" "$SITE_PKG/"
+echo "  Banner patch: $SITE_PKG/neural_memory_banner.pth"
+
 echo "  Plugin files: OK"
 
-# 5. Update Hermes config
+# 5. Install skin
+echo ""
+echo "[5/6] Installing neural skin..."
+SKINS_DIR="$HERMES_DIR/skins"
+mkdir -p "$SKINS_DIR"
+cp "$PROJECT_DIR/hermes-plugin/neural_skin.yaml" "$SKINS_DIR/neural.yaml"
+echo "  Skin: $SKINS_DIR/neural.yaml"
+
+# 6. Update Hermes config
 echo ""
 echo "[5/5] Updating Hermes config..."
 CONFIG="$HERMES_DIR/config.yaml"

@@ -1,0 +1,9 @@
+name: neural
+version: 1.0.0
+description: "Neural Memory — semantic memory with knowledge graph, spreading activation, and embedding-based recall via neural-memory-adapter."
+pip_dependencies:
+  - sentence-transformers
+  - numpy
+hooks:
+  - on_session_end
+  - on_memory_write
