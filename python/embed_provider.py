@@ -56,9 +56,11 @@ class SentenceTransformerBackend:
             print(f"[embed] CPU only (no CUDA detected)")
         
         cached_model_dir = MODEL_DIR / f"models--sentence-transformers--{self.MODEL_NAME}"
-        is_first_download = not cached_model_dir.exists()
+        is_cached = cached_model_dir.exists()
         
-        if is_first_download:
+        if is_cached:
+            print(f"[embed] Loading {self.MODEL_NAME} from local cache...")
+        else:
             print(f"[embed] Downloading {self.MODEL_NAME} (~80MB) to {MODEL_DIR}...")
             print("This only happens once. Please wait...", flush=True)
         
@@ -66,13 +68,14 @@ class SentenceTransformerBackend:
             self.model = SentenceTransformer(
                 self.MODEL_NAME,
                 cache_folder=str(MODEL_DIR),
-                device=device
+                device=device,
+                local_files_only=is_cached
             )
             self.dim = 384
             SentenceTransformerBackend._shared_model = self.model
             SentenceTransformerBackend._shared_dim = self.dim
             
-            if is_first_download:
+            if not is_cached:
                 print(f"[embed] Model cached successfully!", flush=True)
             
             print(f"[embed] {self.MODEL_NAME} ready on {device}")
