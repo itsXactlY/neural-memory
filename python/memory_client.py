@@ -218,12 +218,39 @@ class NeuralMemory:
                 other = c['target'] if c['source'] == mem['id'] else c['source']
                 self._graph_nodes[mem['id']]['connections'][other] = c['weight']
     
-    def remember(self, text: str, label: str = "") -> int:
-        """Store a memory. Returns memory ID."""
+    def remember(self, text: str, label: str = "", detect_conflicts: bool = True) -> int:
+        """Store a memory. Returns memory ID.
+        
+        If detect_conflicts=True, checks for existing memories about the same
+        topic that contain contradictory information and updates/invalidates them.
+        """
         import math
         import time
         
         embedding = self.embedder.embed(text)
+        
+        # Knowledge-update: detect conflicts with existing memories
+        if detect_conflicts and self._graph_nodes:
+            conflicts = self._find_conflicts(text, embedding)
+            for conflict_id, conflict_info in conflicts.items():
+                old_content = conflict_info['content']
+                similarity = conflict_info['similarity']
+                
+                # High similarity + different content = likely update
+                if similarity > 0.7 and self._content_differs(old_content, text):
+                    # Mark old memory as superseded
+                    with self.store._lock:
+                        self.store.conn.execute(
+                            "UPDATE memories SET content = ? WHERE id = ?",
+                            (f"[SUPERSEDED] {old_content}\n[UPDATED TO] {text}", conflict_id)
+                        )
+                        self.store.conn.commit()
+                    # Update in-memory graph
+                    if conflict_id in self._graph_nodes:
+                        self._graph_nodes[conflict_id]['embedding'] = embedding
+                    # Don't create duplicate - update existing
+                    return conflict_id
+        
         mem_id = self.store.store(label or text[:60], text, embedding)
         
         # Add to in-memory graph
@@ -245,23 +272,114 @@ class NeuralMemory:
         
         return mem_id
     
-    def recall(self, query: str, k: int = 5) -> list[dict]:
+    def _find_conflicts(self, new_text: str, new_embedding: list[float], threshold: float = 0.6) -> dict:
+        """Find memories that might conflict with the new text.
+        Returns {memory_id: {similarity, content}} for potential conflicts.
+        """
+        conflicts = {}
+        for mem in self.store.get_all():
+            sim = self._cosine_similarity(new_embedding, mem['embedding'])
+            if sim > threshold:
+                conflicts[mem['id']] = {
+                    'similarity': sim,
+                    'content': mem['content'],
+                    'label': mem['label']
+                }
+        return conflicts
+    
+    def _content_differs(self, old_text: str, new_text: str) -> bool:
+        """Check if two texts contain different information despite high similarity.
+        Heuristics: different numbers, dates, negations, or significant word differences.
+        """
+        import re
+        
+        old_clean = old_text.replace("[SUPERSEDED]", "").replace("[UPDATED TO]", "").strip()
+        
+        # Extract numbers from both
+        old_nums = set(re.findall(r'\d+\.?\d*', old_clean))
+        new_nums = set(re.findall(r'\d+\.?\d*', new_text))
+        
+        # Different numbers = different info
+        if old_nums != new_nums and old_nums and new_nums:
+            return True
+        
+        # Check for negation differences
+        negations = {'not', "n't", 'never', 'no', 'none', 'nothing', 'nowhere'}
+        old_neg = any(n in old_clean.lower().split() for n in negations)
+        new_neg = any(n in new_text.lower().split() for n in negations)
+        if old_neg != new_neg:
+            return True
+        
+        # Check for date differences
+        old_dates = set(re.findall(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}', old_clean))
+        new_dates = set(re.findall(r'\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2}', new_text))
+        if old_dates != new_dates and old_dates and new_dates:
+            return True
+        
+        # Check for significant content word differences (excluding common words)
+        stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+                     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+                     'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for',
+                     'on', 'with', 'at', 'by', 'from', 'it', 'its', "it's", 'this', 'that',
+                     'user', 'user\'s', 'my', 'i', 'me', 'we', 'our', 'you', 'your'}
+        
+        def extract_keywords(text):
+            words = set(re.findall(r'\b[a-z]+\b', text.lower()))
+            return words - stopwords
+        
+        old_kw = extract_keywords(old_clean)
+        new_kw = extract_keywords(new_text)
+        
+        # If more than 30% of keywords differ, it's a real update
+        if old_kw and new_kw:
+            shared = old_kw & new_kw
+            total = old_kw | new_kw
+            diff_ratio = 1.0 - len(shared) / len(total)
+            if diff_ratio > 0.3:
+                return True
+        
+        return False
+    
+    def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
         """
         Retrieve memories related to query.
-        Returns list of {id, label, content, similarity, connections}.
+        
+        Args:
+            query: Search query
+            k: Number of results
+            temporal_weight: Weight for recency scoring (0=pure similarity, 1=pure recency)
+            
+        Returns list of {id, label, content, similarity, temporal_score, connections}.
         """
         import math
+        import time
         
         query_vec = self.embedder.embed(query)
+        now = time.time()
         
-        # Score all memories
+        # Score all memories with temporal weighting
         scored = []
         for mem in self.store.get_all():
             sim = self._cosine_similarity(query_vec, mem['embedding'])
-            scored.append({**mem, 'similarity': sim})
+            
+            # Temporal score: exponential decay based on last_accessed
+            # Memories accessed recently score higher
+            row = self.store.conn.execute(
+                "SELECT last_accessed FROM memories WHERE id = ?", (mem['id'],)
+            ).fetchone()
+            if row and row[0]:
+                age_hours = (now - row[0]) / 3600
+                # Half-life of ~24 hours for temporal relevance
+                temporal_score = math.exp(-0.693 * age_hours / 24)
+            else:
+                temporal_score = 0.5
+            
+            # Combined score: similarity + temporal
+            combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
+            scored.append({**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined})
         
-        # Sort by similarity
-        scored.sort(key=lambda x: -x['similarity'])
+        # Sort by combined score
+        scored.sort(key=lambda x: -x['combined'])
         
         # Enrich with connections via spreading activation
         results = []
@@ -290,6 +408,8 @@ class NeuralMemory:
                 'label': mem['label'],
                 'content': mem['content'],
                 'similarity': round(mem['similarity'], 4),
+                'temporal_score': round(mem['temporal_score'], 4),
+                'combined': round(mem['combined'], 4),
                 'connections': connected[:3],  # Top 3
             })
             
