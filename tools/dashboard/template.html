@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neural Memory Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --surface2: #1c2128;
+    --border: #30363d; --text: #c9d1d9; --text-bright: #e6edf3; --text-dim: #8b949e;
+    --purple: #bc8cff; --green: #3fb950; --orange: #f0883e; --blue: #58a6ff; --pink: #f778ba;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+
+  .header {
+    text-align: center; padding: 28px 16px 20px;
+    background: linear-gradient(135deg, var(--surface), #1a1040);
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 { font-size: 26px; color: var(--text-bright); font-weight: 600; }
+  .header h1 span { color: var(--purple); }
+  .header .source { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+
+  .stats {
+    display: flex; justify-content: center; gap: 40px; margin-top: 16px;
+  }
+  .stat { text-align: center; }
+  .stat .num { font-size: 30px; font-weight: 700; color: var(--purple); }
+  .stat .lbl { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; margin-top: 2px; }
+
+  .grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 12px; padding: 12px; max-width: 1440px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .card.wide { grid-column: 1 / -1; }
+  .card-title {
+    padding: 10px 14px; font-size: 13px; font-weight: 600;
+    color: var(--text-bright); border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+  }
+  .plot { width: 100%; min-height: 300px; }
+
+  .footer {
+    text-align: center; padding: 16px; font-size: 11px; color: var(--text-dim);
+    border-top: 1px solid var(--border);
+  }
+  .footer a { color: var(--purple); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Neural <span>Memory</span> Knowledge Graph</h1>
+  <div class="source" id="source_info"></div>
+  <div class="stats">
+    <div class="stat"><div class="num" id="s_mem">-</div><div class="lbl">Memories</div></div>
+    <div class="stat"><div class="num" id="s_conn">-</div><div class="lbl">Connections</div></div>
+    <div class="stat"><div class="num" id="s_dim">-</div><div class="lbl">Embed Dim</div></div>
+    <div class="stat"><div class="num" id="s_deg">-</div><div class="lbl">Avg Degree</div></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-title">Memory Categories</div>
+    <div id="pie_categories" class="plot"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Connection Strength Distribution</div>
+    <div id="bar_weights" class="plot"></div>
+  </div>
+
+  <div class="card wide">
+    <div class="card-title">Knowledge Graph &mdash; Top 50 Hubs (sized by degree, colored by category)</div>
+    <div id="network" class="plot" style="min-height:420px"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Degree vs Avg Connection Weight</div>
+    <div id="scatter_degree" class="plot"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Connection Flow: Category &rarr; Category</div>
+    <div id="heatmap" class="plot"></div>
+  </div>
+</div>
+
+<div class="footer">
+  Neural Memory Adapter &bull; <a href="https://github.com/nicekate/neural-memory-adapter">GitHub</a>
+  &bull; Generated <span id="gen_time"></span>
+</div>
+
+<script>
+const D = __DATA_JSON__;
+
+// --- Helpers ---
+const cc = {
+  'Conversation': '#bc8cff', 'Peer': '#3fb950', 'Session': '#f0883e',
+  'Document': '#58a6ff', 'Skill': '#f778ba', 'Other': '#8b949e',
+};
+const dark = {
+  paper_bgcolor: '#161b22', plot_bgcolor: '#161b22',
+  font: { color: '#c9d1d9', family: 'Segoe UI, system-ui', size: 12 },
+  margin: { t: 24, r: 16, b: 36, l: 48 },
+  xaxis: { gridcolor: '#21262d', zerolinecolor: '#30363d' },
+  yaxis: { gridcolor: '#21262d', zerolinecolor: '#30363d' },
+};
+
+// --- Header stats ---
+document.getElementById('s_mem').textContent = D.stats.memories.toLocaleString();
+document.getElementById('s_conn').textContent = D.stats.connections.toLocaleString();
+document.getElementById('s_dim').textContent = D.stats.embedding_dim;
+const avgDeg = D.nodes.length ? Math.round(D.nodes.reduce((s,n)=>s+n.total_degree,0)/D.nodes.length) : 0;
+document.getElementById('s_deg').textContent = avgDeg;
+document.getElementById('source_info').textContent = `${D.stats.source}: ${D.stats.path}`;
+document.getElementById('gen_time').textContent = new Date().toLocaleString();
+
+// --- 1. Category Donut ---
+Plotly.newPlot('pie_categories', [{
+  type: 'pie', hole: 0.42,
+  labels: D.categories.map(c => c.name),
+  values: D.categories.map(c => c.count),
+  marker: { colors: D.categories.map(c => cc[c.name] || '#8b949e') },
+  textinfo: 'label+percent', textfont: { color: '#e6edf3', size: 12 },
+  hovertemplate: '<b>%{label}</b><br>%{value} memories (%{percent})<extra></extra>',
+}], { ...dark, showlegend: false, margin: { t: 8, b: 8, l: 8, r: 8 } }, { responsive: true });
+
+// --- 2. Weight Bar ---
+const wOrder = ['Very Weak (0-0.2)', 'Weak (0.2-0.4)', 'Medium (0.4-0.6)', 'Med-Strong (0.6-0.8)', 'Strong (0.8-1.0)'];
+const wColors = ['#21262d', '#30363d', '#58a6ff', '#bc8cff', '#3fb950'];
+const sW = wOrder.map(w => D.weights.find(x => x.bucket === w) || { bucket: w, count: 0 });
+Plotly.newPlot('bar_weights', [{
+  type: 'bar',
+  x: sW.map(w => w.bucket), y: sW.map(w => w.count),
+  marker: { color: wColors, line: { color: '#30363d', width: 1 } },
+  text: sW.map(w => w.count.toLocaleString()), textposition: 'outside',
+  textfont: { color: '#8b949e', size: 11 },
+  hovertemplate: '<b>%{x}</b><br>%{y:,} connections<extra></extra>',
+}], { ...dark, yaxis: { ...dark.yaxis, title: 'Connections' }, margin: { ...dark.margin, b: 80 } }, { responsive: true });
+
+// --- 3. Network Graph ---
+const nMap = {}; D.nodes.forEach((n, i) => nMap[n.id] = i);
+const pos = {};
+D.nodes.forEach((n, i) => {
+  const a = (i / D.nodes.length) * 2 * Math.PI;
+  const r = 180 + n.total_degree * 1.2;
+  pos[n.id] = { x: r * Math.cos(a), y: r * Math.sin(a) };
+});
+
+const eX = [], eY = [];
+D.edges.forEach(e => {
+  if (pos[e.source] && pos[e.target]) {
+    eX.push(pos[e.source].x, pos[e.target].x, null);
+    eY.push(pos[e.source].y, pos[e.target].y, null);
+  }
+});
+
+const byCat = {};
+D.nodes.forEach(n => {
+  if (!byCat[n.category]) byCat[n.category] = { x: [], y: [], t: [], s: [] };
+  const b = byCat[n.category];
+  b.x.push(pos[n.id].x); b.y.push(pos[n.id].y);
+  b.t.push(`${n.label}<br>Degree: ${n.total_degree}<br>Avg Weight: ${n.avg_weight}`);
+  b.s.push(Math.max(8, n.total_degree / 4));
+});
+
+const traces = [{
+  type: 'scatter', mode: 'lines', x: eX, y: eY,
+  line: { color: '#21262d', width: 0.5 }, hoverinfo: 'skip',
+}];
+Object.entries(byCat).forEach(([cat, b]) => {
+  traces.push({
+    type: 'scatter', mode: 'markers', name: cat,
+    x: b.x, y: b.y,
+    marker: { size: b.s, color: cc[cat] || '#8b949e', opacity: 0.85,
+              line: { width: 1, color: '#0d1117' } },
+    text: b.t, hovertemplate: '%{text}<extra>' + cat + '</extra>',
+  });
+});
+Plotly.newPlot('network', traces, {
+  ...dark, showlegend: true, legend: { font: { size: 11 }, x: 0.01, y: 0.99, bgcolor: 'rgba(22,27,34,0.8)' },
+  xaxis: { showgrid: false, showticklabels: false, zeroline: false },
+  yaxis: { showgrid: false, showticklabels: false, zeroline: false, scaleanchor: 'x' },
+  margin: { t: 8, b: 8, l: 8, r: 8 }, hovermode: 'closest',
+}, { responsive: true });
+
+// --- 4. Scatter: Degree vs Weight ---
+Plotly.newPlot('scatter_degree', [{
+  type: 'scatter', mode: 'markers',
+  x: D.nodes.map(n => n.total_degree),
+  y: D.nodes.map(n => n.avg_weight),
+  marker: {
+    size: D.nodes.map(n => Math.max(6, n.total_degree / 6)),
+    color: D.nodes.map(n => cc[n.category] || '#8b949e'), opacity: 0.8,
+    line: { width: 0.5, color: '#30363d' },
+  },
+  text: D.nodes.map(n => `${n.label}<br>Deg: ${n.total_degree}<br>W: ${n.avg_weight}`),
+  hovertemplate: '%{text}<extra></extra>',
+}], {
+  ...dark,
+  xaxis: { ...dark.xaxis, title: 'Total Degree' },
+  yaxis: { ...dark.yaxis, title: 'Avg Connection Weight' },
+}, { responsive: true });
+
+// --- 5. Heatmap ---
+const cats = [...new Set(D.nodes.map(n => n.category))].sort();
+const mat = cats.map(() => cats.map(() => 0));
+D.edges.forEach(e => {
+  const sn = D.nodes.find(n => n.id === e.source);
+  const tn = D.nodes.find(n => n.id === e.target);
+  if (sn && tn) {
+    const si = cats.indexOf(sn.category), ti = cats.indexOf(tn.category);
+    if (si >= 0 && ti >= 0) mat[si][ti]++;
+  }
+});
+Plotly.newPlot('heatmap', [{
+  type: 'heatmap', z: mat, x: cats, y: cats,
+  colorscale: [[0, '#0d1117'], [0.3, '#1f3a5f'], [0.6, '#58a6ff'], [1, '#bc8cff']],
+  text: mat.map(r => r.map(v => v || '')), texttemplate: '%{text}',
+  hovertemplate: '<b>%{y} → %{x}</b><br>%{z} connections<extra></extra>',
+  showscale: false,
+}], { ...dark, margin: { ...dark.margin, b: 60, l: 90 } }, { responsive: true });
+</script>
+</body>
+</html>
