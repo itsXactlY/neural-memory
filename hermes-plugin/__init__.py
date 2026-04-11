@@ -285,43 +285,67 @@ class NeuralMemoryProvider(MemoryProvider):
             return ""
         try:
             parts = []
+            seen_contents = set()
 
-            # Recent session summaries
+            # 1. Recent session summaries (exact match)
             summaries = self._memory.recall("session topics recent activity", k=3)
             if summaries:
                 for s in summaries:
                     content = s.get("content", "")
                     if "Session topics" in content or "session-summary" in str(s.get("label", "")):
-                        parts.append(content[:200])
+                        if content[:100] not in seen_contents:
+                            parts.append(content[:200])
+                            seen_contents.add(content[:100])
 
-            # Recent memories (last few turns)
-            recent = self._memory.recall("recent conversation context", k=5)
-            if recent:
-                for r in recent:
-                    sim = r.get("similarity", 0)
-                    content = r.get("content", "")
-                    if sim > 0.2 and content not in [p[:200] for p in parts]:
-                        parts.append(content[:200])
+            # 2. Recent memories — just grab last 5 from DB regardless of query
+            try:
+                import sqlite3
+                db_path = self._config.get("db_path", "")
+                if db_path:
+                    conn = sqlite3.connect(db_path)
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT content, label FROM memories "
+                        "WHERE label NOT LIKE 'memory-%' "
+                        "ORDER BY created_at DESC LIMIT 8"
+                    ).fetchall()
+                    for row in rows:
+                        content = row["content"] or ""
+                        # Skip meta-garbage and very short content
+                        if len(content) < 30:
+                            continue
+                        c100 = content[:100]
+                        if c100 not in seen_contents and not self._is_garbage(content):
+                            parts.append(content[:200])
+                            seen_contents.add(c100)
+                    conn.close()
+            except Exception:
+                pass
 
-            # Top connected memories (graph hubs)
+            # 3. High-connection memories (graph hubs = important topics)
             try:
                 graph = self._memory.graph()
                 if graph and graph.get("top_connections"):
                     for conn in graph["top_connections"][:3]:
                         weight = conn.get("weight", 0)
                         if weight > 0.5:
-                            # Find the memory content
                             mid = conn.get("source_id") or conn.get("from_id")
                             if mid:
                                 mems = self._memory.recall("", k=50)
                                 for m in mems:
                                     if m.get("id") == mid:
-                                        parts.append(m.get("content", "")[:200])
+                                        content = m.get("content", "")[:200]
+                                        if content[:100] not in seen_contents:
+                                            parts.append(content)
                                         break
             except Exception:
                 pass
 
-            return "\n".join(f"- {p}" for p in parts[:10]) if parts else ""
+            if not parts:
+                return ""
+
+            logger.info("Neural initial context: %d items loaded", len(parts))
+            return "\n".join(f"- {p}" for p in parts[:10])
         except Exception as e:
             logger.debug("Neural initial context load failed: %s", e)
             return ""
