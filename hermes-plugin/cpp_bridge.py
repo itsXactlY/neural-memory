@@ -14,10 +14,9 @@ from typing import Optional
 # ============================================================================
 
 def _find_lib() -> str:
-    _plugin_dir = Path(__file__).parent
     candidates = [
+        Path(__file__).parent.parent / "build" / "libneural_memory.so",
         Path.home() / "projects" / "neural-memory-adapter" / "build" / "libneural_memory.so",
-        _plugin_dir / "build" / "libneural_memory.so",
         Path("/usr/local/lib/libneural_memory.so"),
         Path("/usr/lib/libneural_memory.so"),
     ]
@@ -30,7 +29,7 @@ def _find_lib() -> str:
         return lib
     raise FileNotFoundError(
         "libneural_memory.so not found. Build first:\n"
-        "  cd ~/neural-memory-adapter/build && cmake --build . -j$(nproc)"
+        "  cd ~/projects/neural-memory-adapter/build && cmake --build . -j$(nproc)"
     )
 
 # ============================================================================
@@ -38,11 +37,15 @@ def _find_lib() -> str:
 # ============================================================================
 
 class CSearchResult(ctypes.Structure):
+    """Must match NeuralMemoryResult in c_api.h exactly."""
     _fields_ = [
         ("id", ctypes.c_uint64),
-        ("score", ctypes.c_float),
+        ("embedding", ctypes.POINTER(ctypes.c_float)),  # float* — caller must NOT free
+        ("embedding_dim", ctypes.c_int),
         ("label", ctypes.c_char * 256),
-        ("content", ctypes.c_char * 1024),
+        ("content", ctypes.c_char * 4096),
+        ("similarity", ctypes.c_float),
+        ("salience", ctypes.c_float),
     ]
 
 class CStats(ctypes.Structure):
@@ -177,13 +180,15 @@ class NeuralMemoryCpp:
         return [
             {
                 'id': results[i].id,
-                'score': results[i].score,
+                'score': results[i].similarity,
+                'similarity': results[i].similarity,
+                'salience': results[i].salience,
                 'label': results[i].label.decode('utf-8', errors='replace'),
                 'content': results[i].content.decode('utf-8', errors='replace'),
             }
             for i in range(count)
         ]
-    
+
     def search(self, query_text: str, k: int = 10) -> list[dict]:
         """Text-based search (uses internal embedding)."""
         assert self._handle, "Not initialized."
@@ -196,13 +201,14 @@ class NeuralMemoryCpp:
         return [
             {
                 'id': results[i].id,
-                'score': results[i].score,
+                'score': results[i].similarity,
+                'similarity': results[i].similarity,
                 'label': results[i].label.decode('utf-8', errors='replace'),
                 'content': results[i].content.decode('utf-8', errors='replace'),
             }
             for i in range(count)
         ]
-    
+
     def think(self, start_id: int, depth: int = 3, max_results: int = 20) -> list[dict]:
         """Spreading activation from a memory."""
         assert self._handle, "Not initialized."
@@ -292,4 +298,4 @@ if __name__ == "__main__":
         print("\nC++ bridge: OK")
     except FileNotFoundError as e:
         print(f"C++ library not found: {e}")
-        print("Build first: cd ~/neural-memory-adapter/build && cmake --build . -j$(nproc)")
+        print("Build first: cd ~/projects/neural-memory-adapter/build && cmake --build . -j$(nproc)")

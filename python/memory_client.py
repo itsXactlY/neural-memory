@@ -195,7 +195,7 @@ class NeuralMemory:
     """
     
     def __init__(self, db_path: str | Path = DB_PATH, embedding_backend: str = "auto",
-                 use_mssql: bool = False):
+                 use_mssql: bool = False, use_cpp: bool = True):
         from embed_provider import EmbeddingProvider
 
         self.embedder = EmbeddingProvider(backend=embedding_backend)
@@ -208,25 +208,47 @@ class NeuralMemory:
 
         self.dim = self.embedder.dim
 
+        # C++ SIMD index for fast retrieval (primary search path)
+        self._cpp = None
+        if use_cpp:
+            try:
+                from cpp_bridge import NeuralMemoryCpp
+                self._cpp = NeuralMemoryCpp()
+                self._cpp.initialize(dim=self.dim)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "C++ bridge unavailable, falling back to Python: %s", e
+                )
+                self._cpp = None
+
         # In-memory graph for spreading activation
         self._graph_nodes: dict[int, dict] = {}  # id -> {embedding, connections}
         self._load_from_store()
-    
+
     def _load_from_store(self):
-        """Load existing memories into in-memory graph"""
-        for mem in self.store.get_all():
+        """Load existing memories into in-memory graph + C++ index."""
+        all_mems = self.store.get_all()
+        for mem in all_mems:
             self._graph_nodes[mem['id']] = {
                 'embedding': mem['embedding'],
                 'label': mem['label'],
                 'connections': {}
             }
-        
+
         # Load connections
-        for mem in self.store.get_all():
+        for mem in all_mems:
             conns = self.store.get_connections(mem['id'])
             for c in conns:
                 other = c['target'] if c['source'] == mem['id'] else c['source']
                 self._graph_nodes[mem['id']]['connections'][other] = c['weight']
+
+        # Load into C++ SIMD index
+        if self._cpp:
+            for mem in all_mems:
+                emb = mem.get('embedding', [])
+                if emb and len(emb) == self.dim:
+                    self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
     
     def remember(self, text: str, label: str = "", detect_conflicts: bool = True) -> int:
         """Store a memory. Returns memory ID.
@@ -269,7 +291,14 @@ class NeuralMemory:
             'label': label or text[:60],
             'connections': {}
         }
-        
+
+        # Add to C++ SIMD index
+        if self._cpp:
+            try:
+                self._cpp.store(embedding, label or text[:60], text)
+            except Exception:
+                pass
+
         # Auto-connect to similar memories
         for other_id, other_node in self._graph_nodes.items():
             if other_id == mem_id:
@@ -279,7 +308,7 @@ class NeuralMemory:
                 self._graph_nodes[mem_id]['connections'][other_id] = sim
                 self._graph_nodes[other_id]['connections'][mem_id] = sim
                 self.store.add_connection(mem_id, other_id, sim)
-        
+
         return mem_id
     
     def _find_conflicts(self, new_text: str, new_embedding: list[float], threshold: float = 0.6) -> dict:
@@ -353,41 +382,77 @@ class NeuralMemory:
     def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
         """
         Retrieve memories related to query.
-        
+
         Args:
             query: Search query
             k: Number of results
             temporal_weight: Weight for recency scoring (0=pure similarity, 1=pure recency)
-            
+
         Returns list of {id, label, content, similarity, temporal_score, connections}.
         """
         import math
         import time
-        
+
         query_vec = self.embedder.embed(query)
         now = time.time()
-        
-        # Score all memories with temporal weighting
+
+        # C++ fast path: SIMD retrieve returns top-k candidates in microseconds
+        # Then apply temporal scoring on the small candidate set
+        if self._cpp:
+            try:
+                candidates = self._cpp.retrieve(query_vec, k=k * 3)
+                if candidates:
+                    scored = []
+                    for c in candidates:
+                        mem_id = c['id']
+                        sim = c.get('similarity', c.get('score', 0))
+                        node = self._graph_nodes.get(mem_id, {})
+
+                        # Temporal score from graph node
+                        temporal_score = 0.5  # default
+                        scored.append({
+                            'id': mem_id,
+                            'label': c.get('label', node.get('label', '')),
+                            'content': c.get('content', ''),
+                            'embedding': node.get('embedding', []),
+                            'similarity': sim,
+                            'temporal_score': temporal_score,
+                            'combined': (1 - temporal_weight) * sim + temporal_weight * temporal_score,
+                            'connections': list(node.get('connections', {}).keys()),
+                        })
+
+                    scored.sort(key=lambda x: -x['combined'])
+                    # Touch accessed memories
+                    for s in scored[:k]:
+                        try:
+                            self.store.touch(s['id'])
+                        except Exception:
+                            pass
+                    return scored[:k]
+            except Exception:
+                pass  # Fall through to Python path
+
+        # Python fallback: O(n) linear scan
         scored = []
         for mem in self.store.get_all():
             sim = self._cosine_similarity(query_vec, mem['embedding'])
-            
+
             # Temporal score: exponential decay based on last_accessed
-            # Memories accessed recently score higher
-            row = self.store.conn.execute(
-                "SELECT last_accessed FROM memories WHERE id = ?", (mem['id'],)
-            ).fetchone()
-            if row and row[0]:
-                age_hours = (now - row[0]) / 3600
-                # Half-life of ~24 hours for temporal relevance
-                temporal_score = math.exp(-0.693 * age_hours / 24)
-            else:
+            try:
+                row = self.store.conn.execute(
+                    "SELECT last_accessed FROM memories WHERE id = ?", (mem['id'],)
+                ).fetchone()
+                if row and row[0]:
+                    age_hours = (now - row[0]) / 3600
+                    temporal_score = math.exp(-0.693 * age_hours / 24)
+                else:
+                    temporal_score = 0.5
+            except Exception:
                 temporal_score = 0.5
-            
-            # Combined score: similarity + temporal
+
             combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
             scored.append({**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined})
-        
+
         # Sort by combined score
         scored.sort(key=lambda x: -x['combined'])
         
@@ -514,8 +579,8 @@ class NeuralMemory:
         }
     
     def stats(self) -> dict:
-        """Get system statistics."""
-        graph = self.store.get_stats()
+        """Get memory statistics."""
+        graph = self.store.stats() if hasattr(self.store, 'stats') else self.store.get_stats()
         return {
             'memories': graph['memories'],
             'connections': graph['connections'],
@@ -524,6 +589,12 @@ class NeuralMemory:
         }
     
     def close(self):
+        if self._cpp:
+            try:
+                self._cpp.shutdown()
+            except Exception:
+                pass
+            self._cpp = None
         self.store.close()
     
     @staticmethod
