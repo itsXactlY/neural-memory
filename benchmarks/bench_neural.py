@@ -39,7 +39,7 @@ import numpy as np
 LLAMA_SERVER_URL = os.environ.get("LLAMA_SERVER_URL", "http://localhost:8080/v1")
 LLAMA_MODEL = os.environ.get("LLAMA_MODEL", "GPT")  # matches --alias
 EMBED_MODEL = "all-MiniLM-L6-v2"
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(os.environ.get("EVO_MEM_DATA", Path.home() / "projects/evo_mem/data"))
 RESULTS_DIR = Path(__file__).parent / "results" / "neural_memory"
 
 # ---------------------------------------------------------------------------
@@ -137,7 +137,8 @@ class LlamaClient:
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
-                temperature=temperature,
+                temperature=0.0,        # deterministic — override server default
+                seed=42,                # client-side seed for reproducibility
                 extra_body={
                     "reasoning_budget": -1,  # cap CoT, force content output
                     "top_p": 1.0,
@@ -188,10 +189,10 @@ def extract_answer(response: str, dataset: str) -> str:
     """Extract the final answer from LLM response.
 
     Handles reasoning model output where answer is at the END of
-    a long reasoning chain.
+    a long reasoning chain. Strips markdown that kills exact_match.
     """
     import re
-    response = response.strip()
+    response = strip_markdown(response.strip())
     if not response:
         return ""
 
@@ -240,6 +241,14 @@ def extract_answer(response: str, dataset: str) -> str:
     # Last resort: last single letter A-D in the text
     letters = re.findall(r"\b([A-Da-d])\b", response)
     return letters[-1].upper() if letters else response[:1].upper()
+
+
+def strip_markdown(text: str) -> str:
+    """Strip markdown bold/italic that kills exact_match scoring."""
+    import re
+    text = re.sub(r'\*+', '', text)
+    text = re.sub(r'_+', '', text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +315,13 @@ def build_prompt_with_memory(task: Dict, memories: List[Dict],
 
 def run_benchmark(dataset_name: str, tasks: List[Dict],
                   llm: LlamaClient, retriever: NeuralRetriever,
-                  use_memory: bool = True) -> Dict[str, Any]:
-    """Run benchmark on a dataset."""
+                  use_memory: bool = True,
+                  use_mssql: bool = False) -> Dict[str, Any]:
+    """Run benchmark on a dataset.
+
+    If use_mssql=True, loads memories from MSSQL (persistent, shared with dream engine).
+    Otherwise uses in-memory list (ephemeral, correct answers only).
+    """
     from tqdm import tqdm
 
     correct = 0
@@ -315,6 +329,24 @@ def run_benchmark(dataset_name: str, tasks: List[Dict],
     memory: List[Dict] = []
     results = []
     total_retrieve_ms = 0
+
+    # Load existing memories from MSSQL if requested
+    mssql_store = None
+    if use_mssql and use_memory:
+        try:
+            from mssql_store import MSSQLStore
+            mssql_store = MSSQLStore()
+            mssql_mems = mssql_store.get_all()
+            for m in mssql_mems:
+                if m.get("embedding"):
+                    memory.append({
+                        "text": m.get("content", ""),
+                        "embedding": m["embedding"],
+                        "index": len(memory),
+                    })
+            print(f"[mssql] Loaded {len(memory)} memories from MSSQL")
+        except Exception as e:
+            print(f"[mssql] Failed to load: {e}, falling back to in-memory")
 
     for i, task in enumerate(tqdm(tasks, desc=dataset_name)):
         # Build prompt
@@ -345,7 +377,7 @@ def run_benchmark(dataset_name: str, tasks: List[Dict],
         total += 1
 
         # Store in memory (only correct answers to avoid poisoning)
-        if use_memory:
+        if use_memory and not use_mssql:
             q_text = task.get("question", task.get("problem", ""))
             embedding = retriever.encode(f"Q: {q_text} A: {gt}")
             memory.append({
@@ -362,6 +394,9 @@ def run_benchmark(dataset_name: str, tasks: List[Dict],
             "correct": is_correct,
         })
 
+    if mssql_store:
+        mssql_store.close()
+
     accuracy = correct / max(total, 1)
     avg_retrieve = total_retrieve_ms / max(total, 1)
 
@@ -373,6 +408,7 @@ def run_benchmark(dataset_name: str, tasks: List[Dict],
         "avg_retrieve_ms": round(avg_retrieve, 1),
         "memory_size": len(memory),
         "use_memory": use_memory,
+        "use_mssql": use_mssql,
         "results": results,
     }
 
@@ -390,16 +426,19 @@ def main():
     parser.add_argument("--url", default=LLAMA_SERVER_URL, help="llama-server URL")
     parser.add_argument("--model", default=LLAMA_MODEL, help="Model alias")
     parser.add_argument("--no-memory", action="store_true", help="Run without memory (baseline)")
+    parser.add_argument("--mssql", action="store_true", help="Load memories from MSSQL (with dream consolidation)")
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    mem_mode = "OFF (baseline)" if args.no_memory else "MSSQL (dream consolidated)" if args.mssql else "ON (in-memory)"
     print("=" * 60)
     print("  Neural Memory Benchmark (EvoMem)")
     print("=" * 60)
     print(f"  LLM:       {args.model} @ {args.url}")
     print(f"  Retriever: {EMBED_MODEL} (CUDA)")
-    print(f"  Memory:    {'OFF (baseline)' if args.no_memory else 'ON'}")
+    print(f"  Memory:    {mem_mode}")
+    print(f"  Temp:      0.0 (seed=42)")
     print("=" * 60)
 
     # Init
@@ -427,7 +466,8 @@ def main():
             continue
 
         result = run_benchmark(ds_name, tasks, llm, retriever,
-                               use_memory=not args.no_memory)
+                               use_memory=not args.no_memory,
+                               use_mssql=args.mssql)
         all_results[ds_name] = result
 
         print(f"\n  Accuracy: {result['accuracy']:.1%} ({result['correct']}/{result['total']})")

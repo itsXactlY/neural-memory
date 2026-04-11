@@ -194,13 +194,20 @@ class NeuralMemory:
         results = mem.recall("What pet does the user have?")
     """
     
-    def __init__(self, db_path: str | Path = DB_PATH, embedding_backend: str = "auto"):
+    def __init__(self, db_path: str | Path = DB_PATH, embedding_backend: str = "auto",
+                 use_mssql: bool = False):
         from embed_provider import EmbeddingProvider
-        
+
         self.embedder = EmbeddingProvider(backend=embedding_backend)
-        self.store = SQLiteStore(db_path)
+
+        if use_mssql:
+            from mssql_store import MSSQLStore
+            self.store = MSSQLStore()
+        else:
+            self.store = SQLiteStore(db_path)
+
         self.dim = self.embedder.dim
-        
+
         # In-memory graph for spreading activation
         self._graph_nodes: dict[int, dict] = {}  # id -> {embedding, connections}
         self._load_from_store()
