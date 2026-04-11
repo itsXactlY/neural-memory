@@ -742,7 +742,16 @@ class NeuralMemoryProvider(MemoryProvider):
             query = args["query"]
             limit = int(args.get("limit", 5))
             results = self._memory.recall(query, k=limit)
-            return json.dumps({"results": results, "count": len(results)})
+            # Strip embedding vectors and connections — only send useful fields to LLM
+            clean = []
+            for r in results:
+                clean.append({
+                    "id": r.get("id"),
+                    "label": r.get("label", ""),
+                    "content": r.get("content", "")[:500],
+                    "similarity": round(r.get("similarity", 0), 3),
+                })
+            return json.dumps({"results": clean, "count": len(clean)})
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
         except Exception as exc:
@@ -753,7 +762,16 @@ class NeuralMemoryProvider(MemoryProvider):
             memory_id = int(args["memory_id"])
             depth = int(args.get("depth", 3))
             results = self._memory.think(memory_id, depth=depth)
-            return json.dumps({"results": results, "count": len(results)})
+            # Strip internal fields
+            clean = []
+            for r in results:
+                clean.append({
+                    "id": r.get("id"),
+                    "label": r.get("label", ""),
+                    "content": (r.get("content", "") or "")[:300],
+                    "activation": round(r.get("activation", 0), 3),
+                })
+            return json.dumps({"results": clean, "count": len(clean)})
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
         except Exception as exc:
