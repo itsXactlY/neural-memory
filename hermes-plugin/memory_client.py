@@ -243,12 +243,14 @@ class NeuralMemory:
                 other = c['target'] if c['source'] == mem['id'] else c['source']
                 self._graph_nodes[mem['id']]['connections'][other] = c['weight']
 
-        # Load into C++ SIMD index
+        # Load into C++ SIMD index + build ID mapping
+        self._cpp_id_map = {}  # cpp_id -> sqlite_id
         if self._cpp:
             for mem in all_mems:
                 emb = mem.get('embedding', [])
                 if emb and len(emb) == self.dim:
-                    self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
+                    cpp_id = self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
+                    self._cpp_id_map[cpp_id] = mem['id']
     
     def remember(self, text: str, label: str = "", detect_conflicts: bool = True) -> int:
         """Store a memory. Returns memory ID.
@@ -292,10 +294,11 @@ class NeuralMemory:
             'connections': {}
         }
 
-        # Add to C++ SIMD index
+        # Add to C++ SIMD index + track mapping
         if self._cpp:
             try:
-                self._cpp.store(embedding, label or text[:60], text)
+                cpp_id = self._cpp.store(embedding, label or text[:60], text)
+                self._cpp_id_map[cpp_id] = mem_id
             except Exception:
                 pass
 
@@ -404,20 +407,20 @@ class NeuralMemory:
                 if candidates:
                     scored = []
                     for c in candidates:
-                        mem_id = c['id']
+                        cpp_id = c['id']
+                        # Map C++ index back to SQLite ID
+                        mem_id = self._cpp_id_map.get(cpp_id, cpp_id)
                         sim = c.get('similarity', c.get('score', 0))
                         node = self._graph_nodes.get(mem_id, {})
 
-                        # Temporal score from graph node
-                        temporal_score = 0.5  # default
                         scored.append({
                             'id': mem_id,
                             'label': c.get('label', node.get('label', '')),
                             'content': c.get('content', ''),
                             'embedding': node.get('embedding', []),
                             'similarity': sim,
-                            'temporal_score': temporal_score,
-                            'combined': (1 - temporal_weight) * sim + temporal_weight * temporal_score,
+                            'temporal_score': 0.5,
+                            'combined': (1 - temporal_weight) * sim + temporal_weight * 0.5,
                             'connections': list(node.get('connections', {}).keys()),
                         })
 
