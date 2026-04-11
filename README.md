@@ -1,4 +1,4 @@
-![Demo](https://github.com/user-attachments/assets/2d938624-cc39-4f8b-b35b-485b23e93355)
+[![Demo](assets/cover.png)](https://github.com/user-attachments/assets/2d938624-cc39-4f8b-b35b-485b23e93355)
 
 # Neural Memory Adapter for Hermes Agent
 
