@@ -84,6 +84,18 @@ python3 -c "import numpy" 2>/dev/null && print_ok "numpy" || {
     print_ok "numpy installed"
 }
 
+# Cython (for fast_ops acceleration)
+python3 -c "import Cython" 2>/dev/null && print_ok "cython" || {
+    print_info "Installing cython..."
+    pip install --quiet cython 2>/dev/null || pip install --user --quiet cython
+    print_ok "cython installed"
+}
+# Build fast_ops
+if [ -f "$PROJECT_DIR/python/setup_fast.py" ]; then
+    print_info "Building Cython fast_ops..."
+    cd "$PROJECT_DIR/python" && python3 setup_fast.py build_ext --inplace 2>/dev/null && print_ok "fast_ops compiled" || print_warn "fast_ops build failed (optional)"
+fi
+
 # sentence-transformers (Full Stack only)
 if $IS_FULL; then
     python3 -c "import sentence_transformers" 2>/dev/null && print_ok "sentence-transformers" || {
