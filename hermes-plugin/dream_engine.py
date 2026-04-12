@@ -720,21 +720,17 @@ class DreamEngine:
 
     def _extract_theme(self, node_ids: List[int]) -> str:
         """Extract common themes from node IDs (simple keyword frequency)."""
-        # If we have memory access, get contents
+        # If we have memory access, get contents via store (thread-safe)
         contents = []
-        if self._memory:
+        if self._memory and hasattr(self._memory, 'store'):
             try:
-                conn = None
-                if hasattr(self._memory, '_db_path'):
-                    import sqlite3
-                    conn = sqlite3.connect(self._memory._db_path)
-                    placeholders = ",".join("?" * len(node_ids))
-                    rows = conn.execute(
+                placeholders = ",".join("?" * len(node_ids))
+                with self._memory.store._lock:
+                    rows = self._memory.store.conn.execute(
                         f"SELECT content FROM memories WHERE id IN ({placeholders})",
                         tuple(node_ids)
                     ).fetchall()
                     contents = [r[0] for r in rows if r[0]]
-                    conn.close()
             except Exception:
                 pass
 

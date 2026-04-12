@@ -4,6 +4,7 @@ embed_provider.py - Text Embedding for Neural Memory Adapter
 Tries sentence-transformers first, falls back to TF-IDF+SVD.
 """
 
+import os
 import sys
 import pickle
 import hashlib

@@ -160,8 +160,8 @@ def content_differs(str old_text, str new_text) -> bool:
     old_clean = old_text.replace("[SUPERSEDED]", "").replace("[UPDATED TO]", "").strip()
 
     # Extract numbers
-    cdef set old_nums = set(re.findall(r'\d+\.?\d*', old_clean))
-    cdef set new_nums = set(re.findall(r'\d+\.?\d*', new_text))
+    old_nums = set(re.findall(r'\d+\.?\d*', old_clean))
+    new_nums = set(re.findall(r'\d+\.?\d*', new_text))
 
     if old_nums and new_nums and old_nums != new_nums:
         return True
