@@ -429,6 +429,9 @@ class NeuralMemory:
                         })
 
                     scored.sort(key=lambda x: -x['combined'])
+                    # Strip embeddings before returning — too large for context
+                    for s in scored:
+                        s.pop('embedding', None)
                     # Touch accessed memories
                     for s in scored[:k]:
                         try:
@@ -458,7 +461,9 @@ class NeuralMemory:
                 temporal_score = 0.5
 
             combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
-            scored.append({**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined})
+            entry = {**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined}
+            entry.pop('embedding', None)  # Strip embedding — too large for context
+            scored.append(entry)
 
         # Sort by combined score
         scored.sort(key=lambda x: -x['combined'])
