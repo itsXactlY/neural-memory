@@ -62,6 +62,9 @@ public:
 
     // Touch (update access metadata)
     void touch(uint64_t id);
+    
+    // Set the next ID sequence (used to sync with external databases)
+    void set_next_id(uint64_t next_id) { next_id_.store(next_id); }
 
     size_t size() const { return entries_.size(); }
     size_t capacity() const { return capacity_; }
@@ -161,6 +164,9 @@ public:
 
     // Read a memory (auto-detects tier)
     const MemoryEntry* read(uint64_t id) const;
+    
+    // Sync ID counter with database
+    void set_next_id(uint64_t id) { episodic_.set_next_id(id); }
 
     // --- Consolidation ---
 

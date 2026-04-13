@@ -47,6 +47,12 @@ bool NeuralMemoryAdapter::initialize(const AdapterConfig& config) {
     if (!config.db_config.server.empty()) {
         db_ = std::make_unique<mssql::MSSQLVectorAdapter>(config.db_config);
         db_->initialize();
+        
+        // Sync ID sequence with the database max ID
+        int64_t max_id = db_->get_max_vector_id();
+        if (max_id > 0) {
+            memory_manager_->set_next_id(max_id + 1);
+        }
     }
 #endif
     

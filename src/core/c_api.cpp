@@ -48,6 +48,12 @@ NEURAL_API NeuralMemoryHandle neural_memory_create_dim(int vector_dim) {
     if (const char* password = std::getenv("MSSQL_PASSWORD")) {
         config.db_config.password = password;
     }
+    if (const char* driver = std::getenv("MSSQL_DRIVER")) {
+        config.db_config.driver = driver;
+    }
+    // Always trust self-signed local certs for development
+    config.db_config.trust_server_certificate = true;
+    
     if (!config.db_config.server.empty() && config.db_config.username.empty()) {
         config.db_config.server = ""; // No credentials, disable MSSQL
     }

@@ -451,6 +451,9 @@ public:
 
     // Count vectors in store
     int64_t count_vectors();
+    
+    // Get maximum ID (useful for syncing auto-increment sequences)
+    int64_t get_max_vector_id();
 
     // Get pool stats
     size_t pool_available() const;

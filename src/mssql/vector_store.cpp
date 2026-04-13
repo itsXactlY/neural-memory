@@ -202,6 +202,13 @@ bool MSSQLVectorAdapter::insert_vector(uint64_t id, std::span<const float> vecto
                      static_cast<SQLLEN>(metadata_json.size()), &meta_ind);
 
     bool ok = stmt.execute();
+    if (!ok) {
+        auto errors = stmt.get_errors();
+        std::cerr << "[MSSQL] insert_vector failed for id " << id << std::endl;
+        for (const auto& err : errors) {
+            std::cerr << "  State: " << err.state << " Native: " << err.native_error << " Msg: " << err.message << std::endl;
+        }
+    }
     pool_->release(std::move(conn));
     return ok;
 }
@@ -876,6 +883,22 @@ int64_t MSSQLVectorAdapter::count_vectors() {
     auto count = stmt.get_int64(1);
     pool_->release(std::move(conn));
     return count.value_or(0);
+}
+
+int64_t MSSQLVectorAdapter::get_max_vector_id() {
+    if (!initialized_) return 0;
+    auto conn = pool_->acquire();
+    if (!conn) return 0;
+
+    Statement stmt(conn->dbc());
+    if (!stmt.prepare("SELECT ISNULL(MAX(id), 0) FROM NeuralMemory") || !stmt.execute() || !stmt.fetch()) {
+        pool_->release(std::move(conn));
+        return 0;
+    }
+
+    int64_t max_id = stmt.get_int64(1).value_or(0);
+    pool_->release(std::move(conn));
+    return max_id;
 }
 
 size_t MSSQLVectorAdapter::pool_available() const {

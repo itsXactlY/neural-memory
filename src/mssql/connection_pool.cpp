@@ -81,15 +81,40 @@ void ODBCHandle::release() {
 
 std::string ConnectionConfig::to_connection_string() const {
     std::ostringstream oss;
-    oss << "DRIVER={" << driver << "};"
+    
+    // Clean driver string (remove existing braces if present)
+    std::string clean_driver = driver;
+    if (!clean_driver.empty() && clean_driver.front() == '{' && clean_driver.back() == '}') {
+        clean_driver = clean_driver.substr(1, clean_driver.length() - 2);
+    }
+    
+    oss << "DRIVER={" << clean_driver << "};"
         << "SERVER=" << server << "," << port << ";"
         << "DATABASE=" << database << ";";
 
     if (trusted_connection) {
         oss << "Trusted_Connection=yes;";
     } else {
-        oss << "UID=" << username << ";"
-            << "PWD=" << password << ";";
+        oss << "UID=" << username << ";";
+        
+        // Escape password if it contains special characters
+        std::string clean_pwd = password;
+        if (!clean_pwd.empty()) {
+            // If the user's dotenv somehow bypassed quotes and left literal single quotes at the ends
+            if (clean_pwd.front() == '\'' && clean_pwd.back() == '\'') {
+                clean_pwd = clean_pwd.substr(1, clean_pwd.length() - 2);
+            }
+            
+            // ODBC escaping: wrap in {} and double any inner }
+            std::string escaped_pwd;
+            for (char c : clean_pwd) {
+                if (c == '}') escaped_pwd += "}}";
+                else escaped_pwd += c;
+            }
+            oss << "PWD={" << escaped_pwd << "};";
+        } else {
+            oss << "PWD=;";
+        }
     }
 
     if (encrypt) {
@@ -184,6 +209,12 @@ bool Connection::connect() {
                            SQL_DRIVER_NOPROMPT);
 
     if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        std::cerr << "[ODBC ERROR] Connection failed for string: " << conn_str << std::endl;
+        auto errors = get_odbc_errors(SQL_HANDLE_DBC, dbc_.get());
+        for (const auto& err : errors) {
+            std::cerr << "State: " << err.state << ", Native: " << err.native_error 
+                      << ", Message: " << err.message << std::endl;
+        }
         dbc_.release();
         env_.release();
         return false;
