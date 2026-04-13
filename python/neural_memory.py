@@ -67,7 +67,7 @@ class Memory:
         
         # Auto-detect MSSQL: check env vars
         if use_mssql is None:
-            use_mssql = bool(os.environ.get("MSSQL_SERVER") and os.environ.get("MSSQL_PASSWORD"))
+            use_mssql = bool(use_cpp and os.environ.get("MSSQL_SERVER") and os.environ.get("MSSQL_PASSWORD"))
         self._use_mssql = use_mssql and HAS_MSSQL
         
         # Create NeuralMemory backend (embedding + SQLite store)

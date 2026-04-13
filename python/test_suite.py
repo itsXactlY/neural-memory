@@ -392,7 +392,7 @@ def test_28():
             m.remember("b")
             s = m.stats()
             assert s['memories'] == 2
-            assert s['embedding_dim'] == 384
+            assert s['embedding_dim'] == 1024
     finally: os.unlink(db)
 
 # ============================================================================
