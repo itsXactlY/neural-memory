@@ -439,27 +439,13 @@ class NeuralMemoryProvider(MemoryProvider):
         return f"User: {user_clean}\nAssistant: {assist_clean}"
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Store the turn as an episodic memory. Skips meta-garbage."""
-        if not self._memory:
-            return
-
-        combined = self._extract_facts(user_content, assistant_content)
-        if not combined:
-            return
-
-        # Deduplicate: check if very similar content exists
-        try:
-            existing = self._memory.recall(combined[:100], k=1)
-            if existing and existing[0].get("similarity", 0) > 0.95:
-                return  # Already stored
-        except Exception:
-            pass
-
+        """No-op. Per-turn storage disabled — only session summaries stored at session end.
+        
+        Old behaviour stored every turn as a separate memory, creating a feedback loop
+        where recent conversation turns were recalled as 'context' and re-injected.
+        The proper approach: on_session_end stores a single session summary.
+        """
         self._turn_count += 1
-        try:
-            self._memory.remember(combined, label=f"turn-{self._turn_count}")
-        except Exception as e:
-            logger.debug("Neural sync_turn failed: %s", e)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return ALL_TOOL_SCHEMAS
@@ -476,24 +462,40 @@ class NeuralMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Consolidate on session end - store conversation summary."""
+        """Store a session summary at session end — the ONLY memory write per session."""
         if not self._memory or not messages:
             return
         try:
-            # Store a session summary
             user_msgs = [m for m in messages if m.get("role") == "user"]
-            if user_msgs:
-                summary_parts = []
-                for m in user_msgs[-10:]:  # Last 10 user messages
-                    content = m.get("content", "")
-                    if isinstance(content, str):
-                        summary_parts.append(content[:200])
-                if summary_parts:
-                    summary = "Session topics: " + " | ".join(summary_parts)
-                    self._memory.remember(summary, label="session-summary")
-                    logger.info("Neural memory: stored session summary")
+            if not user_msgs:
+                return
+            
+            summary_parts = []
+            for m in user_msgs:
+                content = m.get("content", "")
+                if not isinstance(content, str):
+                    continue
+                # Skip noise: tool results, log dumps, very short messages
+                if len(content) < 10:
+                    continue
+                if content.startswith(("[SYSTEM:", "SYSTEM:", "Tool ", "Batches:")):
+                    continue
+                if any(skip in content.lower() for skip in (
+                    "tool_result_storage", "run_agent", "DEBUG", "openai client",
+                    "token usage", "completion_tokens", "snapshot_engine",
+                )):
+                    continue
+                # Extract first meaningful line
+                first_line = content.split("\n")[0][:150]
+                if first_line:
+                    summary_parts.append(first_line)
+            
+            if summary_parts:
+                summary = "Session: " + " | ".join(summary_parts[-8:])  # Last 8 meaningful lines
+                self._memory.remember(summary, label="session-summary")
+                logger.info("Neural memory: stored session summary (%d topics)", len(summary_parts))
         except Exception as e:
-            logger.debug("Neural on_session_end failed: %e", e)
+            logger.debug("Neural on_session_end failed: %s", e)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes to neural memory. Skips garbage."""
