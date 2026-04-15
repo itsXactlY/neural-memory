@@ -27,19 +27,39 @@ logger = logging.getLogger(__name__)
 class CppDreamBackend(DreamBackend):
     """Dream backend backed by C++ bridge → MSSQL.
 
-    All graph operations (strengthen, weaken, prune, spreading activation)
-    go through libneural_memory.so ODBC → MSSQL. No pyodbc in Python.
-
-    For dream session tracking, we still use a lightweight SQLite file
-    (dream sessions are metadata, not graph operations).
+    Graph operations (strengthen, weaken, prune) go through the C++ bridge.
+    Memory queries go DIRECTLY to MSSQL via pyodbc (the C++ bridge's in-memory
+    index may not be populated with existing data).
     """
 
-    def __init__(self, dim: int = 384):
+    def __init__(self, dim: int = 1024):
         import sqlite3
 
         self._cpp = NeuralMemoryCpp()
         self._cpp.initialize(dim=dim)
+        self._dim = dim
         logger.info("CppDreamBackend initialized (dim=%d)", dim)
+
+        # Direct MSSQL connection for queries
+        self._mssql_conn = None
+        import os
+        mssql_server = os.environ.get("MSSQL_SERVER", "")
+        mssql_password = os.environ.get("MSSQL_PASSWORD", "")
+        if mssql_server and mssql_password:
+            try:
+                import pyodbc
+                self._mssql_conn = pyodbc.connect(
+                    f"DRIVER={os.environ.get('MSSQL_DRIVER', '{ODBC Driver 18 for SQL Server}')};"
+                    f"SERVER={mssql_server};"
+                    f"DATABASE={os.environ.get('MSSQL_DATABASE', 'NeuralMemory')};"
+                    f"UID={os.environ.get('MSSQL_USERNAME', 'SA')};"
+                    f"PWD={mssql_password};"
+                    f"TrustServerCertificate=yes;",
+                    autocommit=True
+                )
+                logger.info("CppDreamBackend: direct MSSQL connection established")
+            except Exception as e:
+                logger.warning("CppDreamBackend: MSSQL direct connection failed: %s", e)
 
         # Lightweight SQLite for dream session tracking only
         db_path = str(Path.home() / ".neural_memory" / "dream_sessions.db")
@@ -115,109 +135,192 @@ class CppDreamBackend(DreamBackend):
     # -- Graph Operations (ALL via C++ → MSSQL) --
 
     def get_recent_memories(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get recent memories from MSSQL via C++ stats."""
-        stats = self._cpp.get_stats()
-        total = stats.get('graph_nodes', 0)
-        if total == 0:
+        """Get recent memories directly from MSSQL."""
+        if not self._mssql_conn:
             return []
-        # Return the last N IDs (MSSQL stores them sequentially)
-        return [{"id": i} for i in range(max(1, total - limit + 1), total + 1)]
+        try:
+            rows = self._mssql_conn.execute(
+                "SELECT TOP (?) id FROM memories ORDER BY created_at DESC",
+                (limit,)
+            ).fetchall()
+            return [{"id": r[0]} for r in rows]
+        except Exception as e:
+            logger.debug("get_recent_memories failed: %s", e)
+            return []
 
     def get_random_memories(self, limit: int = 30) -> List[Dict[str, Any]]:
-        """Get a random sample of memories from the full history.
-
-        Picks random IDs from the sequential ID space.
-        """
-        stats = self._cpp.get_stats()
-        total = stats.get('graph_nodes', 0)
-        if total == 0:
+        """Get a random sample of memories directly from MSSQL."""
+        if not self._mssql_conn:
             return []
-        sample_size = min(limit, total)
-        ids = random.sample(range(1, total + 1), sample_size)
-        return [{"id": i} for i in ids]
+        try:
+            rows = self._mssql_conn.execute(
+                "SELECT TOP (?) id FROM memories ORDER BY NEWID()",
+                (limit,)
+            ).fetchall()
+            return [{"id": r[0]} for r in rows]
+        except Exception as e:
+            logger.debug("get_random_memories failed: %s", e)
+            return []
 
     def get_isolated_memories(self, max_connections: int = 3,
                                limit: int = 50,
                                oldest_first: bool = False) -> List[Dict[str, Any]]:
-        """Find memories with few edges via C++ get_edges."""
-        stats = self._cpp.get_stats()
-        total_nodes = stats.get('graph_nodes', 0)
-        if total_nodes == 0:
+        """Find memories with few edges directly from MSSQL."""
+        if not self._mssql_conn:
             return []
-
-        # Scan direction: oldest-first (ascending) or newest-first (descending)
-        if oldest_first:
-            scan_range = range(1, total_nodes + 1)
-        else:
-            scan_range = range(total_nodes, 0, -1)
-
-        isolated = []
-        for node_id in scan_range:
-            edges = self._cpp.get_edges(node_id, max_edges=20)
-            if len(edges) < max_connections:
-                isolated.append({
-                    "id": node_id,
-                    "connection_count": len(edges),
-                })
-            if len(isolated) >= limit:
-                break
-        return isolated
+        try:
+            order = "ASC" if oldest_first else "DESC"
+            rows = self._mssql_conn.execute(f"""
+                SELECT TOP (?) m.id, m.content,
+                    (SELECT COUNT(*) FROM connections
+                     WHERE source_id = m.id OR target_id = m.id) as cnt
+                FROM memories m
+                WHERE (SELECT COUNT(*) FROM connections
+                       WHERE source_id = m.id OR target_id = m.id) < ?
+                ORDER BY m.created_at {order}
+            """, (limit, max_connections)).fetchall()
+            return [{"id": r[0], "content": r[1] or "", "connection_count": r[2]} for r in rows]
+        except Exception as e:
+            logger.debug("get_isolated_memories failed: %s", e)
+            return []
 
     def get_connections(self) -> List[Dict[str, Any]]:
-        """Get all edges from MSSQL via C++ count + iterate."""
-        # For the insight phase, we need all edges
-        # C++ get_edges is per-node, so we iterate
-        stats = self._cpp.get_stats()
-        total_nodes = stats.get('graph_nodes', 0)
-        if total_nodes == 0:
+        """Get all edges from MSSQL (capped for perf)."""
+        if not self._mssql_conn:
             return []
-
-        all_edges = []
-        seen = set()
-        for node_id in range(1, min(total_nodes + 1, 500)):  # Cap for perf
-            edges = self._cpp.get_edges(node_id, max_edges=100)
-            for e in edges:
-                key = (min(e['from_id'], e['to_id']), max(e['from_id'], e['to_id']))
-                if key not in seen:
-                    seen.add(key)
-                    all_edges.append({
-                        "source_id": e['from_id'],
-                        "target_id": e['to_id'],
-                        "weight": e['weight'],
-                    })
-        return all_edges
+        try:
+            rows = self._mssql_conn.execute("""
+                SELECT TOP 50000 source_id, target_id, weight
+                FROM connections
+                WHERE weight >= 0.05
+            """).fetchall()
+            return [{"source_id": r[0], "target_id": r[1], "weight": r[2]} for r in rows]
+        except Exception as e:
+            logger.debug("get_connections failed: %s", e)
+            return []
 
     def strengthen_connection(self, source_id: int, target_id: int,
                                delta: float = 0.05) -> None:
-        """Strengthen via C++ batch_strengthen_edges."""
-        self._cpp.batch_strengthen_edges([(source_id, target_id)], delta)
+        """Strengthen edge in connections table via MSSQL."""
+        if not self._mssql_conn:
+            return
+        try:
+            self._mssql_conn.execute(
+                "UPDATE connections SET weight = MIN(weight + ?, 1.0) "
+                "WHERE source_id = ? AND target_id = ?",
+                delta, source_id, target_id
+            )
+        except Exception as e:
+            logger.debug("strengthen_connection failed: %s", e)
+
+    def batch_strengthen_connections(self, edges: list, delta: float = 0.05) -> int:
+        """Batch update strengthened edge weights in connections table.
+        
+        Accepts list of (new_weight, source_id, target_id) tuples from the
+        dream engine's NREM phase.
+        """
+        if not edges or not self._mssql_conn:
+            return 0
+        try:
+            cursor = self._mssql_conn.cursor()
+            for item in edges:
+                new_w, src, tgt = item
+                cursor.execute(
+                    "UPDATE connections SET weight = ? "
+                    "WHERE source_id = ? AND target_id = ?",
+                    new_w, src, tgt
+                )
+            return len(edges)
+        except Exception as e:
+            logger.debug("batch_strengthen failed: %s", e)
+            return 0
 
     def weaken_connection(self, source_id: int, target_id: int,
                            delta: float = 0.01) -> None:
-        """Weaken individual edge — batch_strengthen with negative delta."""
-        # For individual weaken, use add_edge with reduced weight
-        # (C++ doesn't have single-weaken, use bulk for batch)
-        edges = self._cpp.get_edges(source_id, max_edges=100)
-        for e in edges:
-            if e['to_id'] == target_id or e['from_id'] == target_id:
-                new_w = max(e['weight'] - delta, 0.0)
-                self._cpp.add_edge(e['from_id'], e['to_id'], new_w)
-                break
+        """Weaken edge in connections table via MSSQL."""
+        if not self._mssql_conn:
+            return
+        try:
+            self._mssql_conn.execute(
+                "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
+                "WHERE source_id = ? AND target_id = ?",
+                delta, source_id, target_id
+            )
+        except Exception as e:
+            logger.debug("weaken_connection failed: %s", e)
+
+    def batch_weaken_connections(self, updates: list, **kwargs) -> int:
+        """Batch update weakened edge weights in connections table.
+        
+        Accepts list of (new_weight, source_id, target_id) tuples from the
+        dream engine's NREM phase.
+        """
+        if not updates or not self._mssql_conn:
+            return 0
+        try:
+            cursor = self._mssql_conn.cursor()
+            for new_w, src, tgt in updates:
+                cursor.execute(
+                    "UPDATE connections SET weight = ? "
+                    "WHERE source_id = ? AND target_id = ?",
+                    new_w, src, tgt
+                )
+            return len(updates)
+        except Exception as e:
+            logger.debug("batch_weaken failed: %s", e)
+            return 0
 
     def add_bridge(self, source_id: int, target_id: int,
                     weight: float = 0.3) -> None:
-        """Add bridge edge via C++."""
-        self._cpp.add_edge(source_id, target_id, weight, "bridge")
+        """Add bridge edge to connections table via MSSQL."""
+        if not self._mssql_conn:
+            return
+        try:
+            # Check if connection already exists (either direction)
+            existing = self._mssql_conn.execute(
+                "SELECT id FROM connections "
+                "WHERE (source_id = ? AND target_id = ?) "
+                "OR (source_id = ? AND target_id = ?)",
+                source_id, target_id, target_id, source_id
+            ).fetchone()
+            if not existing:
+                self._mssql_conn.execute(
+                    "INSERT INTO connections (source_id, target_id, weight, edge_type) "
+                    "VALUES (?, ?, ?, ?)",
+                    source_id, target_id, weight, "bridge"
+                )
+        except Exception as e:
+            logger.debug("add_bridge failed: %s", e)
 
     def prune_weak(self, threshold: float = 0.05) -> int:
-        """Prune weak edges via C++ bulk_weaken_prune."""
-        return self._cpp.bulk_weaken_prune(0.0, threshold)
+        """Prune weak connections from connections table via MSSQL."""
+        if not self._mssql_conn:
+            return 0
+        try:
+            cursor = self._mssql_conn.execute(
+                "DELETE FROM connections WHERE weight < ?",
+                threshold
+            )
+            return cursor.rowcount if hasattr(cursor, 'rowcount') else 0
+        except Exception as e:
+            logger.debug("prune_weak failed: %s", e)
+            return 0
 
     def log_connection_change(self, source_id: int, target_id: int,
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
-        """Skip — C++ handles this internally via GraphEdges updates."""
-        pass
+        """Log connection change to connection_history table."""
+        if not self._mssql_conn:
+            return
+        try:
+            self._mssql_conn.execute(
+                "INSERT INTO connection_history "
+                "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
+                "VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME())",
+                source_id, target_id, old_weight, new_weight, reason
+            )
+        except Exception as e:
+            logger.debug("log_connection_change failed: %s", e)
 
     def add_insight(self, session_id: int, insight_type: str,
                     source_memory_id: int, content: str,
