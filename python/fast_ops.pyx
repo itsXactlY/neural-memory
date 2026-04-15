@@ -215,3 +215,117 @@ def top_k_indices(double[:] scores, int k):
                     break
 
     return [(idx, scores[idx]) for idx in top_indices]
+
+
+# ---------------------------------------------------------------------------
+# Multi-Signal Scoring (Cython-accelerated)
+# ---------------------------------------------------------------------------
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def multi_signal_score(double embed_sim, double temporal_score,
+                       double freq_score, double graph_score,
+                       tuple weights=(0.6, 0.15, 0.15, 0.1)) -> double:
+    """Compute single combined score from multiple signals.
+
+    Args:
+        embed_sim: Cosine similarity score (0-1)
+        temporal_score: Temporal decay score (0-1)
+        freq_score: Frequency/access count score (0-1)
+        graph_score: Graph relevance score (0-1)
+        weights: (w_embed, w_temporal, w_freq, w_graph) tuple
+
+    Returns:
+        Combined weighted score
+    """
+    cdef double w_e = weights[0]
+    cdef double w_t = weights[1]
+    cdef double w_f = weights[2]
+    cdef double w_g = weights[3]
+
+    return w_e * embed_sim + w_t * temporal_score + w_f * freq_score + w_g * graph_score
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def batch_multi_signal_score(double[:] query, list candidates_data,
+                              tuple weights=(0.6, 0.15, 0.15, 0.1)) -> list:
+    """Batch multi-signal scoring for a list of candidates.
+
+    Args:
+        query: Query embedding vector (D,)
+        candidates_data: List of dicts with keys:
+            'embedding' (list[float]), 'timestamp' (float),
+            'access_count' (float), 'graph_score' (float)
+        weights: (w_embed, w_temporal, w_freq, w_graph)
+
+    Returns:
+        List of combined scores (one per candidate)
+    """
+    cdef int n = len(candidates_data)
+    cdef int d = query.shape[0]
+    cdef int i, j
+    cdef double dot, nq = 0.0, nb, embed_sim, temp_score, freq_score, g_score
+    cdef double w_e = weights[0], w_t = weights[1], w_f = weights[2], w_g = weights[3]
+    cdef double now_epoch, age_hours, half_life = 24.0
+    cdef double decay_factor = -0.693 / (half_life * 3600.0)
+    cdef list results = []
+    cdef dict cand
+    cdef list emb
+
+    import time
+    now_epoch = time.time()
+
+    # Precompute query norm
+    for j in range(d):
+        nq += query[j] * query[j]
+    nq = sqrt(nq)
+
+    if nq == 0.0:
+        return [0.0] * n
+
+    # Find max access count for normalization
+    cdef double max_acc = 1.0
+    for i in range(n):
+        acc = (<dict>candidates_data[i]).get('access_count', 1.0)
+        if acc > max_acc:
+            max_acc = acc
+
+    for i in range(n):
+        cand = <dict>candidates_data[i]
+        emb = <list>cand['embedding']
+
+        # Cosine similarity
+        dot = 0.0
+        nb = 0.0
+        for j in range(d):
+            dot += query[j] * <double>emb[j]
+            nb += <double>emb[j] * <double>emb[j]
+        if nb == 0.0:
+            embed_sim = 0.0
+        else:
+            embed_sim = dot / (nq * sqrt(nb))
+
+        # Temporal decay
+        ts = <double>cand.get('timestamp', 0.0)
+        if ts <= 0:
+            temp_score = 0.5
+        else:
+            age_hours = (now_epoch - ts) / 3600.0
+            if age_hours < 0:
+                temp_score = 1.0
+            else:
+                temp_score = exp(decay_factor * age_hours)
+
+        # Frequency score (normalized)
+        freq_score = (<double>cand.get('access_count', 1.0)) / max_acc
+        if freq_score > 1.0:
+            freq_score = 1.0
+
+        # Graph score
+        g_score = <double>cand.get('graph_score', 0.0)
+
+        # Combined
+        results.append(w_e * embed_sim + w_t * temp_score + w_f * freq_score + w_g * g_score)
+
+    return results

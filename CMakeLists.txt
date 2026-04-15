@@ -57,6 +57,8 @@ set(NEURAL_SOURCES
     src/simd/simd_engine.cpp
     src/memory/hopfield.cpp src/memory/consolidation.cpp
     src/memory/memory_manager.cpp src/memory/vsa.cpp
+    src/memory/knn.cpp
+    src/memory/lstm.cpp
     src/graph/knowledge_graph.cpp
     src/core/memory_adapter.cpp
     src/core/c_api.cpp

@@ -227,6 +227,84 @@ NEURAL_API void neural_memory_set_consolidation_threshold(NeuralMemoryHandle han
 
 NEURAL_API void neural_memory_stats(NeuralMemoryHandle handle, NeuralMemoryStats* stats);
 
+// ============================================================================
+// LSTM Predictor (opaque handle)
+// ============================================================================
+
+typedef void* LSTMPredictorHandle;
+
+// Create LSTM predictor. Returns NULL on failure.
+NEURAL_API LSTMPredictorHandle nm_lstm_create(int input_dim, int hidden_dim);
+
+// Forward pass: predict next embedding from sequence.
+// sequence: float array of shape (seq_len * input_dim), row-major.
+// output: float array of length input_dim (written by function).
+// Returns 0 on success, -1 on error.
+NEURAL_API int nm_lstm_forward(LSTMPredictorHandle handle,
+                                const float* sequence, int seq_len,
+                                float* output);
+
+// Train on one (sequence, target) pair. Returns MSE loss.
+// Returns -1.0f on error.
+NEURAL_API float nm_lstm_train(LSTMPredictorHandle handle,
+                                const float* sequence, int seq_len,
+                                const float* target, float lr);
+
+// Save/load weights. Returns 0 on success, -1 on error.
+NEURAL_API int nm_lstm_save(LSTMPredictorHandle handle, const char* path);
+NEURAL_API LSTMPredictorHandle nm_lstm_load(const char* path, int input_dim, int hidden_dim);
+
+// Destroy LSTM predictor.
+NEURAL_API void nm_lstm_destroy(LSTMPredictorHandle handle);
+
+// ============================================================================
+// kNN Engine (opaque handle)
+// ============================================================================
+
+typedef void* KNNEngineHandle;
+
+// kNN search result
+typedef struct {
+    uint64_t id;
+    float score;
+    float embed_similarity;
+    float temporal_score;
+    float freq_score;
+    float graph_score;
+} KNNCResult;
+
+// Create kNN engine. Returns NULL on failure.
+NEURAL_API KNNEngineHandle nm_knn_create(int embed_dim);
+
+// Search candidates with multi-signal scoring.
+// query: float array of length embed_dim
+// candidates: float array of shape (count * embed_dim), row-major
+// candidate_ids: uint64_t array of length count
+// timestamps: float array of length count (epoch seconds)
+// access_counts: float array of length count
+// graph_scores: float array of length count (0-1)
+// lstm_context: optional float array of length embed_dim (NULL to skip)
+// results: output KNNCResult array of length k (must be pre-allocated)
+// Returns actual number of results, -1 on error.
+NEURAL_API int nm_knn_search(KNNEngineHandle handle,
+                              const float* query, int embed_dim,
+                              const float* candidates,
+                              const uint64_t* candidate_ids,
+                              int count, int k,
+                              const float* timestamps,
+                              const float* access_counts,
+                              const float* graph_scores,
+                              const float* lstm_context,
+                              KNNCResult* results);
+
+// Adjust weights based on LSTM context.
+// lstm_context: optional (NULL to reset to defaults).
+NEURAL_API void nm_knn_adjust_weights(KNNEngineHandle handle,
+                                       const float* lstm_context);
+
+// Destroy kNN engine.
+NEURAL_API void nm_knn_destroy(KNNEngineHandle handle);
+
 #ifdef __cplusplus
 }
 #endif
