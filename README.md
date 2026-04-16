@@ -12,6 +12,7 @@ Semantic memory system with knowledge graph, spreading activation, embedding-bas
 
 
 [![Demo](assets/cover.png)](https://github.com/user-attachments/assets/2d938624-cc39-4f8b-b35b-485b23e93355)
+[![Dashboard](assets/neural_memory.png)](https://raw.githubusercontent.com/itsXactlY/neural-memory/refs/heads/master/assets/neural_memory.png)
 
 ## Features
 
@@ -348,12 +349,34 @@ When storing a memory with similar content to an existing one:
 
 ## Dashboard
 
-Interactive HTML dashboard with knowledge graph visualization, category breakdowns, and connection analysis.
+Interactive 3D knowledge graph visualization — fully offline, zero CDN dependencies.
 
 ```bash
-python tools/dashboard/generate.py                                    # SQLite
-python tools/dashboard/generate.py --mssql --mssql-password 'pass'    # MSSQL
+cd tools/dashboard
+
+# Generate from SQLite
+python3 generate.py -o ~/neural_memory_dashboard.html
+
+# Generate from MSSQL
+python3 generate.py --mssql --mssql-password 'pass' -o ~/dashboard.html
+
+# Generate + serve via HTTPS (self-signed cert)
+python3 generate.py --serve --port 8443
 ```
+
+**Features:**
+- **3D Force Graph** — full-viewport WebGL graph (vasturiano/3d-force-graph + Three.js), force-directed layout with directional particles, clickable nodes with camera focus
+- **Amber Theme** — `#f5b731` on deep black `#0a0a12`, matching hermelinChat skin
+- **HUD Panel** — top-left: memory count, connections, avg degree, graph density, embedding dim
+- **Detail Panel** — right slide-in on node click: category, salience bar, degree (in/out/total), access count, connected nodes (clickable)
+- **Search** — top-center fuzzy search by label or ID, click to focus + open detail
+- **Category Legend** — top-right, click to highlight/filter nodes by category
+- **Mini Charts** — bottom bar: category donut, connection strength bars, degree histogram (Plotly)
+- **Controls** — camera reset, pause/resume simulation, toggle labels
+
+**Offline-First:** All JS libraries (Plotly ~3.5 MB, Three.js ~670 KB, 3d-force-graph ~690 KB) embedded inline. SpriteText replaced with canvas-based inline class. No external CDN calls. Generated HTML is fully self-contained (~5.4 MB).
+
+**Library Cache:** `tools/dashboard/.lib_cache/` — auto-downloaded on first `generate.py` run.
 
 ## Troubleshooting
 

@@ -14,3 +14,5 @@ Makefile
 .env
 build_debug/
 benchmarks/results
+tools/dashboard/.certs/
+*.bak
