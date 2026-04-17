@@ -42,7 +42,7 @@ class SentenceTransformerBackend:
         
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         
-        # Detect best device (with GPU memory check)
+        # Detect best device: CUDA > MPS (Metal) > CPU
         device = 'cpu'
         if torch.cuda.is_available():
             try:
@@ -57,8 +57,14 @@ class SentenceTransformerBackend:
                     print(f"[embed] CUDA: {gpu_name} but only {free_mem:.0f} MB free — using CPU")
             except Exception:
                 print(f"[embed] CUDA detected but memory check failed — using CPU")
+        if device == 'cpu' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            try:
+                device = 'mps'
+                print(f"[embed] Metal (MPS) detected — using Apple Silicon GPU")
+            except Exception:
+                print(f"[embed] MPS detected but failed to initialize — using CPU")
         if device == 'cpu':
-            print(f"[embed] CPU only")
+            print(f"[embed] CPU only (no GPU detected)")
         
         # Build cache dir name: BAAI/bge-m3 → models--BAAI--bge-m3
         safe_name = self.MODEL_NAME.replace('/', '--')
@@ -326,13 +332,18 @@ class EmbeddingProvider:
     
     def _auto_detect(self):
         """Auto-detect best available backend.
-        Priority: CUDA sentence-transformers > CPU sentence-transformers > TF-IDF > hash
+        Priority: CUDA sentence-transformers > MPS sentence-transformers > CPU sentence-transformers > TF-IDF > hash
         """
-        # Try sentence-transformers first (CUDA or CPU)
+        # Try sentence-transformers first (CUDA, MPS, or CPU)
         try:
             import sentence_transformers
             import torch
-            device = "CUDA" if torch.cuda.is_available() else "CPU"
+            if torch.cuda.is_available():
+                device = "CUDA"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = "MPS"
+            else:
+                device = "CPU"
             backend = SentenceTransformerBackend()
             print(f"[embed] Auto-selected: sentence-transformers ({device})")
             return backend

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 cpp_bridge.py - ctypes wrapper for the C++ Neural Memory library
-Provides Pythonic interface to libneural_memory.so
+Provides Pythonic interface to libneural_memory.so / libneural_memory.dylib
 """
 
 import ctypes
 import ctypes.util
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -14,19 +15,39 @@ from typing import Optional
 # ============================================================================
 
 def _find_lib() -> str:
+    is_mac = sys.platform == 'darwin'
+    ext = 'dylib' if is_mac else 'so'
+    lib_name = f'libneural_memory.{ext}'
+
     candidates = [
-        Path(__file__).parent.parent / "build" / "libneural_memory.so",
-        Path.home() / "projects" / "neural-memory-adapter" / "build" / "libneural_memory.so",
-        Path("/usr/local/lib/libneural_memory.so"),
-        Path("/usr/lib/libneural_memory.so"),
+        Path(__file__).parent.parent / "build" / lib_name,
+        Path.home() / "projects" / "neural-memory-adapter" / "build" / lib_name,
+        Path(f"/usr/local/lib/{lib_name}"),
+        Path(f"/usr/lib/{lib_name}"),
     ]
+    # On macOS, also check .so fallback; on Linux also check .dylib
+    alt_ext = 'so' if is_mac else 'dylib'
+    alt_name = f'libneural_memory.{alt_ext}'
+    candidates += [
+        Path(__file__).parent.parent / "build" / alt_name,
+        Path.home() / "projects" / "neural-memory-adapter" / "build" / alt_name,
+    ]
+
     for p in candidates:
         if p.exists():
             return str(p)
-    # Try LD_LIBRARY_PATH
+    # Try system library search path (LD_LIBRARY_PATH / DYLD_LIBRARY_PATH)
     lib = ctypes.util.find_library("neural_memory")
     if lib:
         return lib
+    if is_mac:
+        raise FileNotFoundError(
+            f"libneural_memory.dylib not found. Build for macOS first:\n"
+            "  cd ~/projects/neural-memory-adapter/build\n"
+            "  cmake .. -DCMAKE_OSX_ARCHITECTURES=$(uname -m) && cmake --build . -j$(sysctl -n hw.ncpu)\n"
+            # NOTE: On macOS, CMake produces .dylib by default.
+            # If cross-compiling, use: cmake .. -DCMAKE_SYSTEM_NAME=Darwin
+        )
     raise FileNotFoundError(
         "libneural_memory.so not found. Build first:\n"
         "  cd ~/projects/neural-memory-adapter/build && cmake --build . -j$(nproc)"
@@ -395,20 +416,21 @@ class NeuralMemoryCpp:
 if __name__ == "__main__":
     try:
         mem = NeuralMemoryCpp()
-        mem.initialize(dim=384)
+        DIM = 384  # test dimension; real usage gets dim from embedder
+        mem.initialize(dim=DIM)
         print(f"Initialized C++ adapter")
         
         # Store some test data
         import random
         for i in range(5):
-            vec = [random.uniform(-1, 1) for _ in range(384)]
+            vec = [random.uniform(-1, 1) for _ in range(DIM)]
             norm = sum(x*x for x in vec) ** 0.5
             vec = [x/norm for x in vec]
             mid = mem.store(vec, f"test_{i}", f"Test memory {i}")
             print(f"  Stored: [{mid}] test_{i}")
         
         # Retrieve
-        query = [random.uniform(-1, 1) for _ in range(384)]
+        query = [random.uniform(-1, 1) for _ in range(DIM)]
         norm = sum(x*x for x in query) ** 0.5
         query = [x/norm for x in query]
         results = mem.retrieve(query, k=3)

@@ -10,7 +10,11 @@
 #endif
 
 #include <iostream>
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
 #include <cpuid.h>
+#define HAS_CPUID 1
+#endif
 
 namespace neural {
 namespace simd {
@@ -29,6 +33,7 @@ struct CpuFeatures {
 static CpuFeatures g_features;
 static bool g_detected = false;
 
+#ifdef HAS_CPUID
 const CpuFeatures& detect_cpu() {
     if (g_detected) return g_features;
     
@@ -49,6 +54,20 @@ const CpuFeatures& detect_cpu() {
     g_detected = true;
     return g_features;
 }
+#else
+// ARM: NEON is mandatory on aarch64, no runtime detection needed
+const CpuFeatures& detect_cpu() {
+    if (g_detected) return g_features;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    g_features.sse41 = false;  // N/A on ARM
+    g_features.avx2 = false;
+    g_features.avx512 = false;
+    g_features.fma = true;     // NEON supports fused multiply-add
+#endif
+    g_detected = true;
+    return g_features;
+}
+#endif
 
 void print_simd_info() {
     auto& f = detect_cpu();
@@ -57,11 +76,11 @@ void print_simd_info() {
     std::cout << "  AVX2:   " << (f.avx2 ? "YES" : "NO") << "\n";
     std::cout << "  AVX512: " << (f.avx512 ? "YES" : "NO") << "\n";
     std::cout << "  FMA:    " << (f.fma ? "YES" : "NO") << "\n";
-    #ifdef _OPENMP
+#ifdef _OPENMP
     std::cout << "  OpenMP: YES (max threads: " << omp_get_max_threads() << ")\n";
-    #else
+#else
     std::cout << "  OpenMP: NO\n";
-    #endif
+#endif
 }
 
 } // namespace simd

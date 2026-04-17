@@ -1,6 +1,5 @@
 # CMakeLists.txt - Neural Memory Adapter
 # Production: cmake .. -DCMAKE_BUILD_TYPE=Release
-# Sandbox:    cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=x86-64"
 cmake_minimum_required(VERSION 3.20)
 project(neural-memory-adapter VERSION 1.0.0 LANGUAGES CXX)
 
@@ -10,15 +9,27 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(OPT_FLAGS -O3 -DNDEBUG -march=x86-64 -flto)
+# Platform-specific optimization flags
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64" AND APPLE)
+    # Apple Silicon (M1/M2/M3/M4): use ARM NEON
+    message(STATUS "Apple Silicon detected: using ARM NEON optimizations")
+    set(OPT_FLAGS -O3 -DNDEBUG -march=armv8-a+simd -flto)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    # Linux/other ARM64
+    message(STATUS "ARM64 detected: using NEON optimizations")
+    set(OPT_FLAGS -O3 -DNDEBUG -march=armv8-a+simd -flto)
+else()
+    # x86/x86_64
+    set(OPT_FLAGS -O3 -DNDEBUG -flto)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx2" HAS_AVX2)
+    if(HAS_AVX2)
+        list(APPEND OPT_FLAGS -march=x86-64-v2 -mavx2 -mfma)
+    else()
+        list(APPEND OPT_FLAGS -march=x86-64)
+    endif()
+endif()
 set(WARN_FLAGS -Wall -Wextra -Wpedantic -Wno-unused-parameter)
-
-include(CheckCXXCompilerFlag)
-set(HAS_AVX2 FALSE)
-# AVX-512: disabled by default (Ryzen 7 3800X doesn't have it)
-set(HAS_AVX512 FALSE)
-
-# sandbox
 
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -74,11 +85,18 @@ endif()
 
 add_library(neural_memory SHARED ${NEURAL_SOURCES})
 target_compile_options(neural_memory PRIVATE ${OPT_FLAGS} ${WARN_FLAGS})
-target_link_libraries(neural_memory PRIVATE
-    $<$<BOOL:${USE_MSSQL}>:${ODBC_LIBRARIES}>
-    $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
-    pthread stdc++
-)
+if(APPLE)
+    target_link_libraries(neural_memory PRIVATE
+        $<$<BOOL:${USE_MSSQL}>:${ODBC_LIBRARIES}>
+        $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
+    )
+else()
+    target_link_libraries(neural_memory PRIVATE
+        $<$<BOOL:${USE_MSSQL}>:${ODBC_LIBRARIES}>
+        $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
+        pthread stdc++
+    )
+endif()
 set_target_properties(neural_memory PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 1)
 
 add_executable(bench_vector_ops src/benchmarks/bench_vector_ops.cpp)
