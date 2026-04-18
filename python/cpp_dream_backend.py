@@ -206,9 +206,9 @@ class CppDreamBackend(DreamBackend):
             return
         try:
             self._mssql_conn.execute(
-                "UPDATE connections SET weight = MIN(weight + ?, 1.0) "
+                "UPDATE connections SET weight = CASE WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
                 "WHERE source_id = ? AND target_id = ?",
-                delta, source_id, target_id
+                delta, delta, source_id, target_id
             )
         except Exception as e:
             logger.debug("strengthen_connection failed: %s", e)
@@ -258,9 +258,9 @@ class CppDreamBackend(DreamBackend):
             return
         try:
             self._mssql_conn.execute(
-                "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
+                "UPDATE connections SET weight = CASE WHEN weight - ? < 0.0 THEN 0.0 ELSE weight - ? END "
                 "WHERE source_id = ? AND target_id = ?",
-                delta, source_id, target_id
+                delta, delta, source_id, target_id
             )
         except Exception as e:
             logger.debug("weaken_connection failed: %s", e)
@@ -282,9 +282,9 @@ class CppDreamBackend(DreamBackend):
             try:
                 cursor = self._mssql_conn.cursor()
                 cursor.execute(
-                    "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
+                    "UPDATE connections SET weight = CASE WHEN weight - ? < 0.0 THEN 0.0 ELSE weight - ? END "
                     "WHERE weight > ?",
-                    delta, threshold
+                    delta, delta, threshold
                 )
                 return cursor.rowcount
             except Exception as e:
@@ -346,15 +346,20 @@ class CppDreamBackend(DreamBackend):
     def log_connection_change(self, source_id: int, target_id: int,
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
-        """Log connection change to connection_history table."""
+        """Log connection change to connection_history table (UPSERT)."""
         if not self._mssql_conn:
             return
         try:
             self._mssql_conn.execute(
-                "INSERT INTO connection_history "
-                "(source_id, target_id, old_weight, new_weight, reason, changed_at) "
-                "VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME())",
-                source_id, target_id, old_weight, new_weight, reason
+                "MERGE connection_history AS target "
+                "USING (VALUES (?, ?)) AS src(source_id, target_id) "
+                "ON target.source_id = src.source_id AND target.target_id = src.target_id "
+                "WHEN MATCHED THEN UPDATE SET old_weight=?, new_weight=?, reason=?, changed_at=SYSUTCDATETIME() "
+                "WHEN NOT MATCHED THEN INSERT (source_id, target_id, old_weight, new_weight, reason, changed_at) "
+                "VALUES (?, ?, ?, ?, ?, SYSUTCDATETIME());",
+                source_id, target_id,   # USING
+                old_weight, new_weight, reason,  # UPDATE SET
+                source_id, target_id, old_weight, new_weight, reason  # INSERT
             )
         except Exception as e:
             logger.debug("log_connection_change failed: %s", e)

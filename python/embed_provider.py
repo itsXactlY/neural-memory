@@ -179,7 +179,9 @@ class SharedEmbedServer:
     def _process(self, req):
         cmd = req.get("cmd")
         self._last_used = time.time()
-        self._ensure_on_device()
+        # Only reload GPU for actual embedding work, not status/ping/eject
+        if cmd in ("embed", "embed_batch"):
+            self._ensure_on_device()
         
         with self._lock:
             try:
@@ -209,16 +211,24 @@ class SharedEmbedServer:
     
     def _ensure_on_device(self):
         if self._original_device == 'cpu':
-            return
+            return True
         try:
             import torch
             current = next(self.model.parameters()).device
             if current.type == 'cpu' and self._original_device == 'cuda':
+                free = torch.cuda.mem_get_info(0)[0] / 1024**2
+                if free < 500:
+                    print(f"[embed-server] WARNING: Only {free:.0f}MB free VRAM, staying on CPU", file=sys.stderr)
+                    return False
                 self.model.to('cuda')
+                print(f"[embed-server] Reloaded to GPU")
             elif current.type == 'cpu' and self._original_device == 'mps':
                 self.model.to('mps')
-        except Exception:
-            pass
+                print(f"[embed-server] Reloaded to MPS")
+            return True
+        except Exception as e:
+            print(f"[embed-server] GPU reload failed: {e}, staying on CPU", file=sys.stderr)
+            return False
     
     def _eject_to_cpu(self):
         try:
@@ -260,13 +270,15 @@ class SharedEmbedServer:
 class SharedEmbedClient:
     """Client that connects to SharedEmbedServer via UNIX socket."""
     
-    def __init__(self):
+    def __init__(self, timeout=30.0):
         self._sock = None
         self._dim = None
+        self._timeout = timeout
         self._connect()
     
     def _connect(self):
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(self._timeout)
         self._sock.connect(str(SOCKET_PATH))
         # Get dim
         resp = self._send({"cmd": "ping"})
@@ -426,7 +438,17 @@ class SentenceTransformerBackend:
     
     def embed(self, text: str) -> list[float]:
         if self._is_client:
-            return self._client.embed(text)
+            try:
+                return self._client.embed(text)
+            except (socket.timeout, OSError, RuntimeError) as e:
+                print(f"[embed] Server timeout ({e}), reconnecting...", file=sys.stderr)
+                try:
+                    self._client.close()
+                except:
+                    pass
+                # Reconnect — server should be on GPU now
+                self._client = SharedEmbedClient(timeout=60.0)
+                return self._client.embed(text)
         SentenceTransformerBackend._touch()
         SentenceTransformerBackend._ensure_on_device()
         vec = self.model.encode(text, normalize_embeddings=True)
@@ -434,7 +456,16 @@ class SentenceTransformerBackend:
     
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if self._is_client:
-            return self._client.embed_batch(texts)
+            try:
+                return self._client.embed_batch(texts)
+            except (socket.timeout, OSError, RuntimeError) as e:
+                print(f"[embed] Server timeout ({e}), reconnecting...", file=sys.stderr)
+                try:
+                    self._client.close()
+                except:
+                    pass
+                self._client = SharedEmbedClient(timeout=60.0)
+                return self._client.embed_batch(texts)
         SentenceTransformerBackend._touch()
         SentenceTransformerBackend._ensure_on_device()
         vecs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
