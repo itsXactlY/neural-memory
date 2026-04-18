@@ -514,6 +514,54 @@ systemctl status mssql-server
 ss -tlnp | grep 1433
 ```
 
+### MSSQL: vector_dim CHECK constraint violation
+
+Error: `The INSERT statement conflicted with the CHECK constraint "CK_NeuralMemory_v2_Dim"`
+
+Cause: C++ INSERT statements were missing `vector_dim` column. The column defaults to 0, violating the `vector_dim > 0` constraint.
+
+Fix: Already fixed in `src/mssql/vector_store.cpp` and `src/mssql/bulk_ops.cpp`. Rebuild:
+```bash
+cd ~/projects/neural-memory-adapter/build && make -j$(nproc)
+```
+
+### MSSQL: legacy_id unique index conflict
+
+Error: `Cannot insert duplicate key row in object 'dbo.NeuralMemory' with unique index 'UX_NeuralMemory_v2_LegacyId'`
+
+Cause: `legacy_id` defaults to NULL. SQL Server unique indexes only allow one NULL.
+
+Fix: Drop the index (migration artifact, not needed by C++ code):
+```sql
+DROP INDEX UX_NeuralMemory_v2_LegacyId ON dbo.NeuralMemory;
+```
+
+### MSSQL: MAX/MIN function errors in dream engine
+
+Error: `The MAX function requires 1 argument(s)` during dream cycle `batch_weaken`
+
+Cause: `MAX(x, y)` and `MIN(x, y)` are scalar functions in SQLite but aggregate functions in SQL Server.
+
+Fix: Use `CASE WHEN` instead. Already fixed in `cpp_dream_backend.py`:
+```sql
+-- Wrong (SQLite only):
+UPDATE connections SET weight = MAX(weight - 0.01, 0.0)
+-- Correct (SQL Server):
+UPDATE connections SET weight = CASE WHEN weight - 0.01 < 0.0 THEN 0.0 ELSE weight - 0.01 END
+```
+
+### Embed server: model stays on CPU after reload
+
+Cause: `_ensure_on_device()` was called on every request including `status`/`ping`/`eject`, causing an eject→status→reload race.
+
+Fix: `_ensure_on_device()` only called for `embed`/`embed_batch` commands. Already fixed in `embed_provider.py`.
+
+### Embed server: RPC timeout on GPU reload
+
+Cause: Client had no socket timeout. 2.1GB model `.to('cuda')` takes ~600ms.
+
+Fix: Client default timeout 30s, retry with 60s on timeout. Already fixed in `embed_provider.py`.
+
 ### C++ / LSTM+kNN
 
 ```bash
