@@ -115,7 +115,7 @@ def read_sqlite(db_path: str) -> dict:
             "out_degree": r[5], "in_degree": r[6], "total_degree": r[5] + r[6],
             "avg_weight": round(r[7], 4),
         })
-    hub_ids = [n["id"] for n in nodes[:200]]
+    hub_ids = [n["id"] for n in nodes[:120]]
     id_set = set(hub_ids)
     cur.execute("SELECT source_id, target_id, weight FROM connections")
     edges = []
@@ -199,7 +199,7 @@ def read_mssql(mssql_cfg: dict) -> dict:
             "avg_weight": round(r[7], 4),
         })
 
-    hub_ids = [n["id"] for n in nodes[:200]]
+    hub_ids = [n["id"] for n in nodes[:120]]
     id_set = set(hub_ids)
     id_list = ",".join(str(x) for x in hub_ids)
     if id_list:

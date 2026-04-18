@@ -411,7 +411,14 @@ neural-memory-adapter/
 │   ├── mssql_production_migrate.py # MSSQL migration + verification pipeline
 │   ├── test_mssql_production.py    # 24 production verification tests
 │   ├── production_upgrade.py       # SQLite cleanup script (orphans, dedup, VACUUM)
-│   └── dashboard/                  # Interactive HTML dashboard
+│   ├── sync_sqlite_to_mssql.py     # SQLite → MSSQL sync
+│   └── dashboard/
+│       ├── live_server.py          # FastAPI WebSocket live dashboard (port 8443)
+│       ├── generate.py             # Static HTML generator (offline)
+│       ├── template-live.html      # Live dashboard template
+│       ├── template.html           # Static dashboard template
+│       ├── template-desktop.html   # Desktop widget template
+│       └── .lib_cache/             # Embedded JS libraries (auto-downloaded)
 └── README.md
 ```
 
@@ -453,23 +460,32 @@ When storing a memory with similar content to an existing one:
 
 ## Dashboard
 
-Interactive 3D knowledge graph visualization — fully offline, zero CDN dependencies.
+Live 3D knowledge graph with WebSocket auto-refresh — served via FastAPI over HTTPS.
 
 ```bash
 cd tools/dashboard
 
-# Generate from SQLite
+# Live server (auto-detects MSSQL vs SQLite, WebSocket polling every 3s)
+python3 live_server.py --port 8443
+
+# Force SQLite
+python3 live_server.py --db /path/to/memory.db --port 8443
+
+# Generate static HTML (offline, no server needed)
 python3 generate.py -o ~/neural_memory_dashboard.html
+```
 
-# Generate from MSSQL
-python3 generate.py --mssql --mssql-password 'pass' -o ~/dashboard.html
+**Chrome App Mode** (recommended for desktop integration):
+```bash
+# Spawn as standalone window (~50MB vs ~500MB full Chrome)
+google-chrome-stable --new-window --app=https://localhost:8443/ --ignore-certificate-errors --disable-gpu-compositing
 
-# Generate + serve via HTTPS (self-signed cert)
-python3 generate.py --serve --port 8443
+# i3 shortcut: Alt+Shift+E (configured in i3 config)
 ```
 
 **Features:**
 - **3D Force Graph** — full-viewport WebGL graph (vasturiano/3d-force-graph + Three.js), force-directed layout with directional particles, clickable nodes with camera focus
+- **Live Updates** — WebSocket connection auto-refreshes every 3s when data changes
 - **Amber Theme** — `#f5b731` on deep black `#0a0a12`, matching hermelinChat skin
 - **HUD Panel** — top-left: memory count, connections, avg degree, graph density, embedding dim
 - **Detail Panel** — right slide-in on node click: category, salience bar, degree (in/out/total), access count, connected nodes (clickable)
@@ -478,9 +494,9 @@ python3 generate.py --serve --port 8443
 - **Mini Charts** — bottom bar: category donut, connection strength bars, degree histogram (Plotly)
 - **Controls** — camera reset, pause/resume simulation, toggle labels
 
-**Offline-First:** All JS libraries (Plotly ~3.5 MB, Three.js ~670 KB, 3d-force-graph ~690 KB) embedded inline. SpriteText replaced with canvas-based inline class. No external CDN calls. Generated HTML is fully self-contained (~5.4 MB).
+**Offline-First:** All JS libraries (Plotly ~3.5 MB, Three.js ~670 KB, 3d-force-graph ~690 KB) embedded inline. No external CDN calls.
 
-**Library Cache:** `tools/dashboard/.lib_cache/` — auto-downloaded on first `generate.py` run.
+**Library Cache:** `tools/dashboard/.lib_cache/` — auto-downloaded on first run.
 
 ## Troubleshooting
 

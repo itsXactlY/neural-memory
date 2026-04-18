@@ -85,12 +85,14 @@ class Memory:
             except Exception as e:
                 print(f"[neural] MSSQL unavailable ({e}), falling back to SQLite")
                 use_mssql = False
-        
-        # SQLite fallback
+
+        # SQLite always needed for semantic recall (MSSQLStore has no recall method)
+        from memory_client import NeuralMemory
+        self._sqlite_memory = NeuralMemory(db_path=self._db_path, embedding_backend=embedding_backend)
         if not use_mssql:
-            from memory_client import NeuralMemory
-            self._sqlite_memory = NeuralMemory(db_path=self._db_path, embedding_backend=embedding_backend)
             print(f"[neural] SQLite backend: {self._embedder.backend.__class__.__name__} ({self._dim}d)")
+        else:
+            print(f"[neural] Hybrid mode: MSSQL (graph) + SQLite (recall)")
         
         # --- LSTM + kNN (auto-initialized) ---
         self._access_logger = None
@@ -384,27 +386,15 @@ class Memory:
             return self._sqlite_memory.store.store(label or content[:60], content, embedding)
     
     def recall(self, query: str, k: int = 5) -> list[dict]:
-        """Semantic search with LSTM+kNN enhancement. Returns [{id, label, content, similarity}]."""
+        """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall (MSSQLStore has no recall)."""
         embedding = self._embedder.embed(query)
 
-        if self._mssql_store:
-            results = self._mssql_store.recall(embedding, k * 3)  # Overfetch for kNN re-ranking
-            for r in results:
-                conns = self._mssql_store.get_connections(r['id'])
-                r['connections'] = [{'id': c['target'] if c['source'] == r['id'] else c['source'],
-                                     'weight': c['weight']} for c in conns[:3]]
-            # LSTM+kNN re-ranking (keeps embeddings for scoring, strips after)
-            enhanced = self._enhance_recall(embedding, results, k)
-            for r in enhanced:
-                r.pop('embedding', None)
-            return enhanced[:k]
-        else:
-            # SQLite path: get raw results, enhance, return
-            base_results = self._sqlite_memory.recall(query, k * 3)
-            enhanced = self._enhance_recall(embedding, base_results, k)
-            for r in enhanced:
-                r.pop('embedding', None)
-            return enhanced[:k]
+        # Always use SQLite for semantic recall — MSSQL is graph-only
+        base_results = self._sqlite_memory.recall(query, k * 3)
+        enhanced = self._enhance_recall(embedding, base_results, k)
+        for r in enhanced:
+            r.pop('embedding', None)
+        return enhanced[:k]
 
     def recall_multihop(self, query: str, k: int = 5, hops: int = 2) -> list[dict]:
         """Multi-hop retrieval: cosine similarity + graph expansion."""
