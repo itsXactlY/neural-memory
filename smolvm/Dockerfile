@@ -3,6 +3,10 @@
 # Multi-stage build for minimal image size
 # ============================================================
 
+# NOTE: Build from project root:
+#   cd ~/projects/neural-memory-adapter
+#   docker build -f smolvm/Dockerfile -t nm-poc .
+
 # ----------------------------------------------------------
 # Stage 1: Base — Python 3.12 on Alpine
 # ----------------------------------------------------------
@@ -25,7 +29,7 @@ WORKDIR /app
 # ----------------------------------------------------------
 FROM base AS deps
 
-COPY requirements.txt /tmp/requirements.txt
+COPY smolvm/requirements.txt /tmp/requirements.txt
 
 RUN pip install --no-cache-dir --prefix=/install -r /tmp/requirements.txt
 
@@ -34,15 +38,15 @@ RUN pip install --no-cache-dir --prefix=/install -r /tmp/requirements.txt
 # ----------------------------------------------------------
 FROM base AS native
 
-COPY ../build/libneural_memory.so /tmp/libneural_memory.so
+COPY build/libneural_memory.so /tmp/libneural_memory.so
 
 # ----------------------------------------------------------
 # Stage 4: Python source — neural memory module
 # ----------------------------------------------------------
 FROM base AS python-src
 
-COPY ../python/ /tmp/python/
-COPY ../__init__.py /tmp/__init__.py
+COPY python/ /tmp/python/
+COPY __init__.py /tmp/__init__.py
 
 # ----------------------------------------------------------
 # Stage 5: Embed model placeholder (downloaded on first run)
@@ -56,7 +60,7 @@ RUN mkdir -p /app/models/bge-m3
 # ----------------------------------------------------------
 FROM base AS dlm-bridge
 
-COPY dlm_mssql_bridge.py /tmp/dlm_mssql_bridge.py
+COPY smolvm/dlm_mssql_bridge.py /tmp/dlm_mssql_bridge.py
 
 # ----------------------------------------------------------
 # Stage 7: Final — assemble everything
@@ -81,11 +85,11 @@ COPY --from=model /app/models /app/models
 COPY --from=dlm-bridge /tmp/dlm_mssql_bridge.py /app/dlm_mssql_bridge.py
 
 # Copy init scripts and configs
-COPY init.sh /app/init.sh
-COPY start-embed-server.sh /app/start-embed-server.sh
-COPY start-dlm-client.sh /app/start-dlm-client.sh
-COPY Smolfile /app/Smolfile
-COPY odbcinst.ini /etc/odbcinst.ini
+COPY smolvm/init.sh /app/init.sh
+COPY smolvm/start-embed-server.sh /app/start-embed-server.sh
+COPY smolvm/start-dlm-client.sh /app/start-dlm-client.sh
+COPY smolvm/Smolfile /app/Smolfile
+COPY smolvm/odbcinst.ini /etc/odbcinst.ini
 
 RUN chmod +x /app/init.sh /app/start-embed-server.sh /app/start-dlm-client.sh
 
