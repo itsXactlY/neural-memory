@@ -41,7 +41,7 @@ class EmbedProvider:
     Uses the same cache as embed_provider.py: ~/.neural_memory/models/
     """
 
-    MODEL_NAME = "all-MiniLM-L6-v2"
+    MODEL_NAME = "BAAI/bge-m3"
     MODEL_DIR = Path.home() / ".neural_memory" / "models"
 
     _shared_model = None
@@ -59,21 +59,43 @@ class EmbedProvider:
 
         from sentence_transformers import SentenceTransformer
 
-        cached = self.MODEL_DIR / f"models--sentence-transformers--{self.MODEL_NAME}"
-        is_cached = cached.exists()
+        safe_name = self.MODEL_NAME.replace("/", "--")
+        cached = self.MODEL_DIR / f"models--{safe_name}"
+        is_cached = cached.exists() and (cached / "config.json").exists()
 
         if is_cached:
-            logger.info("Loading %s from local cache (%s)...", self.MODEL_NAME, cached)
+            # Find snapshot path
+            snapshot_path = None
+            refs_main = cached / "refs" / "main"
+            if refs_main.exists():
+                snapshot_hash = refs_main.read_text().strip()
+                snap = cached / "snapshots" / snapshot_hash
+                if (snap / "config.json").exists():
+                    snapshot_path = str(snap)
+            if snapshot_path is None:
+                snapshots_dir = cached / "snapshots"
+                if snapshots_dir.exists():
+                    for snap in snapshots_dir.iterdir():
+                        if (snap / "config.json").exists():
+                            snapshot_path = str(snap)
+                            break
+            if snapshot_path:
+                logger.info("Loading %s from local cache (%s)...", self.MODEL_NAME, snapshot_path)
+                self._model = SentenceTransformer(snapshot_path)
+            else:
+                logger.warning("Cache dir exists but no snapshot found, downloading...")
+                self._model = SentenceTransformer(
+                    self.MODEL_NAME,
+                    cache_folder=str(self.MODEL_DIR),
+                )
         else:
-            logger.info("Downloading %s (first time, ~87MB)...", self.MODEL_NAME)
-
-        self._model = SentenceTransformer(
-            self.MODEL_NAME,
-            cache_folder=str(self.MODEL_DIR),
-            local_files_only=is_cached,
-        )
+            logger.info("Downloading %s (first time, ~2.2GB)...", self.MODEL_NAME)
+            self._model = SentenceTransformer(
+                self.MODEL_NAME,
+                cache_folder=str(self.MODEL_DIR),
+            )
         EmbedProvider._shared_model = self._model
-        logger.info("Embedding model ready: %s", self.MODEL_NAME)
+        logger.info("Embedding model ready: %s (%sd)", self.MODEL_NAME, self._model.get_sentence_embedding_dimension())
 
     def embed(self, text: str) -> List[float]:
         self._load()

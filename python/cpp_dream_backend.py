@@ -135,15 +135,15 @@ class CppDreamBackend(DreamBackend):
     # -- Graph Operations (ALL via C++ → MSSQL) --
 
     def get_recent_memories(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get recent memories directly from MSSQL."""
+        """Get recent memories from MSSQL. Returns [{id, label, content}]."""
         if not self._mssql_conn:
             return []
         try:
             rows = self._mssql_conn.execute(
-                "SELECT TOP (?) id FROM memories ORDER BY created_at DESC",
+                "SELECT TOP (?) id, label, content FROM memories ORDER BY created_at DESC",
                 (limit,)
             ).fetchall()
-            return [{"id": r[0]} for r in rows]
+            return [{"id": r[0], "label": r[1] or "", "content": r[2] or ""} for r in rows]
         except Exception as e:
             logger.debug("get_recent_memories failed: %s", e)
             return []
@@ -214,23 +214,39 @@ class CppDreamBackend(DreamBackend):
             logger.debug("strengthen_connection failed: %s", e)
 
     def batch_strengthen_connections(self, edges: list, delta: float = 0.05) -> int:
-        """Batch update strengthened edge weights in connections table.
-        
-        Accepts list of (new_weight, source_id, target_id) tuples from the
-        dream engine's NREM phase.
+        """Batch strengthen activated edges.
+
+        Accepts 2-tuples (source_id, target_id) — fetches current weight and adds delta.
+        Also accepts 3-tuples (new_weight, source_id, target_id) for direct weight set.
         """
         if not edges or not self._mssql_conn:
             return 0
         try:
             cursor = self._mssql_conn.cursor()
+            count = 0
             for item in edges:
-                new_w, src, tgt = item
+                try:
+                    new_w, src, tgt = item
+                except ValueError:
+                    # 2-tuple: (source_id, target_id) — fetch weight then add delta
+                    src, tgt = item
+                    try:
+                        cursor.execute(
+                            "SELECT weight FROM connections WHERE source_id = ? AND target_id = ?",
+                            (src, tgt)
+                        )
+                        row = cursor.fetchone()
+                        old_w = row[0] if row else 0.5
+                    except Exception:
+                        old_w = 0.5
+                    new_w = min(old_w + delta, 1.0)
                 cursor.execute(
                     "UPDATE connections SET weight = ? "
                     "WHERE source_id = ? AND target_id = ?",
-                    new_w, src, tgt
+                    (new_w, src, tgt)
                 )
-            return len(edges)
+                count += 1
+            return count
         except Exception as e:
             logger.debug("batch_strengthen failed: %s", e)
             return 0
@@ -249,13 +265,34 @@ class CppDreamBackend(DreamBackend):
         except Exception as e:
             logger.debug("weaken_connection failed: %s", e)
 
-    def batch_weaken_connections(self, updates: list, **kwargs) -> int:
-        """Batch update weakened edge weights in connections table.
+    def batch_weaken_connections(self, updates: list = None, **kwargs) -> int:
+        """Batch weaken connections.
         
-        Accepts list of (new_weight, source_id, target_id) tuples from the
-        dream engine's NREM phase.
+        Two modes:
+        1. Explicit: updates = [(new_weight, source_id, target_id), ...]
+        2. Bulk: threshold=0.05, delta=0.01 — single SQL UPDATE for all edges above threshold
         """
-        if not updates or not self._mssql_conn:
+        if not self._mssql_conn:
+            return 0
+        
+        # Bulk mode: threshold + delta
+        threshold = kwargs.get('threshold')
+        delta = kwargs.get('delta', 0.01)
+        if threshold is not None:
+            try:
+                cursor = self._mssql_conn.cursor()
+                cursor.execute(
+                    "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
+                    "WHERE weight > ?",
+                    delta, threshold
+                )
+                return cursor.rowcount
+            except Exception as e:
+                logger.debug("batch_weaken (bulk) failed: %s", e)
+                return 0
+        
+        # Explicit mode: list of tuples
+        if not updates:
             return 0
         try:
             cursor = self._mssql_conn.cursor()
@@ -321,6 +358,30 @@ class CppDreamBackend(DreamBackend):
             )
         except Exception as e:
             logger.debug("log_connection_change failed: %s", e)
+    def prune_connection_history(self, keep_days: int = 7) -> int:
+        """Skip — C++/MSSQL handles history internally."""
+        return 0
+
+    def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
+        """Prune old dream sessions from SQLite tracking DB."""
+        import sqlite3, time
+        conn = sqlite3.connect(self._session_db)
+        try:
+            cutoff = time.time() - (keep_days * 86400)
+            count = conn.execute(
+                "DELETE FROM dream_sessions WHERE started_at < ?",
+                (cutoff,)
+            ).rowcount
+            conn.commit()
+            return count
+        finally:
+            conn.close()
+
+    def prune_orphans(self) -> int:
+        """Skip — C++/MSSQL handles referential integrity."""
+        return 0
+
+
 
     def add_insight(self, session_id: int, insight_type: str,
                     source_memory_id: int, content: str,

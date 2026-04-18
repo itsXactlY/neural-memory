@@ -36,7 +36,7 @@ class CSearchResult(ctypes.Structure):
         ("id", ctypes.c_uint64),
         ("score", ctypes.c_float),
         ("label", ctypes.c_char * 256),
-        ("content", ctypes.c_char * 1024),
+        ("content", ctypes.c_char * 4096),
     ]
 
 class CStats(ctypes.Structure):

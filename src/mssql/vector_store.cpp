@@ -50,7 +50,7 @@ bool MSSQLVectorAdapter::initialize() {
     Statement stmt(conn->dbc());
     std::string check_sql =
         "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES "
-        "WHERE TABLE_NAME IN ('NeuralMemory', 'GraphNodes', 'GraphEdges')";
+            "WHERE TABLE_NAME IN ('NeuralMemory', 'GraphNodes_v2', 'GraphEdges_v2')";
 
     if (!stmt.prepare(check_sql) || !stmt.execute() || !stmt.fetch()) {
         std::cerr << "[MSSQLVectorAdapter] Schema validation failed" << std::endl;
@@ -168,8 +168,8 @@ bool MSSQLVectorAdapter::insert_vector(uint64_t id, std::span<const float> vecto
 
     Statement stmt(conn->dbc());
     std::string sql =
-        "INSERT INTO NeuralMemory (id, vector_data, metadata_json, created_at, updated_at) "
-        "VALUES (?, ?, ?, GETUTCDATE(), GETUTCDATE())";
+        "INSERT INTO NeuralMemory (id, legacy_id, vector_data, vector_dim, metadata_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, GETUTCDATE(), GETUTCDATE())";
 
     if (!stmt.prepare(sql)) {
         pool_->release(std::move(conn));
@@ -181,8 +181,11 @@ bool MSSQLVectorAdapter::insert_vector(uint64_t id, std::span<const float> vecto
     std::memcpy(vec_bytes.data(), vector.data(), vec_bytes.size());
 
     int64_t id_val = static_cast<int64_t>(id);
+    int32_t dim_val = static_cast<int32_t>(vector.size());
     SQLLEN id_ind = 0;
+    SQLLEN leg_ind = 0;
     SQLLEN vec_ind = static_cast<SQLLEN>(vec_bytes.size());
+    SQLLEN dim_ind = 0;
     SQLLEN meta_ind = static_cast<SQLLEN>(metadata_json.size());
 
     // Bind parameters
@@ -190,12 +193,21 @@ bool MSSQLVectorAdapter::insert_vector(uint64_t id, std::span<const float> vecto
                      SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
                      &id_val, 0, &id_ind);
 
+    // Bind legacy_id (= id for new rows)
     SQLBindParameter(stmt.stmt(), 2, SQL_PARAM_INPUT,
+                     SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                     &id_val, 0, &leg_ind);
+
+    SQLBindParameter(stmt.stmt(), 3, SQL_PARAM_INPUT,
                      SQL_C_BINARY, SQL_VARBINARY,
                      static_cast<SQLULEN>(vec_bytes.size()), 0,
                      vec_bytes.data(), static_cast<SQLLEN>(vec_bytes.size()), &vec_ind);
 
-    SQLBindParameter(stmt.stmt(), 3, SQL_PARAM_INPUT,
+    SQLBindParameter(stmt.stmt(), 4, SQL_PARAM_INPUT,
+                     SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                     &dim_val, 0, &dim_ind);
+
+    SQLBindParameter(stmt.stmt(), 5, SQL_PARAM_INPUT,
                      SQL_C_CHAR, SQL_VARCHAR,
                      static_cast<SQLULEN>(metadata_json.size()), 0,
                      const_cast<char*>(metadata_json.c_str()),
@@ -226,8 +238,8 @@ bool MSSQLVectorAdapter::insert_vectors(const std::vector<uint64_t>& ids,
     }
 
     std::string sql =
-        "INSERT INTO NeuralMemory (id, vector_data, metadata_json, created_at, updated_at) "
-        "VALUES (?, ?, ?, GETUTCDATE(), GETUTCDATE())";
+        "INSERT INTO NeuralMemory (id, legacy_id, vector_data, vector_dim, metadata_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, GETUTCDATE(), GETUTCDATE())";
 
     // Direct transactional batch insert
     auto conn = pool_->acquire();
@@ -248,9 +260,12 @@ bool MSSQLVectorAdapter::insert_vectors(const std::vector<uint64_t>& ids,
         int64_t id_val = static_cast<int64_t>(ids[i]);
         auto vec_bytes = vector_to_binary(vectors[i]);
         const auto& meta = metadata_jsons[i];
+        int32_t dim_val = static_cast<int32_t>(vectors[i].size());
 
         SQLLEN id_ind = 0;
+        SQLLEN leg_ind = 0;
         SQLLEN vec_ind = static_cast<SQLLEN>(vec_bytes.size());
+        SQLLEN dim_ind = 0;
         SQLLEN meta_ind = static_cast<SQLLEN>(meta.size());
 
         SQLBindParameter(stmt.stmt(), 1, SQL_PARAM_INPUT,
@@ -258,11 +273,19 @@ bool MSSQLVectorAdapter::insert_vectors(const std::vector<uint64_t>& ids,
                          &id_val, 0, &id_ind);
 
         SQLBindParameter(stmt.stmt(), 2, SQL_PARAM_INPUT,
+                         SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                         &id_val, 0, &leg_ind);
+
+        SQLBindParameter(stmt.stmt(), 3, SQL_PARAM_INPUT,
                          SQL_C_BINARY, SQL_VARBINARY,
                          static_cast<SQLULEN>(vec_bytes.size()), 0,
                          vec_bytes.data(), static_cast<SQLLEN>(vec_bytes.size()), &vec_ind);
 
-        SQLBindParameter(stmt.stmt(), 3, SQL_PARAM_INPUT,
+        SQLBindParameter(stmt.stmt(), 4, SQL_PARAM_INPUT,
+                         SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                         &dim_val, 0, &dim_ind);
+
+        SQLBindParameter(stmt.stmt(), 5, SQL_PARAM_INPUT,
                          SQL_C_CHAR, SQL_VARCHAR,
                          static_cast<SQLULEN>(meta.size()), 0,
                          const_cast<char*>(meta.c_str()),
@@ -624,7 +647,7 @@ bool MSSQLVectorAdapter::insert_graph_node(uint64_t node_id, const std::string& 
 
     Statement stmt(conn->dbc());
     std::string sql =
-        "INSERT INTO GraphNodes (node_id, node_type, properties_json, created_at, updated_at) "
+        "INSERT INTO GraphNodes_v2 (node_id, node_type, properties_json, created_at, updated_at) "
         "VALUES (?, ?, ?, GETUTCDATE(), GETUTCDATE())";
 
     if (!stmt.prepare(sql)) {
@@ -660,7 +683,7 @@ bool MSSQLVectorAdapter::insert_graph_edge(uint64_t from_id, uint64_t to_id,
 
     Statement stmt(conn->dbc());
     std::string sql =
-        "INSERT INTO GraphEdges (from_node_id, to_node_id, edge_type, weight, created_at) "
+        "INSERT INTO GraphEdges_v2 (from_node_id, to_node_id, edge_type, weight, created_at) "
         "VALUES (?, ?, ?, ?, GETUTCDATE())";
 
     if (!stmt.prepare(sql)) {
@@ -699,7 +722,7 @@ bool MSSQLVectorAdapter::delete_graph_node(uint64_t node_id) {
 
     // Delete edges first
     std::string del_edges =
-        "DELETE FROM GraphEdges WHERE from_node_id = ? OR to_node_id = ?";
+        "DELETE FROM GraphEdges_v2 WHERE from_node_id = ? OR to_node_id = ?";
     if (!stmt.prepare(del_edges)) {
         conn->rollback_transaction();
         pool_->release(std::move(conn));
@@ -716,7 +739,7 @@ bool MSSQLVectorAdapter::delete_graph_node(uint64_t node_id) {
     stmt.reset();
 
     // Delete node
-    std::string del_node = "DELETE FROM GraphNodes WHERE node_id = ?";
+    std::string del_node = "DELETE FROM GraphNodes_v2 WHERE node_id = ?";
     if (!stmt.prepare(del_node)) {
         conn->rollback_transaction();
         pool_->release(std::move(conn));
@@ -743,7 +766,7 @@ bool MSSQLVectorAdapter::delete_graph_edge(uint64_t from_id, uint64_t to_id,
 
     Statement stmt(conn->dbc());
     std::string sql =
-        "DELETE FROM GraphEdges WHERE from_node_id = ? AND to_node_id = ? AND edge_type = ?";
+        "DELETE FROM GraphEdges_v2 WHERE from_node_id = ? AND to_node_id = ? AND edge_type = ?";
 
     if (!stmt.prepare(sql)) {
         pool_->release(std::move(conn));
@@ -928,7 +951,7 @@ int MSSQLVectorAdapter::batch_strengthen_edges(
     Statement stmt(conn->dbc());
 
     std::string sql =
-        "UPDATE GraphEdges SET weight = CASE "
+        "UPDATE GraphEdges_v2 SET weight = CASE "
         "WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
         "WHERE from_node_id = ? AND to_node_id = ?";
 
@@ -976,7 +999,7 @@ int MSSQLVectorAdapter::bulk_weaken_prune(float delta, float threshold) {
     {
         Statement stmt(conn->dbc());
         std::string sql =
-            "UPDATE GraphEdges SET weight = CASE "
+            "UPDATE GraphEdges_v2 SET weight = CASE "
             "WHEN weight - ? < 0.0 THEN 0.0 ELSE weight - ? END "
             "WHERE weight > ?";
 
@@ -1001,7 +1024,7 @@ int MSSQLVectorAdapter::bulk_weaken_prune(float delta, float threshold) {
     int pruned = 0;
     {
         Statement stmt(conn->dbc());
-        std::string sql = "DELETE FROM GraphEdges WHERE weight < ?";
+        std::string sql = "DELETE FROM GraphEdges_v2 WHERE weight < ?";
 
         if (stmt.prepare(sql)) {
             SQLLEN ind = 0;
@@ -1031,7 +1054,7 @@ std::vector<MSSQLVectorAdapter::EdgeInfo> MSSQLVectorAdapter::get_edges(uint64_t
 
     Statement stmt(conn->dbc());
     std::string sql =
-        "SELECT from_node_id, to_node_id, weight FROM GraphEdges "
+        "SELECT from_node_id, to_node_id, weight FROM GraphEdges_v2 "
         "WHERE from_node_id = ? OR to_node_id = ?";
 
     if (!stmt.prepare(sql)) {
@@ -1070,7 +1093,7 @@ int64_t MSSQLVectorAdapter::count_edges() const {
     if (!conn) return 0;
 
     Statement stmt(conn->dbc());
-    std::string sql = "SELECT COUNT(*) FROM GraphEdges";
+    std::string sql = "SELECT COUNT(*) FROM GraphEdges_v2";
 
     if (!stmt.prepare(sql) || !stmt.execute() || !stmt.fetch()) {
         pool_->release(std::move(conn));
@@ -1095,7 +1118,7 @@ bool MSSQLVectorAdapter::add_graph_edge_or_update(uint64_t from_id, uint64_t to_
 
     Statement stmt(conn->dbc());
     std::string sql =
-        "MERGE GraphEdges AS target "
+        "MERGE GraphEdges_v2 AS target "
         "USING (SELECT ? AS from_node_id, ? AS to_node_id, ? AS edge_type) AS source "
         "ON target.from_node_id = source.from_node_id "
         "AND target.to_node_id = source.to_node_id "

@@ -239,8 +239,8 @@ bool bcp_bulk_insert(ConnectionPool& pool,
     Statement stmt(conn->dbc());
 
     // Prepare the insert statement
-    std::string sql = "INSERT INTO NeuralMemory (id, vector_data, metadata_json, created_at) "
-                      "VALUES (?, ?, ?, GETUTCDATE())";
+    std::string sql = "INSERT INTO NeuralMemory (id, legacy_id, vector_data, vector_dim, metadata_json, created_at) "
+                      "VALUES (?, ?, ?, ?, ?, GETUTCDATE())";
 
     if (!stmt.prepare(sql)) {
         conn->rollback_transaction();
@@ -252,9 +252,13 @@ bool bcp_bulk_insert(ConnectionPool& pool,
         // Bind parameters
         int64_t id_val = static_cast<int64_t>(ids[i]);
         SQLLEN id_ind = 0;
+        SQLLEN leg_ind = 0;
 
         auto vec_bytes = MSSQLVectorAdapter::vector_to_binary(vectors[i]);
         SQLLEN vec_ind = static_cast<SQLLEN>(vec_bytes.size());
+
+        int32_t dim_val = static_cast<int32_t>(vectors[i].size());
+        SQLLEN dim_ind = 0;
 
         const auto& meta = metadata_jsons[i];
         SQLLEN meta_ind = static_cast<SQLLEN>(meta.size());
@@ -264,14 +268,24 @@ bool bcp_bulk_insert(ConnectionPool& pool,
                          SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
                          &id_val, 0, &id_ind);
 
-        // Bind vector binary data
+        // Bind legacy_id (= id for new rows)
         SQLBindParameter(stmt.stmt(), 2, SQL_PARAM_INPUT,
+                         SQL_C_SBIGINT, SQL_BIGINT, 0, 0,
+                         &id_val, 0, &leg_ind);
+
+        // Bind vector binary data
+        SQLBindParameter(stmt.stmt(), 3, SQL_PARAM_INPUT,
                          SQL_C_BINARY, SQL_VARBINARY,
                          static_cast<SQLULEN>(vec_bytes.size()), 0,
                          vec_bytes.data(), static_cast<SQLLEN>(vec_bytes.size()), &vec_ind);
 
+        // Bind vector_dim
+        SQLBindParameter(stmt.stmt(), 4, SQL_PARAM_INPUT,
+                         SQL_C_SLONG, SQL_INTEGER, 10, 0,
+                         &dim_val, 0, &dim_ind);
+
         // Bind metadata JSON
-        SQLBindParameter(stmt.stmt(), 3, SQL_PARAM_INPUT,
+        SQLBindParameter(stmt.stmt(), 5, SQL_PARAM_INPUT,
                          SQL_C_CHAR, SQL_VARCHAR,
                          static_cast<SQLULEN>(meta.size()), 0,
                          const_cast<char*>(meta.c_str()),
@@ -339,11 +353,12 @@ bool tvp_bulk_insert(ConnectionPool& pool,
 
         // Build multi-row INSERT
         std::ostringstream sql;
-        sql << "INSERT INTO NeuralMemory (id, vector_data, metadata_json, created_at) VALUES ";
+        sql << "INSERT INTO NeuralMemory (id, legacy_id, vector_data, vector_dim, metadata_json, created_at) VALUES ";
 
         std::vector<int64_t> id_buf(count);
+        std::vector<int32_t> dim_buf(count);
         std::vector<std::vector<uint8_t>> vec_bufs(count);
-        std::vector<SQLLEN> id_ind(count), vec_ind(count), meta_ind(count);
+        std::vector<SQLLEN> id_ind(count), leg_ind(count), vec_ind(count), dim_ind(count), meta_ind(count);
 
         std::vector<void*> param_ptrs;
         std::vector<SQLLEN> param_lens;
@@ -356,13 +371,16 @@ bool tvp_bulk_insert(ConnectionPool& pool,
             size_t idx = offset + i;
             if (i > 0) sql << ", ";
 
-            sql << "(?, ?, ?, GETUTCDATE())";
+            sql << "(?, ?, ?, ?, ?, GETUTCDATE())";
 
             id_buf[i] = static_cast<int64_t>(ids[idx]);
+            dim_buf[i] = static_cast<int32_t>(vectors[idx].size());
             vec_bufs[i] = MSSQLVectorAdapter::vector_to_binary(vectors[idx]);
 
             id_ind[i] = 0;
+            leg_ind[i] = 0;
             vec_ind[i] = static_cast<SQLLEN>(vec_bufs[i].size());
+            dim_ind[i] = 0;
             meta_ind[i] = static_cast<SQLLEN>(metadata_jsons[idx].size());
         }
 
@@ -375,7 +393,7 @@ bool tvp_bulk_insert(ConnectionPool& pool,
 
         // Bind all parameters
         for (size_t i = 0; i < count; ++i) {
-            size_t base = i * 4; // 4 params per row
+            size_t base = i * 6; // 6 params per row
             size_t idx = offset + i;
 
             // Param: id
@@ -383,15 +401,25 @@ bool tvp_bulk_insert(ConnectionPool& pool,
                              SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT,
                              0, 0, &id_buf[i], 0, &id_ind[i]);
 
-            // Param: vector_data
+            // Param: legacy_id (= id for new rows)
             SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 2),
+                             SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT,
+                             0, 0, &id_buf[i], 0, &leg_ind[i]);
+
+            // Param: vector_data
+            SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 3),
                              SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY,
                              static_cast<SQLULEN>(vec_bufs[i].size()), 0,
                              vec_bufs[i].data(),
                              static_cast<SQLLEN>(vec_bufs[i].size()), &vec_ind[i]);
 
+            // Param: vector_dim
+            SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 4),
+                             SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER,
+                             10, 0, &dim_buf[i], 0, &dim_ind[i]);
+
             // Param: metadata_json
-            SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 3),
+            SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 5),
                              SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
                              static_cast<SQLULEN>(metadata_jsons[idx].size()), 0,
                              const_cast<char*>(metadata_jsons[idx].c_str()),
@@ -399,10 +427,10 @@ bool tvp_bulk_insert(ConnectionPool& pool,
 
             // Param: created_at is handled by GETUTCDATE() in the SQL
             // We don't bind it - the SQL expression handles it
-            // But we need a placeholder param for the 4th position
+            // But we need a placeholder param for the 6th position
             SQLLEN dummy_ind = SQL_NULL_DATA;
             int64_t dummy_val = 0;
-            SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 4),
+            SQLBindParameter(stmt.stmt(), static_cast<SQLUSMALLINT>(base + 6),
                              SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT,
                              0, 0, &dummy_val, 0, &dummy_ind);
         }

@@ -241,12 +241,13 @@ class LSTMPredictor:
 
     def close(self):
         """Destroy the LSTM predictor."""
-        if self._handle:
+        if getattr(self, '_handle', None):
             self._lib.nm_lstm_destroy(self._handle)
             self._handle = None
 
     def __del__(self):
-        self.close()
+        if getattr(self, '_handle', None):
+            self.close()
 
     def __enter__(self):
         return self

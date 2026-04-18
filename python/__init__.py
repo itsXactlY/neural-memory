@@ -20,6 +20,7 @@ import json
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -145,11 +146,6 @@ class NeuralMemoryProvider(MemoryProvider):
             import sys
             from pathlib import Path
 
-            # Add project python dir to path
-            project_py = str(Path.home() / "projects" / "neural-memory-adapter" / "python")
-            if project_py not in sys.path:
-                sys.path.insert(0, project_py)
-
             # Add plugin dir to path
             plugin_dir = str(Path(__file__).parent)
             if plugin_dir not in sys.path:
@@ -170,10 +166,7 @@ class NeuralMemoryProvider(MemoryProvider):
             import os
             from pathlib import Path
 
-            # Ensure paths are on sys.path
-            project_py = str(Path.home() / "projects" / "neural-memory-adapter" / "python")
-            if project_py not in sys.path:
-                sys.path.insert(0, project_py)
+            # Ensure plugin dir is on sys.path
             plugin_dir = str(Path(__file__).parent)
             if plugin_dir not in sys.path:
                 sys.path.insert(0, plugin_dir)
@@ -202,6 +195,9 @@ class NeuralMemoryProvider(MemoryProvider):
                 db_path=self._config["db_path"],
                 embedding_backend=self._config["embedding_backend"],
             )
+
+            # Load initial context from memory
+            self._initial_context = self._load_initial_context()
 
             # Start dream engine
             self._start_dream_engine()
@@ -245,7 +241,6 @@ class NeuralMemoryProvider(MemoryProvider):
                         neural_memory=self._memory,
                         idle_threshold=600,
                         memory_threshold=50,
-                        min_dream_interval=600,
                     )
                     self._dream.start()
                     logger.info("Dream engine started: C++ → MSSQL")
@@ -260,7 +255,6 @@ class NeuralMemoryProvider(MemoryProvider):
                 neural_memory=self._memory,
                 idle_threshold=600,
                 memory_threshold=50,
-                min_dream_interval=600,
             )
             self._dream.start()
             logger.info("Dream engine started: SQLite fallback")
@@ -314,6 +308,27 @@ class NeuralMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Consolidation check failed: %s", e)
 
+    def _load_initial_context(self) -> str:
+        """Query for session summaries, recent memories, graph hubs."""
+        if not self._memory:
+            return ""
+        try:
+            parts = []
+            # Recent session summaries
+            summaries = self._memory.recall("session topics recent activity", k=3)
+            for s in summaries:
+                if "Session topics" in s.get("content", ""):
+                    parts.append(s["content"][:200])
+            # Recent memories
+            recent = self._memory.recall("recent conversation context", k=5)
+            for r in recent:
+                if r.get("similarity", 0) > 0.2:
+                    parts.append(r["content"][:200])
+            return "\n".join(f"- {p}" for p in parts[:10]) if parts else ""
+        except Exception as e:
+            logger.debug("Failed to load initial context: %s", e)
+            return ""
+
     def system_prompt_block(self) -> str:
         if not self._memory:
             return ""
@@ -326,20 +341,25 @@ class NeuralMemoryProvider(MemoryProvider):
             connections = 0
 
         if total == 0:
-            return (
+            header = (
                 "# Neural Memory\n"
                 "Active. Empty memory store — proactively store facts the user would expect "
                 "you to remember using neural_remember.\n"
                 "Use neural_recall to search memories semantically.\n"
                 "Use neural_think to explore connected ideas via spreading activation."
             )
-        return (
-            f"# Neural Memory\n"
-            f"Active. {total} memories, {connections} connections.\n"
-            f"Use neural_remember to store new memories.\n"
-            f"Use neural_recall to search semantically.\n"
-            f"Use neural_think to explore connected ideas."
-        )
+        else:
+            header = (
+                f"# Neural Memory\n"
+                f"Active. {total} memories, {connections} connections.\n"
+                f"Use neural_remember to store new memories.\n"
+                f"Use neural_recall to search semantically.\n"
+                f"Use neural_think to explore connected ideas."
+            )
+
+        if self._initial_context:
+            return f"{header}\n\n## Recent Memory Context\n{self._initial_context}"
+        return header
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return prefetched recall from background thread."""
@@ -349,6 +369,9 @@ class NeuralMemoryProvider(MemoryProvider):
             result = self._prefetch_result
             self._prefetch_result = ""
         if not result:
+            # On first call, return initial context if available
+            if self._initial_context:
+                return f"## Neural Memory Context (recent history)\n{self._initial_context}"
             return ""
         return f"## Neural Memory Context\n{result}"
 
@@ -448,7 +471,16 @@ class NeuralMemoryProvider(MemoryProvider):
         if len(user_clean) < 5:
             return None
 
-        return f"User: {user_clean}\nAssistant: {assist_clean}"
+        # Skip boilerplate responses
+        _boilerplate = [
+            "trallala", "got it", "ok", "sure", "thanks", "thank you",
+            "i understand", "i see", "alright", "okay", "right",
+        ]
+        assist_lower = assist_clean.lower()
+        is_boilerplate = any(b in assist_lower for b in _boilerplate) and len(assist_clean) < 200
+        if is_boilerplate or not assist_clean:
+            return f"Topic: {user_clean[:300]}"
+        return f"Topic: {user_clean[:200]}\nResult: {assist_clean[:300]}"
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """No-op. Per-turn storage disabled — only session summaries stored at session end.
@@ -520,6 +552,33 @@ class NeuralMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Neural memory_write mirror failed: %s", e)
 
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Scan messages about to be compressed, save meaningful exchanges."""
+        if not self._memory or not messages:
+            return ""
+        extracted = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "user":
+                continue
+            # Find next assistant response
+            user_content = msg.get("content", "")
+            assistant_content = ""
+            for j in range(i + 1, min(i + 3, len(messages))):
+                if messages[j].get("role") == "assistant":
+                    assistant_content = messages[j].get("content", "") or ""
+                    break
+            combined = self._extract_facts(user_content, assistant_content)
+            if not combined:
+                continue
+            self._memory.remember(combined, label="pre-compress")
+            extracted.append(user_content[:150])
+
+        if not extracted:
+            return ""
+        return "Key context preserved before compression:\n" + "\n".join(
+            f"- {t}" for t in extracted[:20]
+        )
+
     def shutdown(self) -> None:
         """Clean shutdown."""
         # Stop dream engine
@@ -584,6 +643,49 @@ class NeuralMemoryProvider(MemoryProvider):
             return json.dumps({"graph": graph, "stats": stats})
         except Exception as exc:
             return tool_error(str(exc))
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
+        """Return config schema for `hermes memory setup neural`."""
+        return [
+            {
+                "key": "db_path",
+                "description": "Path to SQLite database file",
+                "required": False,
+                "default": str(Path.home() / ".neural_memory" / "memory.db"),
+            },
+            {
+                "key": "embedding_backend",
+                "description": "Embedding backend (auto, hash, tfidf, sentence-transformers)",
+                "required": False,
+                "default": "auto",
+                "choices": ["auto", "hash", "tfidf", "sentence-transformers"],
+            },
+            {
+                "key": "consolidation_interval",
+                "description": "Background consolidation interval in seconds (0 = disabled)",
+                "required": False,
+                "default": 0,
+            },
+            {
+                "key": "max_episodic",
+                "description": "Maximum episodic memories (0 = unlimited)",
+                "required": False,
+                "default": 0,
+            },
+        ]
+
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """Write neural config to config.yaml under memory.neural."""
+        try:
+            from hermes_cli.config import load_config, save_config
+            config = load_config()
+            neural_cfg = config.setdefault("memory", {}).setdefault("neural", {})
+            for k, v in values.items():
+                if v is not None and v != "":
+                    neural_cfg[k] = v
+            save_config(config)
+        except Exception as e:
+            logger.warning("Failed to save neural config: %s", e)
 
 
 # ---------------------------------------------------------------------------

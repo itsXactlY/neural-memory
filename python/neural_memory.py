@@ -85,12 +85,14 @@ class Memory:
             except Exception as e:
                 print(f"[neural] MSSQL unavailable ({e}), falling back to SQLite")
                 use_mssql = False
-        
-        # SQLite fallback
+
+        # SQLite always needed for semantic recall (MSSQLStore has no recall method)
+        from memory_client import NeuralMemory
+        self._sqlite_memory = NeuralMemory(db_path=self._db_path, embedding_backend=embedding_backend)
         if not use_mssql:
-            from memory_client import NeuralMemory
-            self._sqlite_memory = NeuralMemory(db_path=self._db_path, embedding_backend=embedding_backend)
             print(f"[neural] SQLite backend: {self._embedder.backend.__class__.__name__} ({self._dim}d)")
+        else:
+            print(f"[neural] Hybrid mode: MSSQL (graph) + SQLite (recall)")
         
         # --- LSTM + kNN (auto-initialized) ---
         self._access_logger = None
@@ -363,51 +365,49 @@ class Memory:
     
     def remember(self, text: str, label: str = "", auto_chunk: bool = True,
                  auto_connect: bool = True, detect_conflicts: bool = True) -> int | list[int]:
-        """Store a memory. Returns memory ID."""
+        """Store a memory. SQLite primary, MSSQL mirror. Returns memory ID."""
         if auto_chunk and len(text) > self._default_chunk_size * 2:
             return self.remember_chunked(text, label)
         
         embedding = self._embedder.embed(text)
         
+        # SQLite always (source of truth)
+        mem_id = self._sqlite_memory.remember(text, label, auto_connect=auto_connect,
+                                              detect_conflicts=detect_conflicts)
+        # MSSQL mirror (optional backup)
         if self._mssql_store:
-            return self._mssql_store.store(label or text[:60], text, embedding)
-        else:
-            return self._sqlite_memory.remember(text, label, auto_connect=auto_connect,
-                                                detect_conflicts=detect_conflicts)
+            try:
+                self._mssql_store.store(label or text[:60], text, embedding)
+            except Exception:
+                pass
+        return mem_id
     
     def remember_embedding(self, embedding: list[float], label: str = "", 
                            content: str = "") -> int:
-        """Store a memory with pre-computed embedding."""
+        """Store a memory with pre-computed embedding. SQLite primary, MSSQL mirror."""
+        # SQLite always
+        mem_id = self._sqlite_memory.store.store(label or content[:60], content, embedding)
+        # MSSQL mirror
         if self._mssql_store:
-            return self._mssql_store.store(label or content[:60], content, embedding)
-        else:
-            return self._sqlite_memory.store.store(label or content[:60], content, embedding)
+            try:
+                self._mssql_store.store(label or content[:60], content, embedding)
+            except Exception:
+                pass
+        return mem_id
     
     def recall(self, query: str, k: int = 5) -> list[dict]:
-        """Semantic search with LSTM+kNN enhancement. Returns [{id, label, content, similarity}]."""
+        """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall (MSSQLStore has no recall)."""
         embedding = self._embedder.embed(query)
 
-        if self._mssql_store:
-            results = self._mssql_store.recall(embedding, k * 3)  # Overfetch for kNN re-ranking
-            for r in results:
-                conns = self._mssql_store.get_connections(r['id'])
-                r['connections'] = [{'id': c['target'] if c['source'] == r['id'] else c['source'],
-                                     'weight': c['weight']} for c in conns[:3]]
-            # LSTM+kNN re-ranking (keeps embeddings for scoring, strips after)
-            enhanced = self._enhance_recall(embedding, results, k)
-            for r in enhanced:
-                r.pop('embedding', None)
-            return enhanced[:k]
-        else:
-            # SQLite path: get raw results, enhance, return
-            base_results = self._sqlite_memory.recall(query, k * 3)
-            enhanced = self._enhance_recall(embedding, base_results, k)
-            for r in enhanced:
-                r.pop('embedding', None)
-            return enhanced[:k]
+        # Always use SQLite for semantic recall — MSSQL is graph-only
+        base_results = self._sqlite_memory.recall(query, k * 3)
+        enhanced = self._enhance_recall(embedding, base_results, k)
+        for r in enhanced:
+            r.pop('embedding', None)
+        return enhanced[:k]
 
     def recall_multihop(self, query: str, k: int = 5, hops: int = 2) -> list[dict]:
-        """Multi-hop retrieval: cosine similarity + graph expansion."""
+        """Multi-hop retrieval: SQLite recall + MSSQL graph expansion (if available)."""
         results = self.recall(query, k)
         if not self._mssql_store:
             return results
@@ -415,23 +415,33 @@ class Memory:
         expanded = []
         seen = {r['id'] for r in results}
         for r in results:
-            conns = self._mssql_store.get_connections(r['id'])
-            for c in conns:
-                other = c['target'] if c['source'] == r['id'] else c['source']
-                if other not in seen:
-                    seen.add(other)
-                    mem = self._mssql_store.get(other)
-                    if mem:
-                        expanded.append({'id': other, 'label': mem['label'],
-                                        'content': mem['content'], 'activation': c['weight']})
+            try:
+                conns = self._mssql_store.get_connections(r['id'])
+                for c in conns:
+                    other = c['target'] if c['source'] == r['id'] else c['source']
+                    if other not in seen:
+                        seen.add(other)
+                        mem = self._mssql_store.get(other)
+                        if mem:
+                            expanded.append({'id': other, 'label': mem['label'],
+                                            'content': mem['content'], 'activation': c['weight']})
+            except Exception:
+                pass
         return results[:k]
 
     def think(self, start_id: int, depth: int = 3, decay: float = 0.85) -> list[dict]:
-        """Spreading activation from a starting memory."""
-        if self._mssql_store:
+        """Spreading activation. SQLite primary, MSSQL enhanced if available."""
+        # Always use SQLite think
+        base = self._sqlite_memory.think(start_id, depth, decay)
+        
+        if not self._mssql_store:
+            return base
+        
+        # MSSQL graph expansion (enhances with additional connections)
+        try:
             visited = {start_id}
             frontier = [start_id]
-            results = []
+            mssql_results = []
             current_decay = decay
             
             for _ in range(depth):
@@ -444,7 +454,7 @@ class Memory:
                             visited.add(other)
                             activation = c['weight'] * current_decay
                             mem = self._mssql_store.get(other)
-                            results.append({
+                            mssql_results.append({
                                 'id': other,
                                 'label': mem['label'] if mem else f'node_{other}',
                                 'activation': round(activation, 4),
@@ -453,47 +463,39 @@ class Memory:
                 frontier = next_frontier
                 current_decay *= decay
             
-            results.sort(key=lambda x: -x['activation'])
-            return results[:20]
-        else:
-            return self._sqlite_memory.think(start_id, depth, decay)
+            # Merge: SQLite results first, MSSQL adds depth
+            base_ids = {r['id'] for r in base}
+            for r in mssql_results:
+                if r['id'] not in base_ids:
+                    base.append(r)
+            base.sort(key=lambda x: -x['activation'])
+            return base[:20]
+        except Exception:
+            return base
     
     def connections(self, mem_id: int) -> list[dict]:
-        """Get connections for a memory."""
-        if self._mssql_store:
-            return self._mssql_store.get_connections(mem_id)
+        """Get connections for a memory. SQLite primary."""
         return self._sqlite_memory.connections(mem_id) if self._sqlite_memory else []
     
     def graph(self) -> dict:
-        """Knowledge graph stats."""
-        if self._mssql_store:
-            s = self._mssql_store.stats()
-            return {
-                'nodes': s['memories'],
-                'edges': s['connections'],
-                'backend': 'mssql',
-            }
+        """Knowledge graph stats. SQLite primary."""
         return self._sqlite_memory.graph()
     
     def consolidate(self) -> int:
         """Run memory consolidation."""
-        return 0  # TODO: implement MSSQL consolidation
+        return 0
     
     def stats(self) -> dict:
-        """System statistics."""
-        if self._mssql_store:
-            s = self._mssql_store.stats()
-            s['embedding_dim'] = self._dim
-            s['embedding_backend'] = self._embedder.backend.__class__.__name__
-            s['backend'] = 'mssql'
-            return s
-        
+        """System statistics. SQLite primary."""
         s = self._sqlite_memory.stats()
+        s['embedding_dim'] = self._dim
+        s['embedding_backend'] = self._embedder.backend.__class__.__name__
         s['backend'] = 'sqlite'
+        s['mssql_mirror'] = self._mssql_store is not None
         return s
     
     def close(self):
-        """Clean shutdown. Saves LSTM weights, closes kNN engine."""
+        """Clean shutdown. Saves LSTM weights, closes stores."""
         # Save LSTM weights for next session
         if self._lstm_knn_ready and self._lstm:
             try:
@@ -501,13 +503,23 @@ class Memory:
                 self._lstm.save(lstm_weights_path)
             except Exception:
                 pass
-        # Close kNN engine (resource leak fix — was missing)
+        # Close kNN engine
         if self._knn:
             try:
                 self._knn.close()
             except Exception:
                 pass
-            self._knn = None
+        # Close stores (SQLite first, then MSSQL mirror)
+        try:
+            self._sqlite_memory.close()
+        except Exception:
+            pass
+        if self._mssql_store:
+            try:
+                self._mssql_store.close()
+            except Exception:
+                pass
+        self._knn = None
         # Close LSTM
         if self._lstm:
             try:
