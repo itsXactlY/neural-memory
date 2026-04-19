@@ -36,7 +36,7 @@ class CSearchResult(ctypes.Structure):
         ("id", ctypes.c_uint64),
         ("score", ctypes.c_float),
         ("label", ctypes.c_char * 256),
-        ("content", ctypes.c_char * 1024),
+        ("content", ctypes.c_char * 4096),
     ]
 
 class CStats(ctypes.Structure):
@@ -221,6 +221,16 @@ class NeuralMemory:
                     "C++ bridge unavailable, falling back to Python: %s", e
                 )
                 self._cpp = None
+
+        # GPU recall engine (CUDA-accelerated cosine similarity)
+        self._gpu = None
+        try:
+            from gpu_recall import GpuRecallEngine
+            self._gpu = GpuRecallEngine()
+            if not self._gpu.load(embed_fn=self.embedder.embed):
+                self._gpu = None
+        except Exception:
+            self._gpu = None
 
         # In-memory graph for spreading activation
         self._graph_nodes: dict[int, dict] = {}  # id -> {embedding, connections}
@@ -418,6 +428,38 @@ class NeuralMemory:
 
         query_vec = self.embedder.embed(query)
         now = time.time()
+
+        # GPU fast path: CUDA cosine similarity (sub-100ms)
+        if self._gpu:
+            try:
+                gpu_results = self._gpu.recall(query, k=k * 3)
+                if gpu_results:
+                    scored = []
+                    for r in gpu_results:
+                        mem_id = r['id']
+                        sim = r['similarity']
+                        node = self._graph_nodes.get(mem_id, {})
+                        scored.append({
+                            'id': mem_id,
+                            'label': r.get('label', node.get('label', '')),
+                            'content': r.get('content', ''),
+                            'embedding': node.get('embedding', []),
+                            'similarity': sim,
+                            'temporal_score': self._compute_temporal_score(mem_id, now),
+                            'combined': (1 - temporal_weight) * sim + temporal_weight * self._compute_temporal_score(mem_id, now),
+                            'connections': list(node.get('connections', {}).keys()),
+                        })
+                    scored.sort(key=lambda x: -x['combined'])
+                    for s in scored:
+                        s.pop('embedding', None)
+                    for s in scored[:k]:
+                        try:
+                            self.store.touch(s['id'])
+                        except Exception:
+                            pass
+                    return scored[:k]
+            except Exception:
+                pass  # Fall through to C++ or Python
 
         # C++ fast path: SIMD retrieve returns top-k candidates in microseconds
         # Then apply temporal scoring on the small candidate set

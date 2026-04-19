@@ -482,7 +482,7 @@ class DreamEngine:
         self._memory_threshold = memory_threshold
         self._max_memories = max_memories_per_cycle
 
-        self._running = False
+        self._stop_event = threading.Event()  # set = stop requested
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._last_activity = time.time()
@@ -504,9 +504,9 @@ class DreamEngine:
 
     def start(self) -> None:
         """Start the background dream daemon."""
-        if self._running:
+        if self._thread and self._thread.is_alive():
             return
-        self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._dream_loop, daemon=True, name="dream-engine"
         )
@@ -518,9 +518,9 @@ class DreamEngine:
 
     def stop(self) -> None:
         """Stop the dream daemon."""
-        self._running = False
+        self._stop_event.set()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=3.0)
         logger.info("Dream engine stopped after %d cycles", self._dream_count)
 
     def touch(self) -> None:
@@ -535,10 +535,10 @@ class DreamEngine:
 
     def _dream_loop(self) -> None:
         """Background daemon: dream when idle or threshold reached."""
-        while self._running:
+        while not self._stop_event.is_set():
             try:
-                time.sleep(30)
-                if not self._running:
+                # Wait 30s but wake immediately if stop() is called
+                if self._stop_event.wait(timeout=30.0):
                     break
 
                 idle = time.time() - self._last_activity
@@ -563,7 +563,8 @@ class DreamEngine:
 
             except Exception as e:
                 logger.debug("Dream loop error: %s", e)
-                time.sleep(60)
+                if self._stop_event.wait(timeout=60):
+                    break
 
     # -- Dream Cycle ---------------------------------------------------------
 
@@ -871,6 +872,6 @@ class DreamEngine:
     def get_stats(self) -> Dict[str, Any]:
         """Get dream engine statistics."""
         base = self._backend.get_dream_stats()
-        base["engine_running"] = self._running
+        base["engine_running"] = not self._stop_event.is_set() and (self._thread is not None and self._thread.is_alive())
         base["dream_cycles"] = self._dream_count
         return base
