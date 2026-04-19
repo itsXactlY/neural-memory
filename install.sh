@@ -126,6 +126,12 @@ $PYTHON -c "import Cython" 2>/dev/null && print_ok "Cython" || {
 # sentence-transformers (optional, for better embeddings)
 $PYTHON -c "import sentence_transformers" 2>/dev/null && print_ok "sentence-transformers" || print_warn "sentence-transformers not found — using hash/tfidf backends (optional)"
 
+# networkx (optional, enables Louvain community detection in dream Insight phase)
+$PYTHON -c "import networkx" 2>/dev/null && print_ok "networkx (Louvain)" || print_warn "networkx not found — Insight phase falls back to BFS connected-components (optional)"
+
+# hnswlib (optional, enables scalable ANN retrieval in Python-only mode)
+$PYTHON -c "import hnswlib" 2>/dev/null && print_ok "hnswlib (HNSW index)" || print_warn "hnswlib not found — recall uses brute-force cosine when C++ unavailable (optional)"
+
 # ---------------------------------------------------------------------------
 # 4. Create plugin directory
 # ---------------------------------------------------------------------------

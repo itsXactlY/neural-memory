@@ -351,6 +351,50 @@ class SQLiteDreamBackend(DreamBackend):
 # Dream Engine
 # ---------------------------------------------------------------------------
 
+def _detect_communities(edges, nodes, adj):
+    """Community detection with Louvain preferred, BFS connected-components fallback.
+
+    Louvain gives modularity-optimized partitions; BFS collapses all reachable
+    nodes into one component, which degenerates once the auto-connect threshold
+    has fired enough edges. Louvain is also deterministic given a seed.
+    """
+    try:
+        import networkx as nx
+        from networkx.algorithms.community import louvain_communities
+        g = nx.Graph()
+        g.add_nodes_from(nodes)
+        for e in edges:
+            w = e.get("weight", 1.0)
+            if w and w > 0:
+                g.add_edge(e["source_id"], e["target_id"], weight=float(w))
+        if g.number_of_edges() == 0:
+            return [[n] for n in nodes]
+        parts = louvain_communities(g, weight="weight", seed=42)
+        return [list(p) for p in parts]
+    except Exception as exc:
+        logger.debug("Louvain unavailable (%s); falling back to BFS components", exc)
+
+    # BFS connected components fallback
+    visited = set()
+    out = []
+    for node in nodes:
+        if node in visited:
+            continue
+        component = []
+        queue = [node]
+        while queue:
+            curr = queue.pop(0)
+            if curr in visited:
+                continue
+            visited.add(curr)
+            component.append(curr)
+            for neighbor, _ in adj.get(curr, []):
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        out.append(component)
+    return out
+
+
 class DreamEngine:
     """Autonomous background consolidation for neural memory.
 
@@ -646,24 +690,11 @@ class DreamEngine:
                 nodes.add(s)
                 nodes.add(t)
 
-            # Connected components (BFS)
-            visited = set()
-            communities: List[List[int]] = []
-            for node in nodes:
-                if node in visited:
-                    continue
-                component = []
-                queue = [node]
-                while queue:
-                    curr = queue.pop(0)
-                    if curr in visited:
-                        continue
-                    visited.add(curr)
-                    component.append(curr)
-                    for neighbor, _ in adj.get(curr, []):
-                        if neighbor not in visited:
-                            queue.append(neighbor)
-                communities.append(component)
+            # Community detection: Louvain (modularity-optimized) with BFS fallback.
+            # Louvain finds denser sub-structure inside connected components, which
+            # matters as the graph gets well-connected (connected-components collapses
+            # everything into one blob once the auto-connect threshold fires enough).
+            communities = _detect_communities(edges, nodes, adj)
             stats["communities"] = len(communities)
 
             # Map nodes to communities

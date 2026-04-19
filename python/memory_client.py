@@ -59,6 +59,12 @@ class CStats(ctypes.Structure):
 
 DB_PATH = Path.home() / ".neural_memory" / "memory.db"
 
+# Salience decay constants — see _effective_salience()
+SALIENCE_AGE_DECAY_K = 0.001      # per day; gentle background forgetting
+SALIENCE_ACCESS_BOOST = 0.05      # per log access
+SALIENCE_MIN = 0.1
+SALIENCE_MAX = 2.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +84,12 @@ CREATE TABLE IF NOT EXISTS connections (
     weight REAL DEFAULT 0.5,
     edge_type TEXT DEFAULT 'similar',
     created_at REAL DEFAULT (unixepoch()),
+    -- Bi-temporal fields (Graphiti-style). All nullable for backwards compat:
+    -- pre-existing edges have NULL for these and are treated as always-valid.
+    event_time REAL DEFAULT NULL,         -- when the claimed fact occurred
+    ingestion_time REAL DEFAULT NULL,     -- when the system learned it (defaults to created_at if NULL)
+    valid_from REAL DEFAULT NULL,         -- edge validity start (NULL = no lower bound)
+    valid_to REAL DEFAULT NULL,           -- edge validity end (NULL = still valid)
     FOREIGN KEY (source_id) REFERENCES memories(id),
     FOREIGN KEY (target_id) REFERENCES memories(id)
 );
@@ -86,6 +98,30 @@ CREATE INDEX IF NOT EXISTS idx_connections_source ON connections(source_id);
 CREATE INDEX IF NOT EXISTS idx_connections_target ON connections(target_id);
 """
 
+# Columns to add via ALTER TABLE on existing DBs (migration for bi-temporal fields).
+_BITEMPORAL_COLUMNS = [
+    ("event_time", "REAL DEFAULT NULL"),
+    ("ingestion_time", "REAL DEFAULT NULL"),
+    ("valid_from", "REAL DEFAULT NULL"),
+    ("valid_to", "REAL DEFAULT NULL"),
+]
+
+
+def _migrate_bitemporal(conn: sqlite3.Connection) -> None:
+    """Add bi-temporal columns to existing connections tables. Idempotent."""
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(connections)")}
+    except sqlite3.DatabaseError:
+        return
+    for name, decl in _BITEMPORAL_COLUMNS:
+        if name not in existing:
+            try:
+                conn.execute(f"ALTER TABLE connections ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError:
+                # Race with concurrent migration or unsupported on this sqlite; skip silently.
+                pass
+    conn.commit()
+
 class SQLiteStore:
     def __init__(self, db_path: str | Path = DB_PATH):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -93,6 +129,7 @@ class SQLiteStore:
         self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent read perf
         self.conn.execute("PRAGMA synchronous=NORMAL") # Faster writes
         self.conn.executescript(SCHEMA)
+        _migrate_bitemporal(self.conn)
         self.conn.commit()
         self._lock = threading.Lock()
     
@@ -110,11 +147,11 @@ class SQLiteStore:
         import struct
         with self._lock:
             rows = self.conn.execute(
-                "SELECT id, label, content, embedding, salience, access_count FROM memories ORDER BY id"
+                "SELECT id, label, content, embedding, salience, access_count, created_at FROM memories ORDER BY id"
             ).fetchall()
         results = []
         for row in rows:
-            id_, label, content, blob, salience, access_count = row
+            id_, label, content, blob, salience, access_count, created_at = row
             if blob is None:
                 continue
             dim = len(blob) // 4
@@ -122,9 +159,28 @@ class SQLiteStore:
             results.append({
                 'id': id_, 'label': label, 'content': content,
                 'embedding': embedding, 'salience': salience,
-                'access_count': access_count
+                'access_count': access_count, 'created_at': created_at,
             })
         return results
+
+    def get_meta_many(self, ids: list[int]) -> dict[int, dict]:
+        """Batch-fetch salience/access/created_at for a set of ids.
+
+        Used by the C++ fast-path in recall() so salience can be applied
+        without reloading the full embedding blob.
+        """
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            rows = self.conn.execute(
+                f"SELECT id, salience, access_count, created_at FROM memories WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        return {
+            r[0]: {'salience': r[1], 'access_count': r[2], 'created_at': r[3]}
+            for r in rows
+        }
     
     def get(self, id_: int) -> Optional[dict]:
         import struct
@@ -151,24 +207,59 @@ class SQLiteStore:
             )
             self.conn.commit()
     
-    def add_connection(self, source: int, target: int, weight: float, edge_type: str = "similar"):
+    def add_connection(self, source: int, target: int, weight: float,
+                       edge_type: str = "similar",
+                       event_time: Optional[float] = None,
+                       ingestion_time: Optional[float] = None,
+                       valid_from: Optional[float] = None,
+                       valid_to: Optional[float] = None):
+        """Insert or replace an edge with optional bi-temporal metadata.
+
+        All temporal fields are optional; omitting them preserves pre-bitemporal
+        behavior (edge is always-valid). `ingestion_time` defaults to now when
+        any temporal field is set, so edges carrying event_time get a meaningful
+        ingestion stamp without requiring callers to supply it explicitly.
+        """
+        import time as _time
+        if ingestion_time is None and (event_time is not None or valid_from is not None or valid_to is not None):
+            ingestion_time = _time.time()
         with self._lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO connections (source_id, target_id, weight, edge_type) VALUES (?, ?, ?, ?)",
-                (source, target, weight, edge_type)
+                """INSERT OR REPLACE INTO connections
+                   (source_id, target_id, weight, edge_type, event_time, ingestion_time, valid_from, valid_to)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (source, target, weight, edge_type, event_time, ingestion_time, valid_from, valid_to),
             )
             self.conn.commit()
-    
-    def get_connections(self, node_id: int) -> list[dict]:
+
+    def get_connections(self, node_id: int, at_time: Optional[float] = None) -> list[dict]:
+        """Return edges touching node_id.
+
+        If `at_time` is provided, filter to edges valid at that instant:
+        `valid_from <= at_time <= valid_to` (NULLs treated as unbounded).
+        Pre-bitemporal edges with all-NULL temporal fields always pass.
+        """
         rows = self.conn.execute(
-            """SELECT source_id, target_id, weight, edge_type FROM connections 
+            """SELECT source_id, target_id, weight, edge_type,
+                      event_time, ingestion_time, valid_from, valid_to
+               FROM connections
                WHERE source_id = ? OR target_id = ? ORDER BY weight DESC""",
-            (node_id, node_id)
+            (node_id, node_id),
         ).fetchall()
-        return [
-            {'source': r[0], 'target': r[1], 'weight': r[2], 'type': r[3]}
-            for r in rows
-        ]
+        out = []
+        for r in rows:
+            vf, vt = r[6], r[7]
+            if at_time is not None:
+                if vf is not None and at_time < vf:
+                    continue
+                if vt is not None and at_time > vt:
+                    continue
+            out.append({
+                'source': r[0], 'target': r[1], 'weight': r[2], 'type': r[3],
+                'event_time': r[4], 'ingestion_time': r[5],
+                'valid_from': vf, 'valid_to': vt,
+            })
+        return out
     
     def get_stats(self) -> dict:
         mem_count = self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -195,7 +286,13 @@ class NeuralMemory:
     """
     
     def __init__(self, db_path: str | Path = DB_PATH, embedding_backend: str = "auto",
-                 use_mssql: bool = False, use_cpp: bool = True):
+                 use_mssql: bool = False, use_cpp: bool = True,
+                 rerank: bool = False,
+                 rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                 use_hnsw: bool = True,
+                 lazy_graph: bool = False,
+                 hnsw_ef_construction: int = 200,
+                 hnsw_m: int = 16):
         from embed_provider import EmbeddingProvider
 
         self.embedder = EmbeddingProvider(backend=embedding_backend)
@@ -207,6 +304,12 @@ class NeuralMemory:
             self.store = SQLiteStore(db_path)
 
         self.dim = self.embedder.dim
+
+        # Cross-encoder reranker (opt-in, lazy-loaded).
+        # Keeps default behavior identical when rerank=False.
+        self._rerank = bool(rerank)
+        self._rerank_model_name = rerank_model
+        self._rerank_model = None  # lazy
 
         # C++ SIMD index for fast retrieval (primary search path)
         self._cpp = None
@@ -222,12 +325,42 @@ class NeuralMemory:
                 )
                 self._cpp = None
 
-        # In-memory graph for spreading activation
-        self._graph_nodes: dict[int, dict] = {}  # id -> {embedding, connections}
-        self._load_from_store()
+        # HNSW index (optional, Python-only fast retrieval when C++ unavailable).
+        # Safe to coexist with C++: we prefer C++ in recall() but HNSW fills in
+        # if the C++ bridge fails. The index is in-memory and reloads from store.
+        self._hnsw = None
+        self._hnsw_capacity = 0
+        self._hnsw_count = 0
+        if use_hnsw and self._cpp is None:
+            try:
+                import hnswlib  # type: ignore
+                self._hnsw = hnswlib.Index(space='cosine', dim=self.dim)
+                # Initial capacity grows on demand via resize_index
+                self._hnsw_capacity = 1024
+                self._hnsw.init_index(max_elements=self._hnsw_capacity,
+                                      ef_construction=hnsw_ef_construction, M=hnsw_m)
+                self._hnsw.set_ef(max(64, hnsw_ef_construction // 2))
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).debug("hnswlib unavailable: %s", exc)
+                self._hnsw = None
+
+        # In-memory graph for spreading activation.
+        # lazy_graph=True skips the eager full-DB load; nodes are fetched on
+        # demand via _ensure_node(). Useful past ~10k memories where eager load
+        # becomes RAM-bound.
+        self._graph_nodes: dict[int, dict] = {}
+        self._lazy_graph = bool(lazy_graph)
+        if not self._lazy_graph:
+            self._load_from_store()
+        else:
+            # Still build the C++/HNSW side-indexes, just without populating
+            # _graph_nodes. Connections load on demand in _ensure_node().
+            self._cpp_id_map = {}
+            self._load_indexes_only()
 
     def _load_from_store(self):
-        """Load existing memories into in-memory graph + C++ index."""
+        """Load existing memories into in-memory graph + C++/HNSW indexes."""
         all_mems = self.store.get_all()
         for mem in all_mems:
             self._graph_nodes[mem['id']] = {
@@ -251,6 +384,69 @@ class NeuralMemory:
                 if emb and len(emb) == self.dim:
                     cpp_id = self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
                     self._cpp_id_map[cpp_id] = mem['id']
+
+        # Populate HNSW index if present
+        if self._hnsw is not None and all_mems:
+            self._hnsw_ensure_capacity(len(all_mems))
+            import numpy as np
+            vecs = np.asarray([m['embedding'] for m in all_mems], dtype=np.float32)
+            ids = np.asarray([m['id'] for m in all_mems], dtype=np.int64)
+            try:
+                self._hnsw.add_items(vecs, ids)
+                self._hnsw_count = len(all_mems)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).debug("hnsw bulk add failed: %s", exc)
+                self._hnsw = None
+
+    def _load_indexes_only(self):
+        """For lazy_graph mode: populate C++/HNSW indexes without filling _graph_nodes."""
+        all_mems = self.store.get_all()
+        if self._cpp:
+            for mem in all_mems:
+                emb = mem.get('embedding', [])
+                if emb and len(emb) == self.dim:
+                    cpp_id = self._cpp.store(emb, mem.get('label', ''), mem.get('content', ''))
+                    self._cpp_id_map[cpp_id] = mem['id']
+        if self._hnsw is not None and all_mems:
+            self._hnsw_ensure_capacity(len(all_mems))
+            import numpy as np
+            vecs = np.asarray([m['embedding'] for m in all_mems], dtype=np.float32)
+            ids = np.asarray([m['id'] for m in all_mems], dtype=np.int64)
+            try:
+                self._hnsw.add_items(vecs, ids)
+                self._hnsw_count = len(all_mems)
+            except Exception:
+                self._hnsw = None
+
+    def _hnsw_ensure_capacity(self, incoming: int) -> None:
+        """Grow HNSW capacity if the next insert would exceed it."""
+        if self._hnsw is None:
+            return
+        needed = self._hnsw_count + incoming
+        if needed > self._hnsw_capacity:
+            # Grow with 1.5x headroom to amortize resize cost
+            new_cap = max(needed * 3 // 2, self._hnsw_capacity * 2)
+            try:
+                self._hnsw.resize_index(new_cap)
+                self._hnsw_capacity = new_cap
+            except Exception:
+                pass
+
+    def _ensure_node(self, node_id: int) -> dict:
+        """Lazy-load a single graph node from the store. Cached after first fetch."""
+        if node_id in self._graph_nodes:
+            return self._graph_nodes[node_id]
+        mem = self.store.get(node_id)
+        if not mem:
+            return {}
+        node = {'embedding': mem['embedding'], 'label': mem['label'], 'connections': {}}
+        conns = self.store.get_connections(node_id)
+        for c in conns:
+            other = c['target'] if c['source'] == node_id else c['source']
+            node['connections'][other] = c['weight']
+        self._graph_nodes[node_id] = node
+        return node
     
     def remember(self, text: str, label: str = "", detect_conflicts: bool = True) -> int:
         """Store a memory. Returns memory ID.
@@ -299,6 +495,19 @@ class NeuralMemory:
             try:
                 cpp_id = self._cpp.store(embedding, label or text[:60], text)
                 self._cpp_id_map[cpp_id] = mem_id
+            except Exception:
+                pass
+
+        # Add to HNSW index (if active)
+        if self._hnsw is not None:
+            try:
+                import numpy as np
+                self._hnsw_ensure_capacity(1)
+                self._hnsw.add_items(
+                    np.asarray([embedding], dtype=np.float32),
+                    np.asarray([mem_id], dtype=np.int64),
+                )
+                self._hnsw_count += 1
             except Exception:
                 pass
 
@@ -382,6 +591,48 @@ class NeuralMemory:
         
         return False
     
+    def _maybe_rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        """Cross-encoder rerank of a candidate set. No-op if disabled or model unavailable.
+
+        Candidates must carry 'content' (string). Preserves all other fields and
+        adds 'rerank_score'. Re-sorts by rerank_score descending.
+        """
+        if not self._rerank or not candidates:
+            return candidates
+        try:
+            if self._rerank_model is None:
+                from sentence_transformers import CrossEncoder
+                self._rerank_model = CrossEncoder(self._rerank_model_name)
+            pairs = [(query, c.get('content') or c.get('label') or '') for c in candidates]
+            scores = self._rerank_model.predict(pairs)
+            for c, s in zip(candidates, scores):
+                c['rerank_score'] = float(s)
+            candidates.sort(key=lambda x: -x.get('rerank_score', 0.0))
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug("rerank skipped: %s", exc)
+        return candidates
+
+    @staticmethod
+    def _effective_salience(salience_base, access_count, created_at, now=None) -> float:
+        """Compute a runtime salience factor from stored base + access + age.
+
+        Kept non-persistent so we don't serialize write contention into recall.
+        - Age decay: gentle exp(-k*days)
+        - Access boost: log1p(access_count) * alpha
+        - Clamped to [SALIENCE_MIN, SALIENCE_MAX]
+        """
+        import math
+        import time as _time
+        if now is None:
+            now = _time.time()
+        base = salience_base if salience_base is not None else 1.0
+        age_days = max(0.0, (now - (created_at or now)) / 86400.0)
+        decay = math.exp(-SALIENCE_AGE_DECAY_K * age_days)
+        boost = math.log1p(max(0, access_count or 0)) * SALIENCE_ACCESS_BOOST
+        eff = base * decay + boost
+        return max(SALIENCE_MIN, min(SALIENCE_MAX, eff))
+
     def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
         """
         Retrieve memories related to query.
@@ -405,6 +656,11 @@ class NeuralMemory:
             try:
                 candidates = self._cpp.retrieve(query_vec, k=k * 3)
                 if candidates:
+                    # Batch-fetch salience meta for the candidate set so the
+                    # salience factor can be applied without re-reading embeddings.
+                    cand_ids = [self._cpp_id_map.get(c['id'], c['id']) for c in candidates]
+                    meta = self.store.get_meta_many(cand_ids) if hasattr(self.store, 'get_meta_many') else {}
+
                     scored = []
                     for c in candidates:
                         cpp_id = c['id']
@@ -412,7 +668,12 @@ class NeuralMemory:
                         mem_id = self._cpp_id_map.get(cpp_id, cpp_id)
                         sim = c.get('similarity', c.get('score', 0))
                         node = self._graph_nodes.get(mem_id, {})
+                        m = meta.get(mem_id, {})
+                        salience_factor = self._effective_salience(
+                            m.get('salience'), m.get('access_count'), m.get('created_at'), now=now
+                        )
 
+                        base_combined = (1 - temporal_weight) * sim + temporal_weight * 0.5
                         scored.append({
                             'id': mem_id,
                             'label': c.get('label', node.get('label', '')),
@@ -420,11 +681,14 @@ class NeuralMemory:
                             'embedding': node.get('embedding', []),
                             'similarity': sim,
                             'temporal_score': 0.5,
-                            'combined': (1 - temporal_weight) * sim + temporal_weight * 0.5,
+                            'salience_factor': round(salience_factor, 4),
+                            'combined': base_combined * salience_factor,
                             'connections': list(node.get('connections', {}).keys()),
                         })
 
                     scored.sort(key=lambda x: -x['combined'])
+                    # Optional cross-encoder rerank on the candidate set before slicing
+                    scored = self._maybe_rerank(query, scored)
                     # Touch accessed memories
                     for s in scored[:k]:
                         try:
@@ -435,7 +699,80 @@ class NeuralMemory:
             except Exception:
                 pass  # Fall through to Python path
 
-        # Python fallback: O(n) linear scan
+        # Python path: prefer HNSW ANN over brute force when available
+        if self._hnsw is not None and self._hnsw_count > 0:
+            try:
+                import numpy as np
+                q = np.asarray([query_vec], dtype=np.float32)
+                fetch = max(k * 3, min(50, self._hnsw_count))
+                labels, dists = self._hnsw.knn_query(q, k=min(fetch, self._hnsw_count))
+                ids = [int(x) for x in labels[0]]
+                sims = [float(1.0 - d) for d in dists[0]]
+                meta_map = self.store.get_meta_many(ids) if hasattr(self.store, 'get_meta_many') else {}
+                scored = []
+                for cid, sim in zip(ids, sims):
+                    mem = self.store.get(cid)
+                    if not mem:
+                        continue
+                    row = self.store.conn.execute(
+                        "SELECT last_accessed FROM memories WHERE id = ?", (cid,)
+                    ).fetchone()
+                    import math as _m
+                    if row and row[0]:
+                        age_hours = (now - row[0]) / 3600
+                        temporal_score = _m.exp(-0.693 * age_hours / 24)
+                    else:
+                        temporal_score = 0.5
+                    m = meta_map.get(cid, {})
+                    sal = self._effective_salience(
+                        m.get('salience'), m.get('access_count'), m.get('created_at'), now=now
+                    )
+                    base = (1 - temporal_weight) * sim + temporal_weight * temporal_score
+                    scored.append({
+                        **mem,
+                        'similarity': sim,
+                        'temporal_score': temporal_score,
+                        'salience_factor': sal,
+                        'combined': base * sal,
+                    })
+                scored.sort(key=lambda x: -x['combined'])
+                rerank_pool = scored[:max(k * 3, 15)] if self._rerank else scored
+                rerank_pool = self._maybe_rerank(query, rerank_pool)
+
+                results = []
+                seen = set()
+                for mem in rerank_pool[:k]:
+                    if mem['id'] in seen:
+                        continue
+                    seen.add(mem['id'])
+                    conns = self.store.get_connections(mem['id'])
+                    connected = []
+                    for c in conns:
+                        other = c['target'] if c['source'] == mem['id'] else c['source']
+                        if other not in seen:
+                            other_mem = self.store.get(other)
+                            if other_mem:
+                                connected.append({
+                                    'id': other, 'label': other_mem['label'], 'weight': c['weight']
+                                })
+                    results.append({
+                        'id': mem['id'],
+                        'label': mem['label'],
+                        'content': mem['content'],
+                        'similarity': round(mem['similarity'], 4),
+                        'temporal_score': round(mem['temporal_score'], 4),
+                        'salience_factor': round(mem.get('salience_factor', 1.0), 4),
+                        'combined': round(mem['combined'], 4),
+                        'connections': connected[:3],
+                    })
+                    self.store.touch(mem['id'])
+                if results:
+                    return results
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).debug("hnsw recall failed, falling back to brute force: %s", exc)
+
+        # Python brute-force fallback: O(n) linear scan
         scored = []
         for mem in self.store.get_all():
             sim = self._cosine_similarity(query_vec, mem['embedding'])
@@ -453,16 +790,30 @@ class NeuralMemory:
             except Exception:
                 temporal_score = 0.5
 
-            combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
-            scored.append({**mem, 'similarity': sim, 'temporal_score': temporal_score, 'combined': combined})
+            salience_factor = self._effective_salience(
+                mem.get('salience'), mem.get('access_count'), mem.get('created_at'), now=now
+            )
+            base_combined = (1 - temporal_weight) * sim + temporal_weight * temporal_score
+            combined = base_combined * salience_factor
+            scored.append({
+                **mem,
+                'similarity': sim,
+                'temporal_score': temporal_score,
+                'salience_factor': salience_factor,
+                'combined': combined,
+            })
 
         # Sort by combined score
         scored.sort(key=lambda x: -x['combined'])
-        
+
+        # Optional cross-encoder rerank on the top candidates before slicing to k
+        rerank_pool = scored[:max(k * 3, 15)] if self._rerank else scored
+        rerank_pool = self._maybe_rerank(query, rerank_pool)
+
         # Enrich with connections via spreading activation
         results = []
         seen = set()
-        for mem in scored[:k]:
+        for mem in rerank_pool[:k]:
             if mem['id'] in seen:
                 continue
             seen.add(mem['id'])
@@ -487,6 +838,7 @@ class NeuralMemory:
                 'content': mem['content'],
                 'similarity': round(mem['similarity'], 4),
                 'temporal_score': round(mem['temporal_score'], 4),
+                'salience_factor': round(mem.get('salience_factor', 1.0), 4),
                 'combined': round(mem['combined'], 4),
                 'connections': connected[:3],  # Top 3
             })
@@ -495,37 +847,34 @@ class NeuralMemory:
         
         return results
     
-    def think(self, start_id: int, depth: int = 3, decay: float = 0.85) -> list[dict]:
+    def think(self, start_id: int, depth: int = 3, decay: float = 0.85,
+              engine: str = "bfs", alpha: float = 0.15, n_iter: int = 40,
+              top_k: int = 25) -> list[dict]:
         """
         Spreading activation from a starting memory.
-        Returns activated memories sorted by activation level.
+
+        engine='bfs'  — original decay-BFS propagation (default; preserves prior behavior)
+        engine='ppr'  — Personalized PageRank seeded at start_id (HippoRAG-2 style).
+                        Uses weighted edges and restart prob `alpha`. Tends to rank
+                        globally-relevant associates higher than local neighbors,
+                        and is less sensitive to `depth` or hop-count heuristics.
+
+        Returns activated memories sorted by activation/score, limited to top_k.
         """
+        # In lazy_graph mode, pull the seed on demand so the early-return gate
+        # doesn't short-circuit before any nodes have been cached.
         if start_id not in self._graph_nodes:
-            return []
-        
-        # BFS with activation propagation
-        activation = {start_id: 1.0}
-        visited = {start_id}
-        queue = [(start_id, 1.0, 0)]
-        
-        while queue:
-            current, act, level = queue.pop(0)
-            if level >= depth or act < 0.01:
-                continue
-            
-            node = self._graph_nodes.get(current, {})
-            for neighbor_id, weight in node.get('connections', {}).items():
-                propagated = act * weight * decay
-                if propagated < 0.01:
-                    continue
-                
-                if neighbor_id not in activation or propagated > activation[neighbor_id]:
-                    activation[neighbor_id] = propagated
-                    if neighbor_id not in visited:
-                        visited.add(neighbor_id)
-                        queue.append((neighbor_id, propagated, level + 1))
-        
-        # Build results (skip start node)
+            if self._lazy_graph:
+                if not self._ensure_node(start_id):
+                    return []
+            else:
+                return []
+
+        if engine == "ppr":
+            activation = self._ppr([start_id], alpha=alpha, n_iter=n_iter)
+        else:
+            activation = self._bfs_spread(start_id, depth=depth, decay=decay)
+
         results = []
         for node_id, act in activation.items():
             if node_id == start_id:
@@ -535,11 +884,134 @@ class NeuralMemory:
                 results.append({
                     'id': node_id,
                     'label': mem['label'],
-                    'activation': round(act, 4),
+                    'activation': round(act, 6),
                 })
-        
+
         results.sort(key=lambda x: -x['activation'])
-        return results
+        return results[:top_k]
+
+    def _bfs_spread(self, start_id: int, depth: int = 3, decay: float = 0.85) -> dict:
+        """Original decay-BFS spreading activation — preserved as a fallback engine."""
+        activation = {start_id: 1.0}
+        visited = {start_id}
+        queue = [(start_id, 1.0, 0)]
+
+        while queue:
+            current, act, level = queue.pop(0)
+            if level >= depth or act < 0.01:
+                continue
+
+            # In lazy mode, hydrate the node on first visit so the walk can continue
+            if self._lazy_graph and current not in self._graph_nodes:
+                self._ensure_node(current)
+            node = self._graph_nodes.get(current, {})
+            for neighbor_id, weight in node.get('connections', {}).items():
+                propagated = act * weight * decay
+                if propagated < 0.01:
+                    continue
+
+                if neighbor_id not in activation or propagated > activation[neighbor_id]:
+                    activation[neighbor_id] = propagated
+                    if neighbor_id not in visited:
+                        visited.add(neighbor_id)
+                        queue.append((neighbor_id, propagated, level + 1))
+
+        return activation
+
+    def _ppr(self, seed_ids, alpha: float = 0.15, n_iter: int = 40) -> dict:
+        """Personalized PageRank over the in-memory weighted graph.
+
+        Based on HippoRAG 2's retrieval primitive: `alpha` is the restart
+        probability (fraction of mass that returns to the seed distribution
+        at each iteration). Equivalent to hippocampal indexing via PPR on a
+        phrase/passage graph — same philosophy as spreading activation, but
+        with a principled convergence criterion and no depth cliff.
+
+        Uses networkx when available (weighted PR); falls back to pure-numpy
+        power iteration for offline/minimal-dep environments.
+        """
+        # In lazy mode, ensure seeds and their reachable subgraph are loaded.
+        # PPR needs the full structure it walks over; we hydrate via a bounded
+        # BFS expansion so we don't blow memory on huge graphs.
+        if self._lazy_graph:
+            for s in seed_ids:
+                self._ensure_node(s)
+            # Two-hop neighborhood expansion (bounded to avoid O(|V|) load)
+            frontier = set(seed_ids)
+            for _ in range(2):
+                next_frontier = set()
+                for nid in frontier:
+                    node = self._graph_nodes.get(nid, {})
+                    for nb in node.get('connections', {}):
+                        if nb not in self._graph_nodes:
+                            self._ensure_node(nb)
+                            next_frontier.add(nb)
+                frontier = next_frontier
+
+        # Personalization vector concentrated on seeds
+        seeds = [s for s in seed_ids if s in self._graph_nodes]
+        if not seeds:
+            return {}
+
+        # Prefer networkx's pagerank (handles dangling, weights, convergence)
+        try:
+            import networkx as nx  # type: ignore
+            g = nx.DiGraph()
+            for nid, node in self._graph_nodes.items():
+                g.add_node(nid)
+                for nb, w in node.get('connections', {}).items():
+                    if w and w > 0:
+                        g.add_edge(nid, nb, weight=float(w))
+            if g.number_of_edges() == 0:
+                return {s: 1.0 / len(seeds) for s in seeds}
+            pers = {n: (1.0 / len(seeds) if n in seeds else 0.0) for n in g.nodes}
+            pr = nx.pagerank(g, alpha=1.0 - alpha, personalization=pers,
+                             weight='weight', max_iter=n_iter, tol=1e-6)
+            return pr
+        except Exception:
+            pass
+
+        # Pure-Python power iteration fallback (O(iter * |E|))
+        nodes = list(self._graph_nodes.keys())
+        idx = {n: i for i, n in enumerate(nodes)}
+        n = len(nodes)
+        if n == 0:
+            return {}
+
+        # Weighted out-degree normalized transition
+        out_rows: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+        out_totals = [0.0] * n
+        for src, node in self._graph_nodes.items():
+            i = idx[src]
+            for tgt, w in node.get('connections', {}).items():
+                if tgt in idx and w and w > 0:
+                    out_rows[i].append((idx[tgt], float(w)))
+                    out_totals[i] += float(w)
+
+        # Personalization: uniform over seeds
+        p = [0.0] * n
+        for s in seeds:
+            p[idx[s]] = 1.0 / len(seeds)
+
+        r = list(p)
+        damp = 1.0 - alpha
+        for _ in range(n_iter):
+            new = [alpha * p_i for p_i in p]
+            for i in range(n):
+                total = out_totals[i]
+                if total <= 0:
+                    # Dangling node — redistribute mass uniformly to seeds
+                    for s in seeds:
+                        new[idx[s]] += damp * r[i] / len(seeds)
+                    continue
+                share = damp * r[i] / total
+                for j, w in out_rows[i]:
+                    new[j] += share * w
+            # Normalize against drift
+            s_new = sum(new) or 1.0
+            r = [v / s_new for v in new]
+
+        return {nodes[i]: r[i] for i in range(n)}
     
     def connections(self, mem_id: int) -> list[dict]:
         """Get all connections for a memory."""
