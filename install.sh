@@ -137,13 +137,8 @@ $PYTHON -c "import fastembed" 2>/dev/null && print_ok "fastembed (ONNX backend)"
     print_ok "fastembed installed"
 }
 
-# 4c. Verify FastEmbed works
-$PYTHON -c "
-from fastembed import TextEmbedding
-model = TextEmbedding('intfloat/multilingual-e5-large')
-emb = list(model.embed(['test']))[0]
-print(f'  FastEmbed OK: {len(emb)}d embedding')
-" 2>/dev/null && print_ok "FastEmbed verification passed" || print_warn "FastEmbed installed but test failed — will retry on first use"
+# 4c. Verify FastEmbed import works (model downloads on first use)
+$PYTHON -c "from fastembed import TextEmbedding; print('  FastEmbed import OK')" 2>/dev/null && print_ok "FastEmbed ready (model downloads on first use)" || print_warn "FastEmbed import failed"
 
 # -------------------------------------------------------------------
 # 5. Optional: GPU recall engine (torch + CUDA)
