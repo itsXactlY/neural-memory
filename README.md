@@ -2,7 +2,9 @@
 
 Semantic memory system with knowledge graph, spreading activation, embedding-based recall, autonomous dream consolidation, and GPU-accelerated recall for the Hermes Agent.
 
-![Neural Memory](https://github.com/user-attachments/assets/2d938624-cc39-4f8b-b35b-485b23e93355)
+[![Neural Memory](assets/cover.png)](https://github.com/itsXactlY/neural-memory/raw/refs/heads/master/assets/cover_video.mp4)
+
+[![Dashboard](assets/neural_memory.png)](https://raw.githubusercontent.com/itsXactlY/neural-memory/refs/heads/master/assets/neural_memory.png)
 
 ## Features
 
