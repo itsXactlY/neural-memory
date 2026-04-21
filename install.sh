@@ -75,12 +75,13 @@ detect_hermes_agent() {
     fi
 
     if [ -z "$HERMES_AGENT" ]; then
-        for candidate in \
-            "$HOME/.hermes/hermes-agent" \
-            "$HOME/hermes-agent" \
-            "$HOME/.hermes/agent" \
-            "/opt/hermes-agent" \
-            "$HOME/projects/hermes-agent"; do
+    for candidate in \
+        "$HOME/.hermes/hermes-agent" \
+        "$HOME/jack-in-a-box/hermes-agent" \
+        "$HOME/hermes-agent" \
+        "$HOME/.hermes/agent" \
+        "/opt/hermes-agent" \
+        "$HOME/projects/hermes-agent"; do
             if [ -d "$candidate" ] && [ -d "$candidate/plugins/memory" ]; then
                 HERMES_AGENT="$candidate"
                 break
