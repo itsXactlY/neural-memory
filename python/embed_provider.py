@@ -472,6 +472,30 @@ class SentenceTransformerBackend:
         return [v.tolist() for v in vecs]
     
     @classmethod
+    def _touch(cls):
+        """Record last use time for idle eject timer."""
+        cls._last_used = time.time()
+    
+    @classmethod
+    def _ensure_on_device(cls):
+        """Ensure model is on GPU (reloads from CPU if necessary)."""
+        if cls._shared_device != 'cuda':
+            return
+        try:
+            import torch
+            if cls._shared_model is None:
+                return
+            current = next(cls._shared_model.parameters()).device
+            if current.type == 'cpu':
+                free = torch.cuda.mem_get_info(0)[0] / 1024**2
+                if free < 500:
+                    return
+                cls._shared_model.to('cuda')
+                print("[embed] Reloaded to GPU")
+        except Exception as e:
+            print(f"[embed] GPU reload failed: {e}", file=sys.stderr)
+
+    @classmethod
     def eject(cls):
         """Manually eject model to CPU (frees GPU memory now)."""
         # Try shared server eject
@@ -835,9 +859,49 @@ class EmbeddingProvider:
     
     def _auto_detect(self):
         """Auto-detect best available backend.
-        Priority: FastEmbed > CUDA sentence-transformers > MPS sentence-transformers > CPU sentence-transformers > TF-IDF > hash
+        Priority: CUDA sentence-transformers > FastEmbed > MPS sentence-transformers > CPU sentence-transformers > TF-IDF > hash
         """
-        # FastEmbed first (ONNX, no PyTorch conflict, fast on CPU)
+        import torch
+
+        # 1. CUDA sentence-transformers FIRST (user's RTX 4060 Ti has 15GB VRAM)
+        if torch.cuda.is_available():
+            try:
+                free = torch.cuda.mem_get_info(0)[0] / 1024**2
+                if free > 2000:  # At least 2GB VRAM for batching
+                    backend = SentenceTransformerBackend()
+                    backend._is_client = False
+                    # Force CUDA load directly
+                    backend._load_direct = lambda: None  # prevent recursion
+                    # Actually load on CUDA
+                    from sentence_transformers import SentenceTransformer
+                    safe_name = backend.MODEL_NAME.replace('/', '--')
+                    cache_base = MODEL_DIR / f"models--{safe_name}"
+                    model_path = None
+                    refs_main = cache_base / "refs" / "main"
+                    if refs_main.exists():
+                        snap_hash = refs_main.read_text().strip()
+                        sp = cache_base / "snapshots" / snap_hash
+                        if (sp / "config.json").exists():
+                            model_path = str(sp)
+                    if model_path is None:
+                        snapshots_dir = cache_base / "snapshots"
+                        if snapshots_dir.exists():
+                            for snap in snapshots_dir.iterdir():
+                                if (snap / "config.json").exists():
+                                    model_path = str(snap)
+                                    break
+                    if model_path:
+                        backend.model = SentenceTransformer(model_path, device='cuda')
+                        backend.dim = backend.model.get_sentence_embedding_dimension()
+                        SentenceTransformerBackend._shared_model = backend.model
+                        SentenceTransformerBackend._shared_dim = backend.dim
+                        SentenceTransformerBackend._shared_device = 'cuda'
+                        print(f"[embed] Auto-selected: sentence-transformers CUDA ({backend.dim}d, {free:.0f}MB free)")
+                        return backend
+            except (ImportError, Exception) as e:
+                print(f"[embed] CUDA sentence-transformers failed: {e}", file=sys.stderr)
+
+        # 2. FastEmbed ONNX (CPU, no PyTorch dependency, fast)
         try:
             backend = FastEmbedBackend()
             print(f"[embed] Auto-selected: FastEmbed ({backend.dim}d)")
@@ -845,33 +909,36 @@ class EmbeddingProvider:
         except (ImportError, Exception) as e:
             if not isinstance(e, ImportError):
                 print(f"[embed] FastEmbed failed: {e}", file=sys.stderr)
-        
-        # Try sentence-transformers (CUDA, MPS, or CPU)
+
+        # 3. MPS sentence-transformers (Apple Silicon)
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            try:
+                backend = SentenceTransformerBackend()
+                print("[embed] Auto-selected: sentence-transformers MPS")
+                return backend
+            except (ImportError, Exception) as e:
+                if not isinstance(e, ImportError):
+                    print(f"[embed] MPS sentence-transformers failed: {e}", file=sys.stderr)
+
+        # 4. CPU sentence-transformers
         try:
             import sentence_transformers
-            import torch
-            if torch.cuda.is_available():
-                device = "CUDA"
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = "MPS"
-            else:
-                device = "CPU"
             backend = SentenceTransformerBackend()
-            print(f"[embed] Auto-selected: sentence-transformers ({device})")
+            print("[embed] Auto-selected: sentence-transformers CPU")
             return backend
         except (ImportError, Exception) as e:
             if not isinstance(e, ImportError):
-                print(f"[embed] sentence-transformers failed: {e}", file=sys.stderr)
-        
-        # TF-IDF+SVD
+                print(f"[embed] CPU sentence-transformers failed: {e}", file=sys.stderr)
+
+        # 5. TF-IDF+SVD
         try:
             import numpy
             print("[embed] Auto-selected: TF-IDF+SVD")
             return TfidfSvdBackend()
         except ImportError:
             pass
-        
-        # Hash fallback
+
+        # 6. Hash fallback
         print("[embed] Auto-selected: hash (zero dependencies)")
         return HashBackend()
     

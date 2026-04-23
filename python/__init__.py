@@ -153,10 +153,13 @@ class NeuralMemoryProvider(MemoryProvider):
             import sys
             from pathlib import Path
 
-            # Add plugin dir to path
-            plugin_dir = str(Path(__file__).parent)
-            if plugin_dir not in sys.path:
-                sys.path.insert(0, plugin_dir)
+            # Resolve symlinks so imports work when running from the symlink
+            plugin_dir = str(Path(__file__).resolve().parent)
+            real_project_dir = str(Path(__file__).resolve().parent.parent.parent / "neural-memory-adapter" / "python")
+
+            for p in (plugin_dir, real_project_dir):
+                if p not in sys.path:
+                    sys.path.insert(0, p)
 
             # Actually try importing
             from neural_memory import Memory
@@ -228,6 +231,17 @@ class NeuralMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Neural memory init failed: %s", e)
             self._memory = None
+
+    def update_session_id(self, session_id: str) -> None:
+        """Called after session split (e.g. compression) to update the session tag.
+        
+        Neural Memory uses session_id as the archive_tag for archive_compression().
+        After compression creates a new session_id, this ensures subsequent
+        archives and prefetches use the correct new tag.
+        """
+        self._session_id = session_id
+        logger.debug("Neural memory session_id updated: %s", session_id)
+
     def _start_dream_engine(self) -> None:
         """Start dream engine — MSSQL (C++) if available, SQLite fallback."""
         import os
@@ -615,41 +629,50 @@ class NeuralMemoryProvider(MemoryProvider):
 
     def post_llm_call(self, session_id: str, user_message: str, assistant_response: str,
                       conversation_history: list, model: str, platform: str, **kwargs) -> None:
-        """After every LLM answer: resume dream engine AND store the response.
+        """After every LLM answer: resume dream engine AND store BOTH messages.
 
-        Full-fidelity storage: stores the assistant response without the
-        _is_garbage filter (sponge filters too aggressively — skips technical
-        content, error messages, code snippets). Deduplication via embedding
-        similarity still applies so we don't flood with near-duplicates.
+        Zero loss: every user query AND every assistant response is stored
+        immediately. No garbage filter, no "is this meaningful?" judgment.
+        Deduplication via embedding similarity prevents floods, but content
+        is NEVER silently dropped.
 
         Also archives the full conversation turn via archive_compression for
-        complete losslessness (turn stored even if dedup skips the response).
+        complete losslessness.
         """
         # 1. Dream engine resume (existing behaviour)
         if self._dream is not None and self._dream_was_running_before_turn:
             self._dream.start()
             self._dream_was_running_before_turn = False
 
-        # 2. Full-fidelity per-turn storage (no garbage filter)
-        if not self._memory or not assistant_response:
-            return
-        if len(assistant_response.strip()) < 5:
+        if not self._memory:
             return
 
-        try:
-            self._memory.remember(
-                assistant_response,
-                label=f"turn:assistant",
-            )
-        except Exception as e:
-            logger.debug(f"Per-turn store failed: {e}")
+        # 2. ALWAYS store user message (zero filtering — nothing is "garbage")
+        if user_message and len(user_message.strip()) >= 3:
+            try:
+                self._memory.remember(
+                    user_message,
+                    label=f"turn:user",
+                )
+            except Exception as e:
+                logger.debug(f"User message store failed: {e}")
 
-        # 3. Archive full turn for losslessness (user + assistant together)
+        # 3. ALWAYS store assistant response (zero filtering)
+        if assistant_response and len(assistant_response.strip()) >= 3:
+            try:
+                self._memory.remember(
+                    assistant_response,
+                    label=f"turn:assistant",
+                )
+            except Exception as e:
+                logger.debug(f"Assistant response store failed: {e}")
+
+        # 4. Archive full turn for losslessness (user + assistant together)
         try:
             if conversation_history:
                 session_tag = f"session-{session_id[:8]}" if session_id else "session-unknown"
                 self._memory.archive_compression(
-                    turns=conversation_history[-4:],  # last turn: user + asst + tool results
+                    turns=conversation_history[-6:],  # last turn: user + asst + tool results
                     session_tag=session_tag,
                 )
         except Exception as e:
