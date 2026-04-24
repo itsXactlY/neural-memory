@@ -91,10 +91,125 @@ When active, the following tools are available:
 |------|-------------|
 | `neural_remember` | Store a memory (with conflict detection) |
 | `neural_recall` | Search memories by semantic similarity |
-| `neural_think` | Spreading activation from a memory |
+| `neural_think` | Spreading activation from a memory (engine: `bfs` or `ppr`) |
 | `neural_graph` | View knowledge graph statistics |
 | `neural_dream` | Force a dream cycle (all/nrem/rem/insight) |
 | `neural_dream_stats` | Dream engine statistics |
+| `neural_dashboard` | Generate Plotly HTML dashboard from current DB state (H10) |
+
+## Phase B upgrades (2026-04-18 and later)
+
+Seven retrieval + consolidation upgrades on top of the original design. All
+additive — defaults preserve prior behavior; new capabilities activate via
+constructor params or when optional deps are installed.
+
+### Salience-aware recall (default on)
+
+Every recall multiplies `combined = (1-tw)*sim + tw*temporal` by an effective
+salience factor:
+
+```
+base * exp(-k*age_days) + log1p(access_count) * α    clamped to [0.1, 2.0]
+```
+
+Stale memories decay gently; frequently-accessed memories boost. Opt out with
+`NeuralMemory(salience_multiply=False)`.
+
+### Bi-temporal edges (backward compat)
+
+The `connections` table gains nullable `event_time`, `ingestion_time`,
+`valid_from`, `valid_to`. Pre-existing edges (all NULL) are always-valid.
+Query historical graph state with `store.get_connections(mem_id, at_time=ts)`.
+Follows the [Graphiti](https://github.com/getzep/graphiti) design.
+
+### Cross-encoder reranker (opt-in)
+
+```python
+NeuralMemory(rerank=True, rerank_model="cross-encoder/ms-marco-MiniLM-L-6-v2")
+```
+
+Lazy-loaded; silent no-op if `sentence-transformers` absent. Reranks top-k*3
+candidates before slicing to k.
+
+### Personalized PageRank think() engine (opt-in)
+
+```python
+mem.think(start_id, engine='ppr', alpha=0.15)
+```
+
+BFS remains default. PPR is the HippoRAG-2 approach — principled convergence,
+handles hubs correctly. Uses `networkx.pagerank` if available; pure-numpy
+power-iteration fallback otherwise.
+
+### HNSW index + lazy graph (opt-in)
+
+```python
+NeuralMemory(use_hnsw=True, lazy_graph=True, hnsw_ef=100)
+```
+
+`use_hnsw=True` (default when hnswlib installed) adds ANN retrieval for the
+Python-only recall path. `lazy_graph=True` defers eager full-DB load —
+scales past ~10k memories. `hnsw_ef` tunes the accuracy/speed tradeoff.
+
+### Louvain community detection in Insight phase
+
+Automatic when `networkx` installed. Replaces BFS connected-components
+(which degenerated on dense graphs). Deterministic seed=42. BFS fallback
+if networkx is absent.
+
+### LongMemEval benchmarks
+
+```bash
+python3 benchmarks/lme_eval.py                           # synthetic smoke
+python3 benchmarks/lme_real.py --dataset /path/to/lme    # real dataset
+```
+
+Reports R@{1,5,10}, MRR, p50/p95 latency. Flags for `--rerank --use-hnsw
+--engine`. Real dataset: `huggingface.co/datasets/xiaowu0162/longmemeval`
+(note: one underscore, not two).
+
+## Optional dependencies
+
+All optional; probed by `install.sh` with warn-if-absent. Each unlocks a
+specific feature without breaking anything if absent.
+
+| Dep | Enables |
+|-----|---------|
+| `sentence-transformers` | MiniLM-L6-v2 semantic embeddings + cross-encoder reranker |
+| `networkx` | Louvain community detection + faster PPR |
+| `hnswlib` | HNSW ANN fast-path in the Python-only recall path |
+| `pyodbc` | MSSQL backend for shared-agent dream consolidation |
+
+Install all three Phase-B deps:
+```bash
+pip install sentence-transformers networkx hnswlib
+```
+
+## Feature-state introspection
+
+```python
+mem.stats()
+# returns {
+#   memories, connections, embedding_dim, embedding_backend,
+#   cpp_available, hnsw_active, hnsw_count, hnsw_ef,
+#   lazy_graph, louvain_available, reranker_loaded,
+#   rerank_enabled, salience_multiply
+# }
+```
+
+## Maintenance tools
+
+- `tools/compact.py` — weekly compaction sweep (H11). Hard-deletes memories
+  matching all of: `age > 180 days`, `effective_salience < 0.15`, `0 valid edges`,
+  label not in sticky-prefix whitelist. Dry-run default; audit log per deletion.
+- `tools/observer.py` — continuous ingest daemon (A6). Watches git repos +
+  Obsidian vaults, writes changes as memories via the `remember` CLI. Launchd
+  plist at `~/Library/LaunchAgents/com.ae.neural-observer.plist`.
+- `tools/obsidian_sync.py` — mirror the memory graph into an Obsidian vault
+  as one `.md` per memory with wikilinks matching SQL edges. Obsidian's graph
+  view then renders your live memory graph.
+- `tools/dashboard/generate.py` — Plotly HTML dashboard (memory categories,
+  connection strength, knowledge graph ring, degree distribution, flow).
 
 ## Dream Engine
 
