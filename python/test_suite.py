@@ -694,9 +694,8 @@ def test_phb_h13_is_identity_grade():
     class _Probe:
         pass
 
-    # Reimplement _is_identity_grade logic minimally — test that identity-grade
-    # strings are preserved and episodic strings rotate. This mirrors the
-    # hermes-plugin/__init__.py implementation.
+    # Mirror of hermes-plugin/__init__.py _is_identity_grade.
+    # Ordering: identity patterns → negative signals → architectural → default.
     def is_identity(content: str) -> bool:
         if len(content) > 800:
             return False
@@ -709,11 +708,6 @@ def test_phb_h13_is_identity_grade():
             "identity:", "persona:", "boundary:",
         )):
             return True
-        if len(content) < 250 and any(p in lower for p in (
-            "provider:", "default:", "backend:", "config:", "=",
-            "runs on", "lives at", "stored at", "path:",
-        )):
-            return True
         if re.search(r"\b(20\d{2}-\d{2}-\d{2}|yesterday|last week|earlier today)\b", lower):
             return False
         if any(p in lower for p in (
@@ -721,6 +715,11 @@ def test_phb_h13_is_identity_grade():
             "found", "discovered", "measured", "result:",
         )):
             return False
+        if len(content) < 250 and any(p in lower for p in (
+            "provider:", "default:", "backend:", "config:",
+            "runs on", "lives at", "stored at", "path:",
+        )):
+            return True
         return len(content) < 200
 
     # Identity-grade cases → True
