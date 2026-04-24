@@ -307,9 +307,13 @@ def test_21():
 @_testcase("memory: auto-connections", tags=["memory"])
 def test_22():
     from memory_client import NeuralMemory
+    from pathlib import Path
+    model_dir = Path.home() / ".neural_memory" / "models" / "models--BAAI--bge-m3"
+    if not model_dir.exists():
+        raise SkipTest("BAAI/bge-m3 not cached — hash backend cannot create semantic connections")
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f: db = f.name
     try:
-        m = NeuralMemory(db_path=db, embedding_backend="hash")
+        m = NeuralMemory(db_path=db, embedding_backend="auto")
         m.remember("Dogs are great pets")
         m.remember("Dogs need daily walks")
         m.remember("Python is a programming language")
@@ -380,7 +384,7 @@ def test_27():
     from neural_memory import Memory
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f: db = f.name
     try:
-        with Memory(db_path=db, embedding_backend="hash", use_cpp=False) as m:
+        with Memory(db_path=db, embedding_backend="hash", use_cpp=False, use_mssql=False) as m:
             m.remember("Test memory")
             r = m.recall("test", k=1)
             assert len(r) >= 1
@@ -391,7 +395,7 @@ def test_28():
     from neural_memory import Memory
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f: db = f.name
     try:
-        with Memory(db_path=db, embedding_backend="hash", use_cpp=False) as m:
+        with Memory(db_path=db, embedding_backend="hash", use_cpp=False, use_mssql=False) as m:
             m.remember("a")
             m.remember("b")
             s = m.stats()

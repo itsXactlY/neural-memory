@@ -866,7 +866,10 @@ class EmbeddingProvider:
         The shared server is checked FIRST because it means another process already loaded
         the model. We do NOT reload it — we connect via socket.
         """
-        import torch
+        try:
+            import torch
+        except ImportError:
+            torch = None
 
         # 0. SHARED SERVER FIRST — if socket exists and server is alive, USE IT
         # This is the whole point of the shared server architecture!
@@ -886,7 +889,7 @@ class EmbeddingProvider:
                 pass  # No server running, fall through to direct load
 
         # 1. CUDA sentence-transformers (user's RTX 4060 Ti has 15GB VRAM)
-        if torch.cuda.is_available():
+        if torch and torch.cuda.is_available():
             try:
                 free = torch.cuda.mem_get_info(0)[0] / 1024**2
                 if free > 2000:  # At least 2GB VRAM for batching
@@ -933,7 +936,7 @@ class EmbeddingProvider:
                 print(f"[embed] FastEmbed failed: {e}", file=sys.stderr)
 
         # 3. MPS sentence-transformers (Apple Silicon)
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        if torch and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             try:
                 backend = SentenceTransformerBackend()
                 print("[embed] Auto-selected: sentence-transformers MPS")
