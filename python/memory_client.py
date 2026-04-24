@@ -113,7 +113,6 @@ CREATE INDEX IF NOT EXISTS idx_connections_source ON connections(source_id);
 CREATE INDEX IF NOT EXISTS idx_connections_target ON connections(target_id);
 CREATE INDEX IF NOT EXISTS idx_connections_pair ON connections(source_id, target_id);
 CREATE INDEX IF NOT EXISTS idx_connections_edge_type_weight ON connections(edge_type, weight);
-CREATE INDEX IF NOT EXISTS idx_connections_valid_time ON connections(valid_from, valid_to);
 CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory ON memory_revisions(memory_id);
 """
 
@@ -165,7 +164,9 @@ class SQLiteStore:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(connections)").fetchall()}
         migrations = {
             "event_time": "ALTER TABLE connections ADD COLUMN event_time REAL",
-            "ingestion_time": "ALTER TABLE connections ADD COLUMN ingestion_time REAL DEFAULT (unixepoch())",
+            # SQLite cannot ADD COLUMN with DEFAULT (unixepoch()) on an existing
+            # table; add plain REAL then backfill below.
+            "ingestion_time": "ALTER TABLE connections ADD COLUMN ingestion_time REAL",
             "valid_from": "ALTER TABLE connections ADD COLUMN valid_from REAL",
             "valid_to": "ALTER TABLE connections ADD COLUMN valid_to REAL",
         }
@@ -173,10 +174,15 @@ class SQLiteStore:
             if col not in cols:
                 try:
                     self.conn.execute(sql)
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    # Duplicate-column races are harmless; every other schema
+                    # error must surface instead of leaving a half-migrated DB.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
         self.conn.execute("UPDATE connections SET ingestion_time = COALESCE(ingestion_time, created_at, unixepoch())")
+        self.conn.execute("UPDATE connections SET valid_from = COALESCE(valid_from, event_time, created_at)")
         self.conn.execute("UPDATE connections SET edge_type = 'similar' WHERE edge_type IS NULL OR edge_type = ''")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_connections_valid_time ON connections(valid_from, valid_to)")
 
     def _ensure_fts(self) -> bool:
         try:

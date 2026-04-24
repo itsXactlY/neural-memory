@@ -178,8 +178,11 @@ class NeuralMemoryProvider(MemoryProvider):
             import os
             from pathlib import Path
 
-            # Ensure plugin dir is on sys.path
-            plugin_dir = str(Path(__file__).parent)
+            # Ensure real plugin source dir is on sys.path. __file__ may be a
+            # symlink under ~/.hermes/plugins/...; Path(__file__).parent alone
+            # points at a sparse runtime dir that may not contain config.py or
+            # memory_client.py. Resolve to the source-of-truth python/ dir.
+            plugin_dir = str(Path(__file__).resolve().parent)
             if plugin_dir not in sys.path:
                 sys.path.insert(0, plugin_dir)
 
@@ -897,6 +900,8 @@ class NeuralMemoryProvider(MemoryProvider):
     # -- Tool handlers -------------------------------------------------------
 
     def _handle_remember(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
         try:
             content = args["content"]
             label = args.get("label", "")
@@ -911,6 +916,8 @@ class NeuralMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def _handle_recall(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
         try:
             query = args["query"]
             limit = int(args.get("limit", 5))
@@ -922,6 +929,8 @@ class NeuralMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def _handle_think(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
         try:
             memory_id = int(args["memory_id"])
             depth = int(args.get("depth", 3))
@@ -933,6 +942,8 @@ class NeuralMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def _handle_graph(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
         try:
             graph = self._memory.graph()
             stats = self._memory.stats()
