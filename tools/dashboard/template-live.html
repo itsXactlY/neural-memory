@@ -7,429 +7,290 @@
 __PLOTLY_SCRIPT__
 __THREEJS_SCRIPT__
 __FORCEGRAPH_SCRIPT__
+__XTERM_CSS__
 <style>
-  /* Fonts: system fallbacks (JetBrains Mono / Inter) — no CDN */
-
   :root {
-    --bg: #030305;
-    --surface: rgba(10, 15, 20, 0.92);
-    --surface2: rgba(15, 20, 30, 0.8);
-    --border: rgba(0, 243, 255, 0.12);
-    --border-glow: rgba(0, 243, 255, 0.3);
-    --text: #8ab4d0;
-    --text-bright: #e0f7ff;
-    --text-dim: #4a6070;
-    --amber: #00f3ff;
-    --amber-dark: #00b8cc;
-    --amber-glow: rgba(0, 243, 255, 0.35);
-    --amber-dim: rgba(0, 243, 255, 0.08);
-    --red: #ff003c;
-    --green: #ccff00;
-    --cyan: #00f3ff;
-    --purple: #bc13fe;
+    --bg:           #030305;
+    --surface:      rgba(10,15,20,0.92);
+    --surface2:     rgba(15,20,30,0.80);
+    --border:       rgba(0,243,255,0.12);
+    --border-glow:  rgba(0,243,255,0.30);
+    --text:         #8ab4d0;
+    --text-bright:  #e0f7ff;
+    --text-dim:     #4a6070;
+    --amber:        #00f3ff;
+    --amber-dark:   #00b8cc;
+    --amber-glow:   rgba(0,243,255,0.35);
+    --amber-dim:    rgba(0,243,255,0.08);
+    --red:          #ff003c;
+    --green:        #ccff00;
+    --cyan:         #00f3ff;
+    --purple:       #bc13fe;
   }
 
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+  * { margin:0; padding:0; box-sizing:border-box; }
 
   body {
     background: var(--bg);
     color: var(--text);
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
     overflow: hidden;
-    height: 100vh;
-    width: 100vw;
+    height: 100vh; width: 100vw;
   }
 
-  /* ═══ 3D Graph — full viewport ═══ */
+  /* ── 3D graph fullscreen ── */
   #graph-container {
-    position: fixed;
-    top: 0; left: 0;
-    width: 100vw; height: 100vh;
-    z-index: 0;
-    background: radial-gradient(ellipse at 50% 50%, rgba(0, 30, 60, 0.4) 0%, var(--bg) 70%);
+    position: fixed; top:0; left:0;
+    width:100vw; height:100vh; z-index:0;
+    background: radial-gradient(ellipse at 50% 50%, rgba(0,30,60,0.4) 0%, var(--bg) 70%);
   }
 
-  /* ═══ HUD — top-left floating panel ═══ */
+  /* ── HUD ── */
   .hud {
-    position: fixed;
-    top: 16px; left: 16px;
-    z-index: 100;
-    background: var(--surface);
-    backdrop-filter: blur(24px);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px 20px;
-    min-width: 220px;
+    position: fixed; top:16px; left:16px; z-index:100;
+    background: var(--surface); backdrop-filter: blur(24px);
+    border:1px solid var(--border); border-radius:12px;
+    padding:16px 20px; min-width:220px;
     box-shadow: 0 4px 30px rgba(0,0,0,0.4), inset 0 0 20px var(--amber-dim);
     font-family: 'JetBrains Mono', monospace;
     user-select: none;
   }
   .hud h1 {
-    font-size: 14px;
-    font-weight: 700;
-    color: var(--amber);
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    margin-bottom: 12px;
-    text-shadow: 0 0 20px var(--amber-glow);
+    font-size:14px; font-weight:700; color:var(--amber);
+    letter-spacing:2px; text-transform:uppercase;
+    margin-bottom:12px; text-shadow:0 0 20px var(--amber-glow);
   }
   .hud-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 4px 0;
-    font-size: 11px;
+    display:flex; justify-content:space-between; align-items:center;
+    padding:4px 0; font-size:11px;
   }
-  .hud-label { color: var(--text-dim); }
-  .hud-value {
-    color: var(--text-bright);
-    font-weight: 600;
-  }
-  .hud-value.amber { color: var(--amber); }
-  .hud-divider {
-    border: none;
-    border-top: 1px solid var(--border);
-    margin: 8px 0;
-  }
-  .hud-source {
-    font-size: 9px;
-    color: var(--text-dim);
-    margin-top: 8px;
-    opacity: 0.7;
+  .hud-label  { color:var(--text-dim); }
+  .hud-value  { color:var(--text-bright); font-weight:600; }
+  .hud-value.amber { color:var(--amber); }
+  .hud-value.green { color:var(--green); }
+  .hud-value.red   { color:var(--red);   }
+  .hud-divider { border:none; border-top:1px solid var(--border); margin:8px 0; }
+  .hud-source  { font-size:9px; color:var(--text-dim); margin-top:8px; opacity:0.7; }
+
+  #fps_spark {
+    display:block; width:100%; height:22px;
+    margin-top:6px; border-radius:3px;
+    background:rgba(0,243,255,0.03);
+    cursor:pointer;
   }
 
-  /* ═══ Legend — top-right ═══ */
-  .legend {
-    position: fixed;
-    top: 16px; right: 16px;
-    z-index: 100;
-    background: var(--surface);
-    backdrop-filter: blur(24px);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 12px 16px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    box-shadow: 0 4px 30px rgba(0,0,0,0.4);
-  }
-  .legend h3 {
-    font-size: 10px;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    margin-bottom: 8px;
-  }
-  .legend-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 3px 0;
-    cursor: pointer;
-    transition: opacity 0.2s;
-  }
-  .legend-item:hover { opacity: 0.8; }
-  .legend-dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    box-shadow: 0 0 6px currentColor;
-  }
-  .legend-name { color: var(--text-bright); }
-  .legend-count { color: var(--text-dim); margin-left: auto; padding-left: 12px; }
-
-  /* ═══ Detail panel — right side, slides in ═══ */
-  .detail-panel {
-    position: fixed;
-    top: 0; right: -400px;
-    width: 380px; height: 100vh;
-    z-index: 200;
-    background: var(--surface);
-    backdrop-filter: blur(30px);
-    border-left: 1px solid var(--border-glow);
-    box-shadow: -10px 0 40px rgba(0,0,0,0.5);
-    transition: right 0.35s cubic-bezier(0.4, 0, 0.2, 1);
-    overflow-y: auto;
-    padding: 24px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .detail-panel.open { right: 0; }
-  .detail-close {
-    position: absolute;
-    top: 12px; right: 16px;
-    background: none; border: none;
-    color: var(--text-dim);
-    font-size: 20px;
-    cursor: pointer;
-    transition: color 0.2s;
-  }
-  .detail-close:hover { color: var(--amber); }
-  .detail-id {
-    font-size: 32px;
-    font-weight: 700;
-    color: var(--amber);
-    text-shadow: 0 0 20px var(--amber-glow);
-  }
-  .detail-label {
-    font-size: 14px;
-    color: var(--text-bright);
-    margin: 8px 0 16px;
-    line-height: 1.4;
-  }
-  .detail-section {
-    margin-bottom: 16px;
-  }
-  .detail-section-title {
-    font-size: 9px;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    margin-bottom: 6px;
-  }
-  .detail-bar {
-    height: 4px;
-    background: rgba(245, 183, 49, 0.1);
-    border-radius: 2px;
-    overflow: hidden;
-    margin-top: 4px;
-  }
-  .detail-bar-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--amber-dark), var(--amber), var(--purple));
-    border-radius: 2px;
-    transition: width 0.5s ease;
-  }
-  .detail-connections {
-    margin-top: 16px;
-  }
-  .detail-conn-item {
-    padding: 6px 0;
-    border-bottom: 1px solid var(--border);
-    font-size: 10px;
-    display: flex;
-    justify-content: space-between;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-  .detail-conn-item:hover { background: var(--amber-dim); }
-  .detail-conn-label { color: var(--text-bright); flex: 1; }
-  .detail-conn-weight { color: var(--amber); margin-left: 8px; }
-
-  /* ═══ Mini charts — bottom bar ═══ */
-  .mini-charts {
-    position: fixed;
-    bottom: 12px; left: 50%;
-    transform: translateX(-50%);
-    z-index: 100;
-    display: flex;
-    gap: 10px;
-  }
-  .mini-card {
-    background: var(--surface);
-    backdrop-filter: blur(20px);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    width: 200px;
-    overflow: hidden;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-  }
-  .mini-card-title {
-    padding: 6px 10px;
-    font-size: 9px;
-    font-weight: 600;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    border-bottom: 1px solid var(--border);
-    font-family: 'JetBrains Mono', monospace;
-    background: var(--surface2);
-  }
-  .mini-plot { width: 100%; height: 120px; }
-
-  /* ═══ Controls — bottom-left ═══ */
-  .controls {
-    position: fixed;
-    bottom: 12px; left: 16px;
-    z-index: 100;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .ctrl-btn {
-    width: 36px; height: 36px;
-    background: var(--surface);
-    backdrop-filter: blur(20px);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text-dim);
-    font-size: 16px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .ctrl-btn:hover {
-    border-color: var(--border-glow);
-    color: var(--amber);
-    box-shadow: 0 0 12px var(--amber-dim);
-  }
-
-  /* ═══ Search — top-center ═══ */
-  .search-bar {
-    position: fixed;
-    top: 16px; left: 50%;
-    transform: translateX(-50%);
-    z-index: 100;
-    display: flex;
-    align-items: center;
-    background: var(--surface);
-    backdrop-filter: blur(24px);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 0 14px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-    transition: border-color 0.3s;
-  }
-  .search-bar:focus-within {
-    border-color: var(--border-glow);
-    box-shadow: 0 0 20px var(--amber-dim);
-  }
-  .search-icon {
-    color: var(--text-dim);
-    font-size: 13px;
-    margin-right: 8px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-  .search-input {
-    background: none;
-    border: none;
-    outline: none;
-    color: var(--text-bright);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    padding: 10px 0;
-    width: 260px;
-  }
-  .search-input::placeholder { color: var(--text-dim); }
-  .search-results {
-    position: absolute;
-    top: 100%;
-    left: 0; right: 0;
-    margin-top: 4px;
-    background: var(--surface);
-    backdrop-filter: blur(24px);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    max-height: 300px;
-    overflow-y: auto;
-    display: none;
-  }
-  .search-results.visible { display: block; }
-  .search-result-item {
-    padding: 8px 14px;
-    font-size: 11px;
-    font-family: 'JetBrains Mono', monospace;
-    cursor: pointer;
-    border-bottom: 1px solid var(--border);
-    transition: background 0.15s;
-  }
-  .search-result-item:hover { background: var(--amber-dim); }
-  .search-result-id { color: var(--amber); margin-right: 8px; }
-  .search-result-label { color: var(--text-bright); }
-
-  /* ═══ CRT Scanline overlay ═══ */
-  body::after {
-    content: '';
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background:
-      linear-gradient(rgba(18,16,16,0) 50%, rgba(0,0,0,0.15) 50%),
-      linear-gradient(90deg, rgba(255,0,0,0.03), rgba(0,255,0,0.01), rgba(0,0,255,0.03));
-    background-size: 100% 2px, 3px 100%;
-    pointer-events: none;
-    z-index: 999;
-    opacity: 0.3;
-  }
-
-  /* ═══ Tooltip for 3D graph ═══ */
-  .graph-tooltip {
-    position: absolute;
-    pointer-events: none;
-    background: var(--surface);
-    backdrop-filter: blur(20px);
-    border: 1px solid var(--border-glow);
-    border-radius: 8px;
-    padding: 10px 14px;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 11px;
-    color: var(--text-bright);
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-    z-index: 300;
-    max-width: 300px;
-    display: none;
-  }
-  .graph-tooltip .tt-id { color: var(--amber); font-weight: 700; font-size: 14px; }
-  .graph-tooltip .tt-label { margin: 4px 0; line-height: 1.3; }
-  .graph-tooltip .tt-stats { color: var(--text-dim); font-size: 10px; }
-
-  /* ═══ Animations ═══ */
-  @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(10px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .hud { animation: fadeIn 0.6s ease-out 0.1s backwards; }
-  .legend { animation: fadeIn 0.6s ease-out 0.2s backwards; }
-  .search-bar { animation: fadeIn 0.6s ease-out 0.15s backwards; }
-  .mini-charts { animation: fadeIn 0.6s ease-out 0.3s backwards; }
-  .controls { animation: fadeIn 0.6s ease-out 0.35s backwards; }
-
-
-  /* ═══ WebSocket additions ═══ */
+  /* ── Live indicator (top-centre) ── */
   .live-indicator {
-    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
-    z-index: 500; display: flex; align-items: center; gap: 8px;
-    background: var(--surface); backdrop-filter: blur(24px);
-    border: 1px solid var(--border); border-radius: 20px;
-    padding: 6px 16px; font-family: 'JetBrains Mono', monospace;
-    font-size: 11px; color: var(--text-dim);
-    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-    transition: border-color 0.3s, color 0.3s;
+    position: fixed; top:16px; left:50%; transform:translateX(-50%);
+    z-index:500; display:flex; align-items:center; gap:8px;
+    background:var(--surface); backdrop-filter:blur(24px);
+    border:1px solid var(--border); border-radius:20px;
+    padding:6px 16px; font-family:'JetBrains Mono',monospace;
+    font-size:11px; color:var(--text-dim);
+    box-shadow:0 4px 20px rgba(0,0,0,0.3);
+    transition:border-color 0.3s, color 0.3s;
+    cursor:default; user-select:none;
   }
-  .live-indicator.connected { border-color: var(--green); color: var(--green); }
-  .live-indicator.disconnected { border-color: var(--red); color: var(--red); }
-  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: livePulse 2s infinite; }
-  @keyframes livePulse { 0%,100% { opacity: 1; box-shadow: 0 0 4px currentColor; } 50% { opacity: 0.4; box-shadow: 0 0 12px currentColor; } }
+  .live-indicator.connected    { border-color:var(--green); color:var(--green); }
+  .live-indicator.disconnected { border-color:var(--red);   color:var(--red);   }
+  .live-dot {
+    width:8px; height:8px; border-radius:50%;
+    background:currentColor; animation:livePulse 2s infinite;
+  }
+  @keyframes livePulse {
+    0%,100% { opacity:1;   box-shadow:0 0  4px currentColor; }
+    50%     { opacity:0.4; box-shadow:0 0 12px currentColor; }
+  }
+  #live_latency { font-size:9px; opacity:0.7; margin-left:4px; }
 
+  /* ── Delta toast ── */
   .delta-toast {
-    position: fixed; top: 52px; left: 50%; transform: translateX(-50%) translateY(-20px);
-    z-index: 500; background: var(--surface); backdrop-filter: blur(24px);
-    border: 1px solid var(--amber); border-radius: 8px; padding: 8px 16px;
-    font-family: 'JetBrains Mono', monospace; font-size: 11px;
-    color: var(--amber); box-shadow: 0 0 20px var(--amber-dim);
-    opacity: 0; transition: all 0.4s ease; pointer-events: none;
+    position:fixed; top:52px; left:50%; transform:translateX(-50%) translateY(-20px);
+    z-index:500; background:var(--surface); backdrop-filter:blur(24px);
+    border:1px solid var(--amber); border-radius:8px; padding:8px 16px;
+    font-family:'JetBrains Mono',monospace; font-size:11px;
+    color:var(--amber); box-shadow:0 0 20px var(--amber-dim);
+    opacity:0; transition:all 0.4s ease; pointer-events:none;
   }
-  .delta-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .delta-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 
-  .hud-value.flash { animation: valFlash 0.6s ease; }
-  @keyframes valFlash { 0% { color: var(--green); text-shadow: 0 0 8px var(--green); } 100% { color: var(--text-bright); text-shadow: none; } }
-
-  /* Ambient glow for desktop */
-  .ambient-glow {
-    position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-    z-index: -1; pointer-events: none;
-    background: radial-gradient(ellipse at 30% 70%, rgba(0,243,255,0.06) 0%, transparent 50%),
-                radial-gradient(ellipse at 70% 30%, rgba(188,19,254,0.04) 0%, transparent 50%);
+  .hud-value.flash { animation:valFlash 0.6s ease; }
+  @keyframes valFlash {
+    0%   { color:var(--green); text-shadow:0 0 8px var(--green); }
+    100% { color:var(--text-bright); text-shadow:none; }
   }
 
+  /* ── Legend ── */
+  .legend {
+    position:fixed; top:16px; right:16px; z-index:100;
+    background:var(--surface); backdrop-filter:blur(24px);
+    border:1px solid var(--border); border-radius:12px;
+    padding:12px 16px; font-family:'JetBrains Mono',monospace; font-size:11px;
+    box-shadow:0 4px 30px rgba(0,0,0,0.4);
+  }
+  .legend h3 { font-size:10px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1.5px; margin-bottom:8px; }
+  .legend-item { display:flex; align-items:center; gap:8px; padding:3px 0; cursor:pointer; transition:opacity 0.2s; }
+  .legend-item:hover { opacity:0.8; }
+  .legend-dot   { width:8px; height:8px; border-radius:50%; box-shadow:0 0 6px currentColor; }
+  .legend-name  { color:var(--text-bright); }
+  .legend-count { color:var(--text-dim); margin-left:auto; padding-left:12px; }
+
+  /* ── Detail panel ── */
+  .detail-panel {
+    position:fixed; top:0; right:-400px; width:380px; height:100vh;
+    z-index:200; background:var(--surface); backdrop-filter:blur(30px);
+    border-left:1px solid var(--border-glow); box-shadow:-10px 0 40px rgba(0,0,0,0.5);
+    transition:right 0.35s cubic-bezier(0.4,0,0.2,1);
+    overflow-y:auto; padding:24px; font-family:'JetBrains Mono',monospace;
+  }
+  .detail-panel.open { right:0; }
+  .detail-close { position:absolute; top:12px; right:16px; background:none; border:none; color:var(--text-dim); font-size:20px; cursor:pointer; transition:color 0.2s; }
+  .detail-close:hover { color:var(--amber); }
+  .detail-id { font-size:32px; font-weight:700; color:var(--amber); text-shadow:0 0 20px var(--amber-glow); }
+  .detail-label { font-size:14px; color:var(--text-bright); margin:8px 0 16px; line-height:1.4; }
+  .detail-section { margin-bottom:16px; }
+  .detail-section-title { font-size:9px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1.5px; margin-bottom:6px; }
+  .detail-bar { height:4px; background:rgba(245,183,49,0.1); border-radius:2px; overflow:hidden; margin-top:4px; }
+  .detail-bar-fill { height:100%; background:linear-gradient(90deg,var(--amber-dark),var(--amber),var(--purple)); border-radius:2px; transition:width 0.5s ease; }
+  .detail-conn-item { padding:6px 0; border-bottom:1px solid var(--border); font-size:10px; display:flex; justify-content:space-between; cursor:pointer; transition:background 0.15s; }
+  .detail-conn-item:hover { background:var(--amber-dim); }
+  .detail-conn-label { color:var(--text-bright); flex:1; }
+  .detail-conn-weight { color:var(--amber); margin-left:8px; }
+
+  /* ── Mini charts ── */
+  .mini-charts {
+    position:fixed; bottom:12px; left:50%; transform:translateX(-50%);
+    z-index:100; display:flex; gap:10px;
+  }
+  .mini-card { background:var(--surface); backdrop-filter:blur(20px); border:1px solid var(--border); border-radius:10px; width:200px; overflow:hidden; box-shadow:0 4px 20px rgba(0,0,0,0.3); }
+  .mini-card-title { padding:6px 10px; font-size:9px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px; border-bottom:1px solid var(--border); font-family:'JetBrains Mono',monospace; background:var(--surface2); }
+  .mini-plot { width:100%; height:120px; }
+
+  /* ── Controls ── */
+  .controls { position:fixed; bottom:12px; left:16px; z-index:100; display:flex; flex-direction:column; gap:6px; }
+  .ctrl-btn { width:36px; height:36px; background:var(--surface); backdrop-filter:blur(20px); border:1px solid var(--border); border-radius:8px; color:var(--text-dim); font-size:16px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.2s; font-family:'JetBrains Mono',monospace; }
+  .ctrl-btn:hover { border-color:var(--border-glow); color:var(--amber); box-shadow:0 0 12px var(--amber-dim); }
+  .ctrl-btn.active { border-color:var(--amber); color:var(--amber); }
+
+  /* ── Search ── */
+  .search-bar {
+    position:fixed; top:16px; left:50%; transform:translateX(-50%);
+    z-index:100; display:flex; align-items:center;
+    background:var(--surface); backdrop-filter:blur(24px);
+    border:1px solid var(--border); border-radius:10px;
+    padding:0 14px; box-shadow:0 4px 20px rgba(0,0,0,0.3);
+    transition:border-color 0.3s;
+  }
+  .search-bar:focus-within { border-color:var(--border-glow); box-shadow:0 0 20px var(--amber-dim); }
+  .search-icon { color:var(--text-dim); font-size:13px; margin-right:8px; font-family:'JetBrains Mono',monospace; }
+  .search-input { background:none; border:none; outline:none; color:var(--text-bright); font-family:'JetBrains Mono',monospace; font-size:12px; padding:10px 0; width:260px; }
+  .search-input::placeholder { color:var(--text-dim); }
+  .search-results { position:absolute; top:100%; left:0; right:0; margin-top:4px; background:var(--surface); backdrop-filter:blur(24px); border:1px solid var(--border); border-radius:8px; max-height:300px; overflow-y:auto; display:none; }
+  .search-results.visible { display:block; }
+  .search-result-item { padding:8px 14px; font-size:11px; font-family:'JetBrains Mono',monospace; cursor:pointer; border-bottom:1px solid var(--border); transition:background 0.15s; }
+  .search-result-item:hover { background:var(--amber-dim); }
+  .search-result-id    { color:var(--amber);       margin-right:8px; }
+  .search-result-label { color:var(--text-bright); }
+
+  /* ── Tooltip ── */
+  .graph-tooltip { position:absolute; pointer-events:none; background:var(--surface); backdrop-filter:blur(20px); border:1px solid var(--border-glow); border-radius:8px; padding:10px 14px; font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--text-bright); box-shadow:0 4px 20px rgba(0,0,0,0.5); z-index:300; max-width:300px; display:none; }
+  .graph-tooltip .tt-id    { color:var(--amber); font-weight:700; font-size:14px; }
+  .graph-tooltip .tt-label { margin:4px 0; line-height:1.3; }
+  .graph-tooltip .tt-stats { color:var(--text-dim); font-size:10px; }
+
+  /* ── Ambient glow ── */
+  .ambient-glow { position:fixed; top:0; left:0; width:100vw; height:100vh; z-index:-1; pointer-events:none; background:radial-gradient(ellipse at 30% 70%,rgba(0,243,255,0.06) 0%,transparent 50%), radial-gradient(ellipse at 70% 30%,rgba(188,19,254,0.04) 0%,transparent 50%); }
+
+  /* ── CRT overlay ── */
+  body::after { content:''; position:fixed; top:0; left:0; right:0; bottom:0; background:linear-gradient(rgba(18,16,16,0) 50%,rgba(0,0,0,0.15) 50%),linear-gradient(90deg,rgba(255,0,0,0.03),rgba(0,255,0,0.01),rgba(0,0,255,0.03)); background-size:100% 2px,3px 100%; pointer-events:none; z-index:999; opacity:0.3; }
+
+  /* ── Observability panel ── */
+  .obs-panel {
+    position:fixed; bottom:12px; right:16px; z-index:100;
+    background:var(--surface); backdrop-filter:blur(24px);
+    border:1px solid var(--border); border-radius:10px;
+    padding:10px 14px; font-family:'JetBrains Mono',monospace;
+    font-size:10px; min-width:200px;
+    box-shadow:0 4px 20px rgba(0,0,0,0.4);
+    transform:translateY(calc(100% + 20px));
+    transition:transform 0.3s cubic-bezier(0.4,0,0.2,1);
+    user-select:none;
+  }
+  .obs-panel.open { transform:translateY(0); }
+  .obs-title { font-size:9px; color:var(--amber); text-transform:uppercase; letter-spacing:1.5px; margin-bottom:8px; }
+  .obs-row { display:flex; justify-content:space-between; padding:2px 0; }
+  .obs-row span:first-child { color:var(--text-dim); }
+  .obs-row span:last-child  { color:var(--text-bright); font-weight:600; }
+  .obs-sep { border:none; border-top:1px solid var(--border); margin:5px 0; }
+
+  /* ── Hermes terminal panel ── */
+  .terminal-panel {
+    position:fixed; bottom:-360px; left:0; right:0; height:360px;
+    z-index:800;
+    background:rgba(3,3,5,0.97); backdrop-filter:blur(20px);
+    border-top:1px solid var(--border-glow);
+    box-shadow:0 -8px 40px rgba(0,0,0,0.7);
+    transition:bottom 0.35s cubic-bezier(0.4,0,0.2,1);
+    display:flex; flex-direction:column;
+  }
+  .terminal-panel.open { bottom:0; }
+  .terminal-bar {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:5px 14px; border-bottom:1px solid var(--border);
+    background:var(--surface2); flex-shrink:0;
+  }
+  .terminal-title {
+    font-family:'JetBrains Mono',monospace; font-size:11px;
+    color:var(--amber); letter-spacing:1.5px; text-transform:uppercase;
+  }
+  .terminal-actions { display:flex; align-items:center; gap:8px; }
+  .term-status { font-size:13px; color:var(--red); transition:color 0.3s; }
+  .term-status.ok { color:var(--green); }
+  .term-btn {
+    background:none; border:1px solid var(--border); border-radius:4px;
+    color:var(--text-dim); font-size:12px; cursor:pointer;
+    padding:2px 8px; font-family:'JetBrains Mono',monospace;
+    transition:all 0.2s;
+  }
+  .term-btn:hover { border-color:var(--border-glow); color:var(--amber); }
+  .term-hint { font-size:9px; color:var(--text-dim); opacity:0.5; }
+  #terminal_container {
+    flex:1; overflow:hidden; padding:4px 4px 4px 8px;
+    /* xterm needs explicit height */
+  }
+  .xterm { height:100% !important; }
+  .xterm-viewport { background:transparent !important; }
+  .xterm-screen  { background:transparent !important; }
+
+  /* ── Keyboard shortcut hint ── */
+  .kb-hint {
+    position:fixed; bottom:6px; left:50%; transform:translateX(-50%);
+    z-index:90; font-family:'JetBrains Mono',monospace; font-size:9px;
+    color:var(--text-dim); opacity:0.35; pointer-events:none;
+    letter-spacing:0.8px;
+  }
+
+  /* ── Entrance animations ── */
+  @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+  .hud        { animation:fadeIn 0.6s ease-out 0.10s backwards; }
+  .legend     { animation:fadeIn 0.6s ease-out 0.20s backwards; }
+  .search-bar { animation:fadeIn 0.6s ease-out 0.15s backwards; }
+  .mini-charts{ animation:fadeIn 0.6s ease-out 0.30s backwards; }
+  .controls   { animation:fadeIn 0.6s ease-out 0.35s backwards; }
 </style>
 </head>
 <body>
 <div class="ambient-glow"></div>
-<div class="live-indicator" id="live_status"><div class="live-dot"></div><span id="live_text">Connecting...</span></div>
+
+<!-- Live indicator -->
+<div class="live-indicator" id="live_status">
+  <div class="live-dot"></div>
+  <span id="live_text">Connecting…</span>
+  <span id="live_latency"></span>
+</div>
 <div class="delta-toast" id="delta_toast"></div>
 
-
-<!-- 3D Graph Container -->
+<!-- 3D graph -->
 <div id="graph-container"></div>
 
 <!-- Tooltip -->
@@ -442,68 +303,49 @@ __FORCEGRAPH_SCRIPT__
 <!-- HUD — top-left -->
 <div class="hud">
   <h1>Neural Memory</h1>
-  <div class="hud-row">
-    <span class="hud-label">Memories</span>
-    <span class="hud-value amber" id="h_mem">—</span>
-  </div>
-  <div class="hud-row">
-    <span class="hud-label">Connections</span>
-    <span class="hud-value" id="h_conn">—</span>
-  </div>
-  <div class="hud-row">
-    <span class="hud-label">Avg Degree</span>
-    <span class="hud-value" id="h_deg">—</span>
-  </div>
+  <div class="hud-row"><span class="hud-label">Memories</span>    <span class="hud-value amber" id="h_mem">—</span></div>
+  <div class="hud-row"><span class="hud-label">Connections</span> <span class="hud-value"       id="h_conn">—</span></div>
+  <div class="hud-row"><span class="hud-label">Avg Degree</span>  <span class="hud-value"       id="h_deg">—</span></div>
+  <hr class="hud-divider">
+  <div class="hud-row"><span class="hud-label">Density</span>    <span class="hud-value" id="h_density">—</span></div>
+  <div class="hud-row"><span class="hud-label">Embed Dim</span>   <span class="hud-value" id="h_dim">—</span></div>
   <hr class="hud-divider">
   <div class="hud-row">
-    <span class="hud-label">Density</span>
-    <span class="hud-value" id="h_density">—</span>
+    <span class="hud-label">FPS</span>
+    <span class="hud-value green" id="h_fps" title="Click to toggle observability panel" style="cursor:pointer">—</span>
   </div>
-  <div class="hud-row">
-    <span class="hud-label">Embed Dim</span>
-    <span class="hud-value" id="h_dim">—</span>
-  </div>
+  <div class="hud-row"><span class="hud-label">Frame</span>       <span class="hud-value" id="h_fms">—</span></div>
+  <canvas id="fps_spark" width="180" height="22" title="Frame time history (green=fast, red=slow)"></canvas>
   <div class="hud-source" id="h_source"></div>
 </div>
 
-<!-- Search — top-center -->
-<div class="search-bar">
+<!-- Search — top-centre (moved below live indicator) -->
+<div class="search-bar" style="top:52px;">
   <span class="search-icon">⌕</span>
-  <input type="text" class="search-input" id="search_input" placeholder="Search memories..." autocomplete="off">
+  <input type="text" class="search-input" id="search_input" placeholder="Search memories…" autocomplete="off">
   <div class="search-results" id="search_results"></div>
 </div>
 
 <!-- Legend — top-right -->
-<div class="legend" id="legend">
-  <h3>Categories</h3>
-  <!-- filled by JS -->
-</div>
+<div class="legend" id="legend"><h3>Categories</h3></div>
 
 <!-- Controls — bottom-left -->
 <div class="controls">
-  <button class="ctrl-btn" id="btn_reset" title="Reset camera">⟲</button>
-  <button class="ctrl-btn" id="btn_pause" title="Pause/resume simulation">⏸</button>
-  <button class="ctrl-btn" id="btn_labels" title="Toggle labels">Aa</button>
+  <button class="ctrl-btn" id="btn_reset"   title="Reset camera">⟲</button>
+  <button class="ctrl-btn" id="btn_pause"   title="Pause/resume simulation">⏸</button>
+  <button class="ctrl-btn" id="btn_labels"  title="Toggle labels">Aa</button>
+  <button class="ctrl-btn" id="btn_ambient" title="Ambient rotation [A]">◎</button>
   <button class="ctrl-btn" id="btn_restart" title="Restart dashboard" style="font-size:12px;color:var(--red);">⟳</button>
 </div>
 
 <!-- Mini charts — bottom bar -->
 <div class="mini-charts">
-  <div class="mini-card">
-    <div class="mini-card-title">Categories</div>
-    <div id="mini_pie" class="mini-plot"></div>
-  </div>
-  <div class="mini-card">
-    <div class="mini-card-title">Connection Strength</div>
-    <div id="mini_bar" class="mini-plot"></div>
-  </div>
-  <div class="mini-card">
-    <div class="mini-card-title">Degree Distribution</div>
-    <div id="mini_hist" class="mini-plot"></div>
-  </div>
+  <div class="mini-card"><div class="mini-card-title">Categories</div><div id="mini_pie" class="mini-plot"></div></div>
+  <div class="mini-card"><div class="mini-card-title">Connection Strength</div><div id="mini_bar" class="mini-plot"></div></div>
+  <div class="mini-card"><div class="mini-card-title">Degree Distribution</div><div id="mini_hist" class="mini-plot"></div></div>
 </div>
 
-<!-- Detail panel — right side -->
+<!-- Detail panel -->
 <div class="detail-panel" id="detail_panel">
   <button class="detail-close" id="detail_close">✕</button>
   <div class="detail-id" id="det_id"></div>
@@ -519,9 +361,9 @@ __FORCEGRAPH_SCRIPT__
   </div>
   <div class="detail-section">
     <div class="detail-section-title">Degree</div>
-    <div class="hud-row"><span class="hud-label">Out</span><span class="hud-value" id="det_out">—</span></div>
-    <div class="hud-row"><span class="hud-label">In</span><span class="hud-value" id="det_in">—</span></div>
-    <div class="hud-row"><span class="hud-label">Total</span><span class="hud-value amber" id="det_total">—</span></div>
+    <div class="hud-row"><span class="hud-label">Out</span>   <span class="hud-value" id="det_out">—</span></div>
+    <div class="hud-row"><span class="hud-label">In</span>    <span class="hud-value" id="det_in">—</span></div>
+    <div class="hud-row"><span class="hud-label">Total</span> <span class="hud-value amber" id="det_total">—</span></div>
   </div>
   <div class="detail-section">
     <div class="detail-section-title">Access Count</div>
@@ -536,107 +378,196 @@ __FORCEGRAPH_SCRIPT__
   </div>
 </div>
 
-<!-- Restart + Time controls are in the controls panel -->
+<!-- Observability panel — bottom-right -->
+<div class="obs-panel" id="obs_panel">
+  <div class="obs-title">Observability</div>
+  <div class="obs-row"><span>Draw calls</span> <span id="obs_draws">—</span></div>
+  <div class="obs-row"><span>Triangles</span>  <span id="obs_tris">—</span></div>
+  <div class="obs-row"><span>Geometries</span> <span id="obs_geom">—</span></div>
+  <div class="obs-row"><span>Textures</span>   <span id="obs_tex">—</span></div>
+  <div class="obs-row"><span>Programs</span>   <span id="obs_prog">—</span></div>
+  <hr class="obs-sep">
+  <div class="obs-row"><span>WS latency</span>  <span id="obs_wslatency">—</span></div>
+  <div class="obs-row"><span>WS updates</span>  <span id="obs_wsupdates">0</span></div>
+  <hr class="obs-sep">
+  <div class="obs-row"><span>JS heap</span>     <span id="obs_heap">—</span></div>
+  <hr class="obs-sep">
+  <div class="obs-row"><span>DB query</span>    <span id="obs_dbms">—</span></div>
+  <div class="obs-row"><span>Broadcast</span>   <span id="obs_broadms">—</span></div>
+  <div class="obs-row"><span>Uptime</span>      <span id="obs_uptime">—</span></div>
+  <div class="obs-row"><span>Clients</span>     <span id="obs_clients">—</span></div>
+</div>
+
+<!-- Hermes terminal panel -->
+<div class="terminal-panel" id="terminal_panel">
+  <div class="terminal-bar">
+    <span class="terminal-title">◈ hermes  ·  neural shell</span>
+    <div class="terminal-actions">
+      <span id="term_status" class="term-status" title="Connection state">●</span>
+      <button class="term-btn" id="term_new"   title="New session">+</button>
+      <button class="term-btn" id="term_clear" title="Clear">⎚</button>
+      <span class="term-hint">[ ` ] toggle</span>
+      <button class="term-btn" id="term_close" title="Close">✕</button>
+    </div>
+  </div>
+  <div id="terminal_container"></div>
+</div>
+
+<!-- Keyboard hint -->
+<div class="kb-hint">[ A ] ambient &nbsp;·&nbsp; [ O ] observability &nbsp;·&nbsp; [ ` ] terminal &nbsp;·&nbsp; [ Esc ] close</div>
+
+<!-- xterm.js -->
+__XTERM_SCRIPT__
+__XTERM_FIT_SCRIPT__
 
 <script>
-const D = __DATA_JSON__;
+'use strict';
+// ═══════════════════════════════════════════════════════════
+// Bootstrap data  (server injects JSON here)
+// ═══════════════════════════════════════════════════════════
+let D = __DATA_JSON__;
 
-// ═══════════════════════════════════════════
-// Color config — amber theme categories
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// Category → colour map
+// ═══════════════════════════════════════════════════════════
 const cc = {
-  'Conversation': '#00f3ff',
-  'Peer': '#ccff00',
-  'Session': '#ff003c',
-  'Document': '#bc13fe',
-  'Skill': '#00f3ff',
-  'Other': '#3a4a5a',
+  Conversation: '#00f3ff',
+  Peer:         '#ccff00',
+  Session:      '#ff003c',
+  Document:     '#bc13fe',
+  Skill:        '#00f3ff',
+  Other:        '#3a4a5a',
 };
 
-// ═══════════════════════════════════════════
-// HUD stats
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// HUD helpers
+// ═══════════════════════════════════════════════════════════
 function animateNum(id, target) {
-  const el = document.getElementById(id);
-  const dur = 1000;
-  const t0 = performance.now();
+  const el  = document.getElementById(id);
+  const dur = 900, t0 = performance.now();
   (function tick(now) {
-    const p = Math.min((now - t0) / dur, 1);
+    const p    = Math.min((now - t0) / dur, 1);
     const ease = 1 - Math.pow(1 - p, 3);
     el.textContent = Math.round(target * ease).toLocaleString();
     if (p < 1) requestAnimationFrame(tick);
   })(t0);
 }
-animateNum('h_mem', D.stats.memories);
-animateNum('h_conn', D.stats.connections);
-const avgDeg = D.nodes.length ? Math.round(D.nodes.reduce((s, n) => s + n.total_degree, 0) / D.nodes.length) : 0;
-animateNum('h_deg', avgDeg);
-const maxPossible = D.nodes.length * (D.nodes.length - 1);
-const density = maxPossible > 0 ? ((D.stats.connections / maxPossible) * 100).toFixed(1) : '0.0';
-document.getElementById('h_density').textContent = density + '%';
-document.getElementById('h_dim').textContent = D.stats.embedding_dim;
-document.getElementById('h_source').textContent = D.stats.source + ' :: ' + D.stats.path;
 
-// ═══════════════════════════════════════════
-// Legend
-// ═══════════════════════════════════════════
-const cats = [...new Set(D.nodes.map(n => n.category))];
-const catCounts = {};
-cats.forEach(c => { catCounts[c] = D.nodes.filter(n => n.category === c).length; });
-const legendEl = document.getElementById('legend');
-cats.forEach(c => {
-  const item = document.createElement('div');
-  item.className = 'legend-item';
-  item.dataset.cat = c;
-  item.innerHTML = `<div class="legend-dot" style="background:${cc[c]};color:${cc[c]}"></div>
-    <span class="legend-name">${c}</span>
-    <span class="legend-count">${catCounts[c]}</span>`;
-  item.addEventListener('click', () => highlightCategory(c));
-  legendEl.appendChild(item);
-});
+function updateHUD(stats, nodes) {
+  animateNum('h_mem',  stats.memories);
+  animateNum('h_conn', stats.connections);
+  const avgDeg  = nodes.length
+    ? Math.round(nodes.reduce((s, n) => s + n.total_degree, 0) / nodes.length)
+    : 0;
+  animateNum('h_deg', avgDeg);
+  const maxPoss = nodes.length * (nodes.length - 1);
+  const density = maxPoss > 0 ? ((stats.connections / maxPoss) * 100).toFixed(1) : '0.0';
+  document.getElementById('h_density').textContent = density + '%';
+  document.getElementById('h_dim').textContent     = stats.embedding_dim;
+  document.getElementById('h_source').textContent  = stats.source + ' :: ' + stats.path;
+}
 
-// ═══════════════════════════════════════════
-// Build 3D force graph data
-// ═══════════════════════════════════════════
-const graphNodes = D.nodes.map(n => ({
-  id: n.id,
-  label: n.label,
-  category: n.category,
-  salience: n.salience,
-  access_count: n.access_count,
-  total_degree: n.total_degree,
-  out_degree: n.out_degree,
-  in_degree: n.in_degree,
-  avg_weight: n.avg_weight,
-  created_at: n.created_at,
-  val: Math.max(2, Math.sqrt(n.total_degree) * 1.8),
-  color: cc[n.category] || cc['Other'],
-}));
+updateHUD(D.stats, D.nodes);
 
-const graphLinks = D.edges.map(e => ({
-  source: e.source,
-  target: e.target,
-  weight: e.weight,
-  color: `rgba(0,243,255,${Math.max(0.05, e.weight * 0.3)})`,
-}));
+// ═══════════════════════════════════════════════════════════
+// Legend builder
+// ═══════════════════════════════════════════════════════════
+function buildLegend(nodes) {
+  const legendEl = document.getElementById('legend');
+  legendEl.innerHTML = '<h3>Categories</h3>';
+  const counts = {};
+  nodes.forEach(n => { counts[n.category] = (counts[n.category] || 0) + 1; });
+  [...new Set(nodes.map(n => n.category))].forEach(cat => {
+    const item = document.createElement('div');
+    item.className  = 'legend-item';
+    item.dataset.cat = cat;
+    item.innerHTML  =
+      `<div class="legend-dot" style="background:${cc[cat]};color:${cc[cat]}"></div>` +
+      `<span class="legend-name">${cat}</span>` +
+      `<span class="legend-count">${counts[cat]}</span>`;
+    item.addEventListener('click', () => highlightCategory(cat));
+    legendEl.appendChild(item);
+  });
+}
+buildLegend(D.nodes);
 
-// Build adjacency map for detail panel
-const adjMap = {};
-graphNodes.forEach(n => { adjMap[n.id] = []; });
-graphLinks.forEach(l => {
-  const sid = typeof l.source === 'object' ? l.source.id : l.source;
-  const tid = typeof l.target === 'object' ? l.target.id : l.target;
-  if (adjMap[sid]) adjMap[sid].push({ id: tid, weight: l.weight, dir: 'out' });
-  if (adjMap[tid]) adjMap[tid].push({ id: sid, weight: l.weight, dir: 'in' });
-});
-const nodeById = {};
-graphNodes.forEach(n => { nodeById[n.id] = n; });
+// ═══════════════════════════════════════════════════════════
+// Sprite cache — reuse THREE.Sprite objects across rebuilds
+// ═══════════════════════════════════════════════════════════
+const _spriteCache = new Map();
 
-// ═══════════════════════════════════════════
-// 3D Force Graph
-// ═══════════════════════════════════════════
-let showLabels = true;
-let isPaused = false;
+function _getSprite(node) {
+  const key    = `${node.id}:${node.label}:${node.color}`;
+  let   sprite = _spriteCache.get(node.id);
+  if (sprite && sprite.__cacheKey === key) return sprite;
+  sprite = new SpriteText(node.label, 3, node.color);
+  sprite.fontFace       = 'JetBrains Mono, monospace';
+  sprite.fontWeight     = '600';
+  sprite.backgroundColor = 'rgba(3,3,5,0.6)';
+  sprite.padding        = 2;
+  sprite.borderRadius   = 3;
+  sprite.__cacheKey     = key;
+  _spriteCache.set(node.id, sprite);
+  return sprite;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Graph data builders
+// ═══════════════════════════════════════════════════════════
+function buildGraphNodes(nodes) {
+  return nodes.map(n => ({
+    id: n.id, label: n.label, category: n.category,
+    salience: n.salience, access_count: n.access_count,
+    total_degree: n.total_degree, out_degree: n.out_degree,
+    in_degree: n.in_degree, avg_weight: n.avg_weight,
+    created_at: n.created_at,
+    val:   Math.max(2, Math.sqrt(n.total_degree) * 1.8),
+    color: cc[n.category] || cc.Other,
+  }));
+}
+
+function buildGraphLinks(edges) {
+  return edges.map(e => ({
+    source: e.source, target: e.target, weight: e.weight,
+    color: `rgba(0,243,255,${Math.max(0.05, e.weight * 0.3)})`,
+  }));
+}
+
+function buildAdjMap(graphNodes, graphLinks) {
+  const adj = {};
+  graphNodes.forEach(n => { adj[n.id] = []; });
+  graphLinks.forEach(l => {
+    const sid = typeof l.source === 'object' ? l.source.id : l.source;
+    const tid = typeof l.target === 'object' ? l.target.id : l.target;
+    if (adj[sid]) adj[sid].push({ id: tid, weight: l.weight, dir: 'out' });
+    if (adj[tid]) adj[tid].push({ id: sid, weight: l.weight, dir: 'in'  });
+  });
+  return adj;
+}
+
+let graphNodes = buildGraphNodes(D.nodes);
+let graphLinks = buildGraphLinks(D.edges);
+let adjMap     = buildAdjMap(graphNodes, graphLinks);
+let nodeById   = Object.fromEntries(graphNodes.map(n => [n.id, n]));
+
+// ═══════════════════════════════════════════════════════════
+// Dynamic quality — node resolution based on count
+// ═══════════════════════════════════════════════════════════
+function _nodeResolution(count) {
+  if (count > 200) return 4;
+  if (count > 100) return 6;
+  if (count > 50)  return 8;
+  return 10;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Force graph — initialise with high-performance settings
+// ═══════════════════════════════════════════════════════════
+// Labels off by default — canvas sprite textures are expensive at scale.
+// Toggle with 'Aa' button.
+let showLabels  = false;
+let isPaused    = false;
+let ambientMode = false;
 
 const Graph = ForceGraph3D()
   (document.getElementById('graph-container'))
@@ -646,197 +577,208 @@ const Graph = ForceGraph3D()
   .nodeVal('val')
   .nodeColor(n => n.color)
   .nodeOpacity(0.92)
-  .nodeResolution(12)
-  .linkWidth(l => Math.max(0.3, l.weight * 2))
-  .linkOpacity(0.25)
-  .linkDirectionalParticles(1)
-  .linkDirectionalParticleWidth(l => l.weight * 1.5)
-  .linkDirectionalParticleSpeed(0.003)
+  .nodeResolution(_nodeResolution(graphNodes.length))
+  // linkWidth(0) → 3d-force-graph uses a single batched LineSegments draw call
+  // instead of N cylinder meshes.  This is the single biggest FPS win.
+  .linkWidth(0)
+  .linkOpacity(0.45)
+  .linkDirectionalParticles(0)
   .linkColor(l => l.color)
-  .nodeLabel(n => `<div style="font-family:JetBrains Mono,monospace;font-size:12px;background:rgba(10,15,20,0.95);border:1px solid rgba(0,243,255,0.3);border-radius:6px;padding:8px 12px;color:#e0f7ff;">
-    <div style="color:#00f3ff;font-weight:700;font-size:14px;">#${n.id}</div>
-    <div style="margin:4px 0;">${n.label}</div>
-    <div style="color:#4a6070;font-size:10px;">Deg: ${n.total_degree} | W: ${n.avg_weight} | Sal: ${n.salience.toFixed(2)}</div>
-  </div>`)
-  .nodeThreeObject(node => {
-    if (!showLabels) return null;
-    const sprite = new SpriteText(node.label, 3, node.color);
-    sprite.fontFace = 'JetBrains Mono, monospace';
-    sprite.fontWeight = '600';
-    sprite.backgroundColor = 'rgba(3,3,5,0.6)';
-    sprite.padding = 2;
-    sprite.borderRadius = 3;
-    return sprite;
-  })
+  .nodeLabel(n =>
+    `<div style="font-family:JetBrains Mono,monospace;font-size:12px;` +
+    `background:rgba(10,15,20,0.95);border:1px solid rgba(0,243,255,0.3);` +
+    `border-radius:6px;padding:8px 12px;color:#e0f7ff;">` +
+    `<div style="color:#00f3ff;font-weight:700;font-size:14px;">#${n.id}</div>` +
+    `<div style="margin:4px 0;">${n.label}</div>` +
+    `<div style="color:#4a6070;font-size:10px;">` +
+    `Deg: ${n.total_degree} | W: ${n.avg_weight} | Sal: ${n.salience.toFixed(2)}</div></div>`
+  )
+  .nodeThreeObject(node => showLabels ? _getSprite(node) : null)
   .nodeThreeObjectExtend(true)
   .onNodeClick(node => openDetail(node))
   .onNodeHover(node => {
-    const tooltip = document.getElementById('tooltip');
+    const tt = document.getElementById('tooltip');
     if (node) {
-      tooltip.style.display = 'block';
-      tooltip.querySelector('.tt-id').textContent = '#' + node.id;
-      tooltip.querySelector('.tt-label').textContent = node.label;
-      tooltip.querySelector('.tt-stats').textContent = `Deg: ${node.total_degree} | Cat: ${node.category} | Sal: ${node.salience.toFixed(2)}`;
+      tt.style.display = 'block';
+      tt.querySelector('.tt-id').textContent    = '#' + node.id;
+      tt.querySelector('.tt-label').textContent = node.label;
+      tt.querySelector('.tt-stats').textContent =
+        `Deg: ${node.total_degree} | Cat: ${node.category} | Sal: ${node.salience.toFixed(2)}`;
     } else {
-      tooltip.style.display = 'none';
+      tt.style.display = 'none';
     }
   })
-  .d3AlphaDecay(0.02)
-  .d3VelocityDecay(0.3)
-  .warmupTicks(100)
-  .cooldownTicks(200);
+  .d3AlphaDecay(0.04)
+  .d3VelocityDecay(0.4)
+  .warmupTicks(30)
+  .cooldownTicks(100);
 
-// ═══════════════════════════════════════════
-// Force layout — distance by weight, min distance anti-clump
-// ═══════════════════════════════════════════
+// Post-init renderer tuning
+(function _tuneRenderer() {
+  const r = Graph.renderer();
+  if (!r) return;
+  // Cap pixel ratio at 1.5 — above that you're rendering 2.25× the pixels for minimal visual gain
+  r.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+  r.toneMapping         = 3;  // THREE.ACESFilmicToneMapping
+  r.toneMappingExposure = 1.3;
+  r.shadowMap.enabled   = false;
+  r.info.autoReset      = true;
+})();
+
+// Force layout
 Graph
   .d3Force('link', Graph.d3Force('link')
-    .distance(link => {
-      // High weight → close, low weight → far
-      const w = link.weight || 0.5;
-      return 10 + (1 - w) * 120;  // weight=1.0 → 10px, weight=0.0 → 130px
-    })
-    .strength(link => {
-      // Stronger links pull harder
-      return 0.3 + (link.weight || 0.5) * 0.7;
-    })
-  )
+    .distance(l => 10 + (1 - (l.weight || 0.5)) * 120)
+    .strength(l  => 0.3 + (l.weight || 0.5) * 0.7))
   .d3Force('charge', Graph.d3Force('charge')
-    .strength(-80)          // repulsion between all nodes
-    .distanceMax(500)       // only repel nearby nodes
-  )
-  .d3Force('center', Graph.d3Force('center')
-    .strength(0.05)         // weak center pull — let clusters breathe
-  );
+    .strength(-80).distanceMax(500))
+  .d3Force('center', Graph.d3Force('center').strength(0.05));
 
-// Camera
-Graph.cameraPosition({ x: 0, y: 0, z: 400 });
+Graph.cameraPosition({ x:0, y:0, z:400 });
 
 // Tooltip follows mouse
 document.addEventListener('mousemove', e => {
-  const tooltip = document.getElementById('tooltip');
-  if (tooltip.style.display === 'block') {
-    tooltip.style.left = (e.clientX + 16) + 'px';
-    tooltip.style.top = (e.clientY - 10) + 'px';
+  const tt = document.getElementById('tooltip');
+  if (tt.style.display === 'block') {
+    tt.style.left = (e.clientX + 16) + 'px';
+    tt.style.top  = (e.clientY - 10) + 'px';
   }
 });
 
-// ═══════════════════════════════════════════
-// Controls
-// ═══════════════════════════════════════════
-document.getElementById('btn_reset').addEventListener('click', () => {
-  Graph.cameraPosition({ x: 0, y: 0, z: 400 }, { x: 0, y: 0, z: 0 }, 1000);
-});
+// ═══════════════════════════════════════════════════════════
+// FPS measurement + sparkline
+// ═══════════════════════════════════════════════════════════
+const _FT_BUF    = new Float32Array(120);
+let   _ftIdx     = 0, _ftCount = 0, _ftLast = 0;
+let   currentFps = 0, currentFrameMs = 0;
 
-document.getElementById('btn_pause').addEventListener('click', function() {
-  isPaused = !isPaused;
-  this.textContent = isPaused ? '▶' : '⏸';
-  if (isPaused) {
-    Graph.pauseAnimation();
-  } else {
-    Graph.resumeAnimation();
+const _spark     = document.getElementById('fps_spark');
+const _sparkCtx  = _spark.getContext('2d');
+
+function _drawSparkline() {
+  const w = _spark.width, h = _spark.height;
+  _sparkCtx.clearRect(0, 0, w, h);
+  const n    = Math.min(_ftCount, w);
+  const maxT = 16;  // 16ms = 60fps threshold
+  for (let i = 0; i < n; i++) {
+    const t   = _FT_BUF[(_ftIdx - n + i + 120) % 120];
+    const bar = Math.min(h, (t / maxT) * h);
+    // green (144fps) → yellow (60fps) → red (<30fps)
+    const hue = Math.max(0, Math.min(120, 120 - Math.max(0, t - 6.9) * 5.5));
+    _sparkCtx.fillStyle = `hsl(${hue},100%,55%)`;
+    _sparkCtx.fillRect(i * (w / n), h - bar, Math.max(1, w / n - 0.5), bar);
   }
-});
+}
 
-document.getElementById('btn_labels').addEventListener('click', () => {
-  showLabels = !showLabels;
-  Graph.nodeThreeObject(showLabels ? (node => {
-    const sprite = new SpriteText(node.label, 3, node.color);
-    sprite.fontFace = 'JetBrains Mono, monospace';
-    sprite.fontWeight = '600';
-    sprite.backgroundColor = 'rgba(3,3,5,0.6)';
-    sprite.padding = 2;
-    sprite.borderRadius = 3;
-    return sprite;
-  }) : null);
-});
+function _fpsTick(now) {
+  if (_ftLast > 0) {
+    const dt = now - _ftLast;
+    _FT_BUF[_ftIdx % 120] = dt;
+    _ftIdx++;
+    _ftCount = Math.min(_ftCount + 1, 120);
 
-// Restart dashboard
-document.getElementById('btn_restart').addEventListener('click', function() {
-  if (!confirm('Restart dashboard service?')) return;
-  const btn = this;
-  btn.textContent = '⏳';
-  btn.style.pointerEvents = 'none';
-  fetch('/api/restart', { method: 'POST' })
-    .then(r => r.json())
-    .then(d => {
-      btn.textContent = '✓';
-      btn.style.color = 'var(--green)';
-      setTimeout(() => location.reload(), 3000);
-    })
-    .catch(() => {
-      btn.textContent = '✕';
-      btn.style.color = 'var(--red)';
-      setTimeout(() => { btn.textContent = '⟳'; btn.style.pointerEvents = ''; }, 2000);
-    });
-});
+    if (_ftIdx % 6 === 0) {
+      let sum = 0;
+      const n = Math.min(_ftCount, 60);
+      for (let i = 0; i < n; i++) sum += _FT_BUF[(_ftIdx - 1 - i + 120) % 120];
+      currentFrameMs = sum / n;
+      currentFps     = Math.round(1000 / currentFrameMs);
 
-// ═══════════════════════════════════════════
-// Detail panel
-// ═══════════════════════════════════════════
-function openDetail(node) {
-  const panel = document.getElementById('detail_panel');
-  panel.classList.add('open');
-  document.getElementById('det_id').textContent = '#' + node.id;
-  document.getElementById('det_label').textContent = node.label;
-  document.getElementById('det_category').textContent = node.category;
-  document.getElementById('det_category').style.color = node.color;
-  document.getElementById('det_salience').textContent = node.salience.toFixed(3);
-  document.getElementById('det_salience_bar').style.width = (node.salience * 100) + '%';
-  document.getElementById('det_out').textContent = node.out_degree;
-  document.getElementById('det_in').textContent = node.in_degree;
-  document.getElementById('det_total').textContent = node.total_degree;
-  document.getElementById('det_access').textContent = node.access_count;
-  document.getElementById('det_weight').textContent = node.avg_weight;
+      const fpsEl = document.getElementById('h_fps');
+      const fmsEl = document.getElementById('h_fms');
+      fpsEl.textContent = currentFps;
+      fmsEl.textContent = currentFrameMs.toFixed(1) + 'ms';
+      fpsEl.className   = 'hud-value ' +
+        (currentFps >= 120 ? 'green' : currentFps >= 60 ? 'amber' : 'red');
+      _drawSparkline();
+    }
+  }
+  _ftLast = now;
+  requestAnimationFrame(_fpsTick);
+}
+requestAnimationFrame(_fpsTick);
 
-  // Connections
-  const connEl = document.getElementById('det_connections');
-  connEl.innerHTML = '<div class="detail-section-title">Connected To</div>';
-  const conns = adjMap[node.id] || [];
-  conns.sort((a, b) => b.weight - a.weight);
-  conns.forEach(c => {
-    const target = nodeById[c.id];
-    if (!target) return;
-    const item = document.createElement('div');
-    item.className = 'detail-conn-item';
-    item.innerHTML = `<span class="detail-conn-label">${c.dir === 'out' ? '→' : '←'} ${target.label}</span>
-      <span class="detail-conn-weight">${c.weight.toFixed(2)}</span>`;
-    item.addEventListener('click', () => {
-      openDetail(target);
-      focusNode(target);
-    });
-    connEl.appendChild(item);
+// ═══════════════════════════════════════════════════════════
+// Plotly mini charts
+// ═══════════════════════════════════════════════════════════
+const miniLayout = {
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  font: { color:'#8ab4d0', family:'JetBrains Mono', size:9 },
+  margin: { t:6, r:6, b:24, l:28 },
+  xaxis: { gridcolor:'rgba(0,243,255,0.06)', zerolinecolor:'rgba(0,243,255,0.08)', tickfont:{size:8} },
+  yaxis: { gridcolor:'rgba(0,243,255,0.06)', zerolinecolor:'rgba(0,243,255,0.08)', tickfont:{size:8} },
+};
+const miniConfig = { responsive:true, displayModeBar:false };
+
+const wOrder  = ['Very Weak (0-0.2)','Weak (0.2-0.4)','Medium (0.4-0.6)','Med-Strong (0.6-0.8)','Strong (0.8-1.0)'];
+const wColors = ['rgba(58,74,90,0.4)','rgba(58,74,90,0.6)','#bc13fe','#00f3ff','#ccff00'];
+
+function renderCharts(data) {
+  const cats = data.categories || [];
+  const wts  = data.weights    || [];
+  const nodes= data.nodes      || [];
+
+  Plotly.react('mini_pie', [{
+    type:'pie', hole:0.55,
+    labels: cats.map(c => c.name), values: cats.map(c => c.count),
+    marker: { colors: cats.map(c => cc[c.name] || '#3a4a5a'), line:{ color:'#030305', width:1 } },
+    textinfo:'label+percent', textfont:{ color:'#e0f7ff', size:8, family:'JetBrains Mono' },
+    hovertemplate:'<b>%{label}</b><br>%{value}<extra></extra>',
+  }], { ...miniLayout, showlegend:false, margin:{ t:4, r:4, b:4, l:4 } }, miniConfig);
+
+  const sW = wOrder.map(w => wts.find(x => x.bucket === w) || { bucket:w, count:0 });
+  Plotly.react('mini_bar', [{
+    type:'bar',
+    x: sW.map(w => w.bucket.replace(/ \(.*\)/,'')),
+    y: sW.map(w => w.count),
+    marker:{ color:wColors, line:{ color:'rgba(245,183,49,0.15)', width:0.5 } },
+    hovertemplate:'<b>%{x}</b><br>%{y:,}<extra></extra>',
+  }], miniLayout, miniConfig);
+
+  Plotly.react('mini_hist', [{
+    type:'histogram', x: nodes.map(n => n.total_degree), nbinsx:25,
+    marker:{ color:'rgba(245,183,49,0.4)', line:{ color:'rgba(245,183,49,0.7)', width:0.5 } },
+    hovertemplate:'Degree: %{x}<br>Count: %{y}<extra></extra>',
+  }], miniLayout, miniConfig);
+}
+renderCharts(D);
+
+// ═══════════════════════════════════════════════════════════
+// Full data rebuild (called on WS update)
+// Queued via rAF so it never blocks the render loop
+// ═══════════════════════════════════════════════════════════
+let _pendingRebuild = null, _rebuildScheduled = false;
+
+function scheduleRebuild(newData) {
+  _pendingRebuild = newData;
+  if (_rebuildScheduled) return;
+  _rebuildScheduled = true;
+  requestAnimationFrame(() => {
+    _rebuildScheduled = false;
+    const nd = _pendingRebuild;
+    _pendingRebuild = null;
+    if (nd) _doRebuild(nd);
   });
-
-  // Focus camera on node
-  focusNode(node);
 }
 
-function focusNode(node) {
-  const distance = 120;
-  const distRatio = 1 + distance / Math.hypot(node.x, node.y, node.z);
-  Graph.cameraPosition(
-    { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
-    { x: node.x, y: node.y, z: node.z },
-    800
-  );
+function _doRebuild(newData) {
+  D          = newData;
+  graphNodes = buildGraphNodes(D.nodes);
+  graphLinks = buildGraphLinks(D.edges);
+  adjMap     = buildAdjMap(graphNodes, graphLinks);
+  nodeById   = Object.fromEntries(graphNodes.map(n => [n.id, n]));
+
+  Graph.nodeResolution(_nodeResolution(graphNodes.length));
+  Graph.graphData({ nodes: graphNodes, links: graphLinks });
+
+  updateHUD(D.stats, graphNodes);
+  buildLegend(D.nodes);
+  renderCharts(D);
 }
 
-document.getElementById('detail_close').addEventListener('click', () => {
-  document.getElementById('detail_panel').classList.remove('open');
-});
-
-// Close on Escape
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    document.getElementById('detail_panel').classList.remove('open');
-    document.getElementById('search_results').classList.remove('visible');
-  }
-});
-
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 // Category highlight
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 let activeCategory = null;
 function highlightCategory(cat) {
   if (activeCategory === cat) {
@@ -850,22 +792,67 @@ function highlightCategory(cat) {
     .linkOpacity(l => {
       const sn = typeof l.source === 'object' ? l.source : nodeById[l.source];
       const tn = typeof l.target === 'object' ? l.target : nodeById[l.target];
-      return (sn && sn.category === cat) || (tn && tn.category === cat) ? 0.4 : 0.02;
+      return (sn?.category === cat || tn?.category === cat) ? 0.4 : 0.02;
     });
 }
 
-// ═══════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// Detail panel
+// ═══════════════════════════════════════════════════════════
+function openDetail(node) {
+  const panel = document.getElementById('detail_panel');
+  panel.classList.add('open');
+  document.getElementById('det_id').textContent        = '#' + node.id;
+  document.getElementById('det_label').textContent     = node.label;
+  document.getElementById('det_category').textContent  = node.category;
+  document.getElementById('det_category').style.color  = node.color;
+  document.getElementById('det_salience').textContent  = node.salience.toFixed(3);
+  document.getElementById('det_salience_bar').style.width = (node.salience * 100) + '%';
+  document.getElementById('det_out').textContent       = node.out_degree;
+  document.getElementById('det_in').textContent        = node.in_degree;
+  document.getElementById('det_total').textContent     = node.total_degree;
+  document.getElementById('det_access').textContent    = node.access_count;
+  document.getElementById('det_weight').textContent    = node.avg_weight;
+
+  const connEl = document.getElementById('det_connections');
+  connEl.innerHTML = '<div class="detail-section-title">Connected To</div>';
+  const conns = (adjMap[node.id] || []).slice().sort((a, b) => b.weight - a.weight);
+  conns.forEach(c => {
+    const target = nodeById[c.id];
+    if (!target) return;
+    const item = document.createElement('div');
+    item.className = 'detail-conn-item';
+    item.innerHTML =
+      `<span class="detail-conn-label">${c.dir === 'out' ? '→' : '←'} ${target.label}</span>` +
+      `<span class="detail-conn-weight">${c.weight.toFixed(2)}</span>`;
+    item.addEventListener('click', () => { openDetail(target); focusNode(target); });
+    connEl.appendChild(item);
+  });
+  focusNode(node);
+}
+
+function focusNode(node) {
+  const dist  = 120;
+  const ratio = 1 + dist / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
+  Graph.cameraPosition(
+    { x: node.x * ratio, y: node.y * ratio, z: node.z * ratio },
+    { x: node.x, y: node.y, z: node.z },
+    800,
+  );
+}
+
+document.getElementById('detail_close').addEventListener('click', () =>
+  document.getElementById('detail_panel').classList.remove('open'));
+
+// ═══════════════════════════════════════════════════════════
 // Search
-// ═══════════════════════════════════════════
-const searchInput = document.getElementById('search_input');
+// ═══════════════════════════════════════════════════════════
+const searchInput   = document.getElementById('search_input');
 const searchResults = document.getElementById('search_results');
 
 searchInput.addEventListener('input', function() {
   const q = this.value.toLowerCase().trim();
-  if (q.length < 2) {
-    searchResults.classList.remove('visible');
-    return;
-  }
+  if (q.length < 2) { searchResults.classList.remove('visible'); return; }
   const matches = D.nodes.filter(n =>
     n.label.toLowerCase().includes(q) || String(n.id) === q
   ).slice(0, 15);
@@ -874,14 +861,12 @@ searchInput.addEventListener('input', function() {
   matches.forEach(n => {
     const item = document.createElement('div');
     item.className = 'search-result-item';
-    item.innerHTML = `<span class="search-result-id">#${n.id}</span>
-      <span class="search-result-label">${n.label}</span>`;
+    item.innerHTML =
+      `<span class="search-result-id">#${n.id}</span>` +
+      `<span class="search-result-label">${n.label}</span>`;
     item.addEventListener('click', () => {
       const gn = graphNodes.find(g => g.id === n.id);
-      if (gn) {
-        openDetail(gn);
-        focusNode(gn);
-      }
+      if (gn) { openDetail(gn); focusNode(gn); }
       searchResults.classList.remove('visible');
       searchInput.value = '';
     });
@@ -889,167 +874,95 @@ searchInput.addEventListener('input', function() {
   });
   searchResults.classList.add('visible');
 });
+searchInput.addEventListener('blur', () =>
+  setTimeout(() => searchResults.classList.remove('visible'), 200));
 
-searchInput.addEventListener('blur', () => {
-  setTimeout(() => searchResults.classList.remove('visible'), 200);
+// ═══════════════════════════════════════════════════════════
+// Controls
+// ═══════════════════════════════════════════════════════════
+document.getElementById('btn_reset').addEventListener('click', () =>
+  Graph.cameraPosition({ x:0, y:0, z:400 }, { x:0, y:0, z:0 }, 1000));
+
+document.getElementById('btn_pause').addEventListener('click', function() {
+  isPaused = !isPaused;
+  this.textContent = isPaused ? '▶' : '⏸';
+  isPaused ? Graph.pauseAnimation() : Graph.resumeAnimation();
 });
 
-// ═══════════════════════════════════════════
-// Mini Plotly charts (bottom bar)
-// ═══════════════════════════════════════════
-const miniLayout = {
-  paper_bgcolor: 'rgba(0,0,0,0)',
-  plot_bgcolor: 'rgba(0,0,0,0)',
-  font: { color: '#8ab4d0', family: 'JetBrains Mono', size: 9 },
-  margin: { t: 6, r: 6, b: 24, l: 28 },
-  xaxis: { gridcolor: 'rgba(0,243,255,0.06)', zerolinecolor: 'rgba(0,243,255,0.08)', tickfont: { size: 8 } },
-  yaxis: { gridcolor: 'rgba(0,243,255,0.06)', zerolinecolor: 'rgba(0,243,255,0.08)', tickfont: { size: 8 } },
-};
-const miniConfig = { responsive: true, displayModeBar: false };
+document.getElementById('btn_labels').addEventListener('click', () => {
+  showLabels = !showLabels;
+  Graph.nodeThreeObject(showLabels ? (node => _getSprite(node)) : null);
+});
 
-// Pie
-Plotly.newPlot('mini_pie', [{
-  type: 'pie', hole: 0.55,
-  labels: D.categories.map(c => c.name),
-  values: D.categories.map(c => c.count),
-  marker: {
-    colors: D.categories.map(c => cc[c.name] || '#3a4a5a'),
-    line: { color: '#030305', width: 1 },
-  },
-  textinfo: 'label+percent',
-  textfont: { color: '#e0f7ff', size: 8, family: 'JetBrains Mono' },
-  hovertemplate: '<b>%{label}</b><br>%{value}<extra></extra>',
-}], { ...miniLayout, showlegend: false, margin: { t: 4, r: 4, b: 4, l: 4 } }, miniConfig);
+document.getElementById('btn_ambient').addEventListener('click', function() {
+  ambientMode = !ambientMode;
+  this.classList.toggle('active', ambientMode);
+  if (ambientMode) { ambTargetSpeed = 0.00025; ambAngle = 0; }
+});
 
-// Weight bar
-const wOrder = ['Very Weak (0-0.2)', 'Weak (0.2-0.4)', 'Medium (0.4-0.6)', 'Med-Strong (0.6-0.8)', 'Strong (0.8-1.0)'];
-const wColors = ['rgba(58,74,90,0.4)', 'rgba(58,74,90,0.6)', '#bc13fe', '#00f3ff', '#ccff00'];
-const sW = wOrder.map(w => D.weights.find(x => x.bucket === w) || { bucket: w, count: 0 });
-Plotly.newPlot('mini_bar', [{
-  type: 'bar',
-  x: sW.map(w => w.bucket.replace(/ \(.*\)/, '')),
-  y: sW.map(w => w.count),
-  marker: { color: wColors, line: { color: 'rgba(245,183,49,0.15)', width: 0.5 } },
-  hovertemplate: '<b>%{x}</b><br>%{y:,}<extra></extra>',
-}], miniLayout, miniConfig);
+document.getElementById('btn_restart').addEventListener('click', function() {
+  if (!confirm('Restart dashboard service?')) return;
+  const btn = this;
+  btn.textContent = '⏳'; btn.style.pointerEvents = 'none';
+  fetch('/api/restart', { method:'POST' })
+    .then(r => r.json())
+    .then(() => { btn.textContent = '✓'; btn.style.color = 'var(--green)'; setTimeout(() => location.reload(), 3000); })
+    .catch(() => {
+      btn.textContent = '✕'; btn.style.color = 'var(--red)';
+      setTimeout(() => { btn.textContent = '⟳'; btn.style.color = ''; btn.style.pointerEvents = ''; }, 2000);
+    });
+});
 
-// Degree histogram
-Plotly.newPlot('mini_hist', [{
-  type: 'histogram',
-  x: D.nodes.map(n => n.total_degree),
-  nbinsx: 25,
-  marker: {
-    color: 'rgba(245,183,49,0.4)',
-    line: { color: 'rgba(245,183,49,0.7)', width: 0.5 },
-  },
-  hovertemplate: 'Degree: %{x}<br>Count: %{y}<extra></extra>',
-}], miniLayout, miniConfig);
-</script>
+// ═══════════════════════════════════════════════════════════
+// Keyboard
+// ═══════════════════════════════════════════════════════════
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === 'Escape') {
+    document.getElementById('detail_panel').classList.remove('open');
+    searchResults.classList.remove('visible');
+    return;
+  }
+  if (e.key === 'a' || e.key === 'A') {
+    ambientMode = !ambientMode;
+    document.getElementById('btn_ambient').classList.toggle('active', ambientMode);
+    if (ambientMode) { ambTargetSpeed = 0.00025; ambAngle = 0; }
+    return;
+  }
+  if (e.key === 'o' || e.key === 'O') { toggleObs(); return; }
+  if (e.key === '`')  { e.preventDefault(); toggleTerminal(); return; }
+});
 
-<script>
-// ═══════════════════════════════════════════
-// WebSocket Live Updates (adds to existing D, graphNodes, etc.)
-// ═══════════════════════════════════════════
-let ws = null, reconnectDelay = 1000;
-
+// ═══════════════════════════════════════════════════════════
 // Ambient camera rotation
+// ═══════════════════════════════════════════════════════════
 let ambAngle = 0, ambSpeed = 0, ambTargetSpeed = 0;
-let ambientMode = false;
 
-function ambientRotate() {
-  if (!ambientMode) { requestAnimationFrame(ambientRotate); return; }
-  ambSpeed += (ambTargetSpeed - ambSpeed) * 0.015;
-  ambAngle += ambSpeed;
-  const r = 380, by = 80;
-  const x = Math.cos(ambAngle) * r;
-  const z = Math.sin(ambAngle) * r;
-  const y = by + Math.sin(ambAngle * 0.5) * 80;
-  Graph.cameraPosition({ x, y, z }, { x: 0, y: 0, z: 0 }, 0);
-  requestAnimationFrame(ambientRotate);
-}
-
-// ACES Tonemapping on renderer
+// ACES tonemapping on renderer (also set in _tuneRenderer, belt+braces)
 try {
   const r = Graph.renderer();
   if (r) { r.toneMapping = 3; r.toneMappingExposure = 1.3; }
 } catch(e) {}
 
-function rebuildFromData(newData) {
-  D = newData;
+(function ambientLoop() {
+  if (ambientMode) {
+    ambSpeed  += (ambTargetSpeed - ambSpeed) * 0.015;
+    ambAngle  += ambSpeed;
+    const r    = 380, by = 80;
+    Graph.cameraPosition({
+      x: Math.cos(ambAngle) * r,
+      y: by + Math.sin(ambAngle * 0.5) * 80,
+      z: Math.sin(ambAngle) * r,
+    }, { x:0, y:0, z:0 }, 0);
+  }
+  requestAnimationFrame(ambientLoop);
+})();
 
-  // Rebuild graph nodes/links
-  const newNodes = D.nodes.map(n => ({
-    id: n.id, label: n.label, category: n.category, salience: n.salience,
-    access_count: n.access_count, total_degree: n.total_degree,
-    out_degree: n.out_degree, in_degree: n.in_degree, avg_weight: n.avg_weight,
-    val: Math.max(2, Math.sqrt(n.total_degree) * 1.8),
-    color: cc[n.category] || cc['Other'],
-  }));
-  const newLinks = D.edges.map(e => ({
-    source: e.source, target: e.target, weight: e.weight,
-    color: `rgba(0,243,255,${Math.max(0.05, e.weight * 0.3)})`,
-  }));
-
-  // Rebuild adjMap
-  const newAdj = {};
-  newNodes.forEach(n => { newAdj[n.id] = []; });
-  newLinks.forEach(l => {
-    const sid = typeof l.source === 'object' ? l.source.id : l.source;
-    const tid = typeof l.target === 'object' ? l.target.id : l.target;
-    if (newAdj[sid]) newAdj[sid].push({ id: tid, weight: l.weight, dir: 'out' });
-    if (newAdj[tid]) newAdj[tid].push({ id: sid, weight: l.weight, dir: 'in' });
-  });
-
-  // Update graph
-  Graph.graphData({ nodes: newNodes, links: newLinks });
-
-  // Update HUD
-  animateNum('h_mem', D.stats.memories);
-  animateNum('h_conn', D.stats.connections);
-  const avgD = newNodes.length ? Math.round(newNodes.reduce((s, n) => s + n.total_degree, 0) / newNodes.length) : 0;
-  animateNum('h_deg', avgD);
-  document.getElementById('h_source').textContent = D.stats.source + ' :: ' + D.stats.path;
-
-  // Update charts with Plotly.react (smooth update, no re-render)
-  try {
-    Plotly.react('mini_pie', [{
-      type: 'pie', hole: 0.55,
-      labels: D.categories.map(c => c.name), values: D.categories.map(c => c.count),
-      marker: { colors: D.categories.map(c => cc[c.name] || '#3a4a5a'), line: { color: '#030305', width: 1 } },
-      textinfo: 'label+percent', textfont: { color: '#e0f7ff', size: 8, family: 'JetBrains Mono' },
-      hovertemplate: '<b>%{label}</b><br>%{value}<extra></extra>',
-    }], { ...miniLayout, showlegend: false, margin: { t: 4, r: 4, b: 4, l: 4 } }, miniConfig);
-
-    const wO = ['Very Weak (0-0.2)', 'Weak (0.2-0.4)', 'Medium (0.4-0.6)', 'Med-Strong (0.6-0.8)', 'Strong (0.8-1.0)'];
-    const wC = ['rgba(58,74,90,0.4)', 'rgba(58,74,90,0.6)', '#bc13fe', '#00f3ff', '#ccff00'];
-    const sW = wO.map(w => D.weights.find(x => x.bucket === w) || { bucket: w, count: 0 });
-    Plotly.react('mini_bar', [{
-      type: 'bar', x: sW.map(w => w.bucket.replace(/ \(.*\)/, '')), y: sW.map(w => w.count),
-      marker: { color: wC, line: { color: 'rgba(245,183,49,0.15)', width: 0.5 } },
-      hovertemplate: '<b>%{x}</b><br>%{y:,}<extra></extra>',
-    }], miniLayout, miniConfig);
-
-    Plotly.react('mini_hist', [{
-      type: 'histogram', x: D.nodes.map(n => n.total_degree), nbinsx: 25,
-      marker: { color: 'rgba(245,183,49,0.4)', line: { color: 'rgba(245,183,49,0.7)', width: 0.5 } },
-      hovertemplate: 'Degree: %{x}<br>Count: %{y}<extra></extra>',
-    }], miniLayout, miniConfig);
-  } catch(e) {}
-
-  // Update legend
-  const legendEl = document.getElementById('legend');
-  legendEl.innerHTML = '<h3>Categories</h3>';
-  const cats = [...new Set(D.nodes.map(n => n.category))];
-  const ccnt = {};
-  cats.forEach(c => { ccnt[c] = D.nodes.filter(n => n.category === c).length; });
-  cats.forEach(c => {
-    const item = document.createElement('div');
-    item.className = 'legend-item';
-    item.innerHTML = '<div class="legend-dot" style="background:' + cc[c] + ';color:' + cc[c] + '"></div><span class="legend-name">' + c + '</span><span class="legend-count">' + ccnt[c] + '</span>';
-    item.addEventListener('click', () => highlightCategory(c));
-    legendEl.appendChild(item);
-  });
-}
+// ═══════════════════════════════════════════════════════════
+// WebSocket — data stream
+// ═══════════════════════════════════════════════════════════
+let ws = null, wsReconnectDelay = 1000;
+let _wsPingT0 = 0, wsLatencyMs = 0, wsUpdatesCount = 0;
 
 function showDeltaToast(text) {
   const t = document.getElementById('delta_toast');
@@ -1065,107 +978,306 @@ function flashValue(id) {
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws/stream');
+
   ws.onopen = () => {
-    reconnectDelay = 1000;
+    wsReconnectDelay = 1000;
     document.getElementById('live_status').className = 'live-indicator connected';
     document.getElementById('live_text').textContent = 'Live';
+    // Start ping loop
+    _sendPing();
   };
+
   ws.onclose = () => {
     document.getElementById('live_status').className = 'live-indicator disconnected';
-    document.getElementById('live_text').textContent = 'Reconnecting...';
-    setTimeout(connectWS, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 1.5, 30000);
+    document.getElementById('live_text').textContent = 'Reconnecting…';
+    document.getElementById('live_latency').textContent = '';
+    setTimeout(connectWS, wsReconnectDelay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, 30000);
   };
+
   ws.onerror = () => {};
-  ws.onmessage = (event) => {
+
+  ws.onmessage = event => {
     const msg = JSON.parse(event.data);
+
+    if (msg.type === 'pong') {
+      wsLatencyMs = Math.round(performance.now() - _wsPingT0);
+      document.getElementById('live_latency').textContent = wsLatencyMs + 'ms';
+      document.getElementById('obs_wslatency').textContent = wsLatencyMs + 'ms';
+      setTimeout(_sendPing, 5000);
+      return;
+    }
+
     if (msg.type === 'initial') {
-      rebuildFromData({ nodes: msg.nodes, edges: msg.edges, categories: msg.categories, weights: msg.weights, stats: msg.stats });
-    } else if (msg.type === 'update') {
-      const d = msg.delta;
-      const parts = [];
-      if (d.new_memories > 0) parts.push('+' + d.new_memories + ' memory');
+      scheduleRebuild({ nodes: msg.nodes, edges: msg.edges, categories: msg.categories, weights: msg.weights, stats: msg.stats });
+      return;
+    }
+
+    if (msg.type === 'update') {
+      wsUpdatesCount++;
+      document.getElementById('obs_wsupdates').textContent = wsUpdatesCount;
+      const d = msg.delta, parts = [];
+      if (d.new_memories    > 0) parts.push('+' + d.new_memories    + ' memory');
       if (d.new_connections > 0) parts.push('+' + d.new_connections + ' conn');
-      if (parts.length) showDeltaToast(parts.join('  '));
-      if (d.new_memories > 0) flashValue('h_mem');
+      if (parts.length) showDeltaToast(parts.join('  ·  '));
+      if (d.new_memories    > 0) flashValue('h_mem');
       if (d.new_connections > 0) flashValue('h_conn');
-      rebuildFromData({ nodes: msg.nodes, edges: msg.edges, categories: msg.categories, weights: msg.weights, stats: msg.stats });
-      // Ambient pulse on update
+      scheduleRebuild({ nodes: msg.nodes, edges: msg.edges, categories: msg.categories, weights: msg.weights, stats: msg.stats });
+      // Ambient pulse on new data
       if (ambientMode) { ambTargetSpeed = 0.004; setTimeout(() => { ambTargetSpeed = 0.00025; }, 3000); }
     }
   };
 }
 
-// Toggle ambient mode with 'A' key
-document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT') return;
-  if (e.key === 'a' || e.key === 'A') {
-    ambientMode = !ambientMode;
-    if (ambientMode) {
-      ambTargetSpeed = 0.00025;
-      ambAngle = 0;
-    }
+function _sendPing() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    _wsPingT0 = performance.now();
+    ws.send('ping');
   }
+}
+
+connectWS();
+
+// ═══════════════════════════════════════════════════════════
+// Observability panel
+// ═══════════════════════════════════════════════════════════
+let obsOpen = false;
+document.getElementById('h_fps').addEventListener('click', toggleObs);
+
+function toggleObs() {
+  obsOpen = !obsOpen;
+  document.getElementById('obs_panel').classList.toggle('open', obsOpen);
+}
+
+function _fmtBytes(b) {
+  return b == null ? '—' : (b / 1048576).toFixed(1) + 'MB';
+}
+function _fmtUptime(s) {
+  if (s < 60)   return Math.round(s) + 's';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  return (s / 3600).toFixed(1) + 'h';
+}
+
+setInterval(() => {
+  if (!obsOpen) return;
+
+  // Renderer info
+  try {
+    const info = Graph.renderer().info;
+    document.getElementById('obs_draws').textContent = info.render.calls;
+    document.getElementById('obs_tris').textContent  = info.render.triangles.toLocaleString();
+    document.getElementById('obs_geom').textContent  = info.memory.geometries;
+    document.getElementById('obs_tex').textContent   = info.memory.textures;
+    document.getElementById('obs_prog').textContent  = info.programs?.length ?? '—';
+  } catch(e) {}
+
+  // JS heap
+  const mem = performance.memory;
+  document.getElementById('obs_heap').textContent =
+    mem ? _fmtBytes(mem.usedJSHeapSize) + ' / ' + _fmtBytes(mem.jsHeapSizeLimit) : '—';
+
+  // Server metrics
+  fetch('/api/metrics')
+    .then(r => r.json())
+    .then(m => {
+      document.getElementById('obs_dbms').textContent    = m.db_query_ms   + 'ms';
+      document.getElementById('obs_broadms').textContent = m.broadcast_ms  + 'ms';
+      document.getElementById('obs_uptime').textContent  = _fmtUptime(m.uptime_s);
+      document.getElementById('obs_clients').textContent = m.ws_clients;
+    })
+    .catch(() => {});
+}, 500);
+
+// ═══════════════════════════════════════════════════════════
+// Hermes terminal  (xterm.js + PTY WebSocket)
+// ═══════════════════════════════════════════════════════════
+let term       = null;
+let fitAddon   = null;
+let termWs     = null;
+let termOpen   = false;
+let _termResizeObs = null;
+
+function _initTerminal() {
+  if (term) return;
+  if (typeof Terminal === 'undefined') {
+    console.warn('xterm.js not loaded — terminal disabled');
+    return;
+  }
+
+  term = new Terminal({
+    theme: {
+      background:   'rgba(3,3,5,0)',
+      foreground:   '#e0f7ff',
+      cursor:       '#00f3ff',
+      cursorAccent: '#030305',
+      black:        '#030305',  brightBlack:   '#3a4a5a',
+      red:          '#ff003c',  brightRed:     '#ff4060',
+      green:        '#ccff00',  brightGreen:   '#ddff44',
+      yellow:       '#f5b731',  brightYellow:  '#ffd070',
+      blue:         '#00b8cc',  brightBlue:    '#00f3ff',
+      magenta:      '#bc13fe',  brightMagenta: '#d050ff',
+      cyan:         '#00f3ff',  brightCyan:    '#80ffff',
+      white:        '#8ab4d0',  brightWhite:   '#e0f7ff',
+    },
+    fontFamily:       'JetBrains Mono, Fira Code, monospace',
+    fontSize:         13,
+    lineHeight:       1.35,
+    letterSpacing:    0.3,
+    cursorBlink:      true,
+    cursorStyle:      'bar',
+    cursorWidth:      2,
+    scrollback:       5000,
+    allowTransparency: true,
+    fastScrollModifier: 'alt',
+  });
+
+  if (typeof FitAddon !== 'undefined') {
+    fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+  }
+
+  term.open(document.getElementById('terminal_container'));
+  if (fitAddon) fitAddon.fit();
+
+  _termResizeObs = new ResizeObserver(() => {
+    if (!fitAddon) return;
+    try {
+      fitAddon.fit();
+      if (termWs && termWs.readyState === WebSocket.OPEN) {
+        termWs.send(JSON.stringify({ type:'resize', rows:term.rows, cols:term.cols }));
+      }
+    } catch(e) {}
+  });
+  _termResizeObs.observe(document.getElementById('terminal_container'));
+}
+
+function _connectTerminal() {
+  if (termWs && (termWs.readyState === WebSocket.CONNECTING || termWs.readyState === WebSocket.OPEN)) return;
+
+  const proto  = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  termWs       = new WebSocket(proto + '//' + location.host + '/ws/terminal');
+  termWs.binaryType = 'arraybuffer';
+
+  const statusEl = document.getElementById('term_status');
+
+  termWs.onopen = () => {
+    statusEl.className = 'term-status ok';
+    if (fitAddon) fitAddon.fit();
+    if (term) {
+      termWs.send(JSON.stringify({ type:'resize', rows:term.rows, cols:term.cols }));
+      term.focus();
+    }
+  };
+
+  termWs.onclose = () => {
+    statusEl.className = 'term-status';
+    if (term) term.write('\r\n\x1b[33m[session ended — press Enter to reconnect]\x1b[0m\r\n');
+  };
+
+  termWs.onerror = () => {
+    if (term) term.write('\r\n\x1b[31m[connection error]\x1b[0m\r\n');
+  };
+
+  termWs.onmessage = e => {
+    if (!term) return;
+    if (e.data instanceof ArrayBuffer) {
+      term.write(new Uint8Array(e.data));
+    } else {
+      term.write(e.data);
+    }
+  };
+
+  // User → PTY
+  term.onData(data => {
+    if (termWs && termWs.readyState === WebSocket.OPEN) {
+      termWs.send(new TextEncoder().encode(data));
+    } else if (data === '\r') {
+      // Enter pressed while disconnected → reconnect
+      _connectTerminal();
+    }
+  });
+}
+
+function toggleTerminal() {
+  termOpen = !termOpen;
+  const panel = document.getElementById('terminal_panel');
+  panel.classList.toggle('open', termOpen);
+  if (termOpen) {
+    if (!term) _initTerminal();
+    if (term)  _connectTerminal();
+    setTimeout(() => {
+      if (fitAddon) try { fitAddon.fit(); } catch(e) {}
+      if (term) term.focus();
+    }, 370);
+  }
+}
+
+document.getElementById('term_close').addEventListener('click', () => {
+  termOpen = false;
+  document.getElementById('terminal_panel').classList.remove('open');
 });
 
-// Start WS
-connectWS();
-setTimeout(ambientRotate, 2000);
-</script>
+document.getElementById('term_clear').addEventListener('click', () => { if (term) term.clear(); });
 
-<!-- SpriteText inline fallback — zero external deps -->
-<script>
-// Canvas-based SpriteText — drop-in replacement for three-spritetext
+document.getElementById('term_new').addEventListener('click', () => {
+  // Kill current session and open new one
+  if (termWs) { termWs.close(); termWs = null; }
+  if (term)   { term.reset(); _connectTerminal(); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// SpriteText — canvas-based 3D node labels (zero external deps)
+// ═══════════════════════════════════════════════════════════
 class SpriteText extends THREE.Sprite {
   constructor(text, textSize, color) {
     const canvas = document.createElement('canvas');
-    const tex = new THREE.CanvasTexture(canvas);
-    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+    const tex    = new THREE.CanvasTexture(canvas);
+    const mat    = new THREE.SpriteMaterial({ map:tex, transparent:true, depthWrite:false });
     super(mat);
-    this._text = text || '';
-    this._textSize = textSize || 1;
-    this._color = color || '#ffffff';
-    this._canvas = canvas;
-    this._tex = tex;
-    this.fontFace = 'sans-serif';
+    this._text      = text || '';
+    this._textSize  = textSize || 1;
+    this._color     = color || '#ffffff';
+    this._canvas    = canvas;
+    this._tex       = tex;
+    this.fontFace   = 'sans-serif';
     this.fontWeight = 'normal';
     this.backgroundColor = 'transparent';
-    this.padding = 0;
+    this.padding    = 0;
     this.borderRadius = 0;
+    this._rendered  = false;
   }
-  _update() {
-    const c = this._canvas;
+
+  _build() {
+    const c   = this._canvas;
     const ctx = c.getContext('2d');
-    const fs = Math.max(20, Math.round(this._textSize * 18));
+    const fs  = Math.max(20, Math.round(this._textSize * 18));
     const font = `${this.fontWeight} ${fs}px ${this.fontFace}`;
     ctx.font = font;
     const tw = Math.ceil(ctx.measureText(this._text).width) + 20;
     const th = Math.ceil(fs * 1.5);
     c.width = tw; c.height = th;
+
     if (this.backgroundColor && this.backgroundColor !== 'transparent') {
       ctx.fillStyle = this.backgroundColor;
       const p = this.padding, r = this.borderRadius;
       const x = p, y = p, w = tw - 2*p, h = th - 2*p;
       ctx.beginPath();
-      ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y);
-      ctx.quadraticCurveTo(x+w,y,x+w,y+r); ctx.lineTo(x+w,y+h-r);
-      ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h); ctx.lineTo(x+r,y+h);
-      ctx.quadraticCurveTo(x,y+h,x,y+h-r); ctx.lineTo(x,y+r);
-      ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath(); ctx.fill();
+      ctx.moveTo(x+r,y);        ctx.lineTo(x+w-r,y);
+      ctx.quadraticCurveTo(x+w,y,   x+w,y+r);   ctx.lineTo(x+w,y+h-r);
+      ctx.quadraticCurveTo(x+w,y+h, x+w-r,y+h); ctx.lineTo(x+r,y+h);
+      ctx.quadraticCurveTo(x,y+h,   x,y+h-r);   ctx.lineTo(x,y+r);
+      ctx.quadraticCurveTo(x,y,     x+r,y);      ctx.closePath(); ctx.fill();
     }
     ctx.font = font; ctx.fillStyle = this._color;
     ctx.textBaseline = 'middle'; ctx.fillText(this._text, 10, th / 2);
     this._tex.image = c; this._tex.needsUpdate = true;
     this.scale.set(tw / th * this._textSize * 3, this._textSize * 3, 1);
   }
+
+  onBeforeRender() {
+    if (!this._rendered) { this._rendered = true; this._build(); }
+  }
 }
-// Monkey-patch: trigger canvas rebuild on first access
-const _origUpdate = SpriteText.prototype._update;
-const _origDesc = Object.getOwnPropertyDescriptor(THREE.Sprite.prototype, 'material');
-// Override to auto-update on first render
-SpriteText.prototype.onBeforeRender = function() {
-  if (!this._rendered) { this._rendered = true; this._update(); }
-};
 </script>
 </body>
 </html>
