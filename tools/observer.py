@@ -30,6 +30,22 @@ from typing import Any
 STATE_PATH = Path.home() / ".neural_memory" / "observer-state.json"
 LOG_DIR = Path.home() / ".neural_memory" / "logs"
 REMEMBER_BIN = os.environ.get("REMEMBER_BIN", str(Path.home() / ".local" / "bin" / "remember"))
+TELEGRAM_BRIDGE = Path.home() / ".hermes" / "bin" / "ae_telegram_send.py"
+
+
+def telegram_alert(msg: str) -> None:
+    if not TELEGRAM_BRIDGE.exists():
+        return
+    try:
+        subprocess.run(
+            [str(TELEGRAM_BRIDGE)],
+            input=msg.encode("utf-8"),
+            timeout=10,
+            check=False,
+            capture_output=True,
+        )
+    except Exception:
+        pass
 
 # Git repos to watch
 DEFAULT_REPOS = [
@@ -158,14 +174,18 @@ def poll_vault(vaults: list[str], state: dict, events: list[dict]) -> None:
             vault_state[key] = mtime
 
 
-def write_events(events: list[dict]) -> int:
+def write_events(events: list[dict]) -> tuple[int, int]:
+    """Returns (written, failed). Failed = exceptions raised; nonzero exit codes don't count as failure here since `remember` may legitimately reject duplicates."""
     if not events:
-        return 0
+        return 0, 0
     if not Path(REMEMBER_BIN).exists():
-        print(f"ERROR: remember CLI not at {REMEMBER_BIN}", file=sys.stderr)
-        return 0
+        msg = f"neural-observer ERROR: remember CLI not at {REMEMBER_BIN} — observer cannot write to neural-memory"
+        print(msg, file=sys.stderr)
+        telegram_alert(msg)
+        return 0, len(events)
 
     written = 0
+    failed = 0
     for e in events:
         try:
             subprocess.run(
@@ -174,8 +194,9 @@ def write_events(events: list[dict]) -> int:
             )
             written += 1
         except Exception as exc:
+            failed += 1
             print(f"WARN remember failed for {e.get('label')}: {exc}", file=sys.stderr)
-    return written
+    return written, failed
 
 
 def main() -> int:
@@ -211,14 +232,26 @@ def main() -> int:
             print(json.dumps(e))
         summary["action"] = "dry-run"
     else:
-        written = write_events(events)
+        written, failed = write_events(events)
         save_state(state)
         summary["written"] = written
+        summary["failed"] = failed
         summary["action"] = "wrote"
+        if events and failed > len(events) // 2:
+            telegram_alert(
+                f"neural-observer HIGH FAILURE RATE: {failed}/{len(events)} writes failed. "
+                f"Memory ingestion degraded. Check ~/.neural_memory/logs/observer.stderr.log"
+            )
 
     print(json.dumps(summary, indent=2))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        msg = f"neural-observer CRASHED: {type(exc).__name__}: {exc}"
+        print(msg, file=sys.stderr)
+        telegram_alert(msg)
+        sys.exit(2)

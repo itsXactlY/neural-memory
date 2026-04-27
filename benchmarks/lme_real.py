@@ -113,9 +113,27 @@ def run(args):
 
         # Seed haystack into memory
         t_seed = time.perf_counter()
-        for qid_r, sess_id, turn_idx, content in turns:
-            # Limit turn length to prevent huge writes
-            mem.remember(content[:2000], label=_label_for(qid_r, sess_id, turn_idx))
+        if args.no_auto_connect:
+            # H14: bulk-seed bypass — skip mem.remember()'s auto-connect O(n)
+            # scan + optionally batch the embedder for ~10x throughput.
+            # Edges are absent for these memories — fine for retrieval-only
+            # benchmarks; think()/walk semantics are unavailable on them.
+            batch_size = args.batch_embed
+            if batch_size > 0:
+                for j in range(0, len(turns), batch_size):
+                    chunk = turns[j:j + batch_size]
+                    contents = [c[:2000] for _, _, _, c in chunk]
+                    vecs = mem.embedder.embed_batch(contents)
+                    for (qid_r, sess_id, turn_idx, _), text, vec in zip(chunk, contents, vecs):
+                        mem.store.store(_label_for(qid_r, sess_id, turn_idx), text, vec)
+            else:
+                for qid_r, sess_id, turn_idx, content in turns:
+                    text = content[:2000]
+                    vec = mem.embedder.embed(text)
+                    mem.store.store(_label_for(qid_r, sess_id, turn_idx), text, vec)
+        else:
+            for qid_r, sess_id, turn_idx, content in turns:
+                mem.remember(content[:2000], label=_label_for(qid_r, sess_id, turn_idx))
         seed_times_s.append(time.perf_counter() - t_seed)
 
         # Query
@@ -194,6 +212,18 @@ def main():
     ap.add_argument("--rerank", action="store_true", default=False)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--out", default=None)
+    # H14: bench-only flags for tractable ST + rerank full runs
+    ap.add_argument(
+        "--no-auto-connect", action="store_true",
+        help="Skip mem.remember() auto-connect during bulk seeding. "
+             "Memories stored, edges absent. Retrieval-only benchmarks.",
+    )
+    ap.add_argument(
+        "--batch-embed", type=int, default=0,
+        help="Batch size for embedder.embed_batch() during seeding. "
+             "0 = per-turn (current behavior). Requires --no-auto-connect "
+             "since auto-connect is per-row anyway.",
+    )
     args = ap.parse_args()
 
     report = run(args)
