@@ -19,3 +19,5 @@ tools/dashboard/.certs/
 sqlite-wal
 sqlite-shm
 sqlite
+CLAUDE.md
+tools/dashboard/.lib_cache/

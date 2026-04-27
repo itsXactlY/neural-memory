@@ -442,6 +442,7 @@ class NeuralMemoryProvider(MemoryProvider):
                     if any(skip in content_lower for skip in (
                         "neural memory", "tool_result", "test_suite", "mssql",
                         "config.yaml", "odbc", "embedding", "connection string",
+                        "archive:session",
                     )):
                         continue
                     lines.append(f"- [{sim:.2f}] {content[:150]}")
@@ -482,6 +483,13 @@ class NeuralMemoryProvider(MemoryProvider):
         "embedding",
         "connection string",
         "odbc",
+        # Compaction artifacts — these indicate stale/loop content
+        "[SUPERSEDED]",
+        "[UPDATED TO]",
+        "[CONTEXT COMPACTION",
+        "[SYSTEM: If you have a meaningful status report",
+        "context compaction — reference only",
+        "the latest user message that appears after this summary",
     )
 
     # Patterns that indicate the text is NOT a useful memory (banner/log/config)

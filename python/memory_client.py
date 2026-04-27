@@ -69,6 +69,34 @@ class CStats(ctypes.Structure):
 
 DB_PATH = Path.home() / ".neural_memory" / "memory.db"
 
+
+def _resolve_hf_snapshot(model_name: str) -> Optional[str]:
+    """Return a local snapshot directory for model_name, or None if not cached.
+
+    Checks ~/.neural_memory/models first, then the default HF hub cache.
+    Passing a snapshot path directly to SentenceTransformer / CrossEncoder
+    avoids any network contact with the HF Hub.
+    """
+    safe_name = model_name.replace("/", "--")
+    search_dirs = [
+        Path.home() / ".neural_memory" / "models",
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ]
+    for base in search_dirs:
+        cache_base = base / f"models--{safe_name}"
+        refs_main = cache_base / "refs" / "main"
+        if refs_main.exists():
+            snap_hash = refs_main.read_text().strip()
+            snap = cache_base / "snapshots" / snap_hash
+            if snap.exists() and (snap / "config.json").exists():
+                return str(snap)
+        snapshots_dir = cache_base / "snapshots"
+        if snapshots_dir.exists():
+            for snap in sorted(snapshots_dir.iterdir(), reverse=True):
+                if (snap / "config.json").exists():
+                    return str(snap)
+    return None
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -917,7 +945,8 @@ class NeuralMemory:
         try:
             from sentence_transformers import CrossEncoder
             model_name = os.environ.get("NEURAL_MEMORY_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-            self._reranker = CrossEncoder(model_name)
+            load_path = _resolve_hf_snapshot(model_name) or model_name
+            self._reranker = CrossEncoder(load_path)
             return self._reranker
         except Exception:
             self._reranker_failed = True

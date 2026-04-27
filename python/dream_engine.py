@@ -795,10 +795,13 @@ class DreamEngine:
                 except Exception as e:
                     logger.debug("Maintenance cleanup error: %s", e)
 
-            self._backend.finish_session(session_id, stats)
-
         except Exception as e:
             logger.debug("NREM phase error: %s", e)
+        finally:
+            try:
+                self._backend.finish_session(session_id, stats)
+            except Exception as e:
+                logger.debug("NREM finish_session failed: %s", e)
 
         return stats
 
@@ -849,10 +852,13 @@ class DreamEngine:
                 except Exception:
                     pass
 
-            self._backend.finish_session(session_id, stats)
-
         except Exception as e:
             logger.debug("REM phase error: %s", e)
+        finally:
+            try:
+                self._backend.finish_session(session_id, stats)
+            except Exception as e:
+                logger.debug("REM finish_session failed: %s", e)
 
         return stats
 
@@ -931,10 +937,13 @@ class DreamEngine:
                     self._backend.add_insight(session_id, "bridge", bnode, content, 0.8)
                     stats["insights"] += 1
 
-            self._backend.finish_session(session_id, stats)
-
         except Exception as e:
             logger.debug("Insight phase error: %s", e)
+        finally:
+            try:
+                self._backend.finish_session(session_id, stats)
+            except Exception as e:
+                logger.debug("Insight finish_session failed: %s", e)
 
         return stats
 
@@ -976,30 +985,76 @@ class DreamEngine:
         return communities
 
     def _write_derived_cluster_memory(self, comm: List[int], content: str, confidence: float) -> int | None:
-        """Materialize a dream insight as a first-class derived memory."""
+        """Materialize a dream insight as a first-class derived memory.
+
+        Dedup strategy:
+        1) Reuse existing identical derived:cluster content when present.
+        2) Otherwise create a new memory entry (with conflict detection enabled).
+        """
         if not self._memory:
             return None
+
+        store = getattr(self._memory, "store", None)
+        if store is None and hasattr(self._memory, "_sqlite_memory"):
+            store = self._memory._sqlite_memory.store
+
+        derived_id: Optional[int] = None
+
+        # Reuse exact duplicate first to prevent unbounded growth.
+        if store is not None:
+            try:
+                lock = getattr(store, "_lock", None)
+                if lock is not None:
+                    with lock:
+                        row = store.conn.execute(
+                            "SELECT id FROM memories WHERE label = ? AND content = ? ORDER BY id DESC LIMIT 1",
+                            ("derived:cluster", content),
+                        ).fetchone()
+                else:
+                    row = store.conn.execute(
+                        "SELECT id FROM memories WHERE label = ? AND content = ? ORDER BY id DESC LIMIT 1",
+                        ("derived:cluster", content),
+                    ).fetchone()
+
+                if row is not None:
+                    derived_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                    try:
+                        store.touch(derived_id)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # No exact duplicate found: create one.
+        if derived_id is None:
+            try:
+                created = self._memory.remember(
+                    content,
+                    label="derived:cluster",
+                    auto_connect=False,
+                    detect_conflicts=True,
+                )
+                if isinstance(created, list):
+                    created = created[0]
+                derived_id = int(created)
+            except Exception:
+                return None
+
+        # Ensure derived_from links to source memories exist.
         try:
-            derived_id = self._memory.remember(
-                content,
-                label="derived:cluster",
-                auto_connect=False,
-                detect_conflicts=False,
-            )
-            if isinstance(derived_id, list):
-                derived_id = derived_id[0]
-        except Exception:
-            return None
-        try:
-            store = getattr(self._memory, "store", None)
-            if store is None and hasattr(self._memory, "_sqlite_memory"):
-                store = self._memory._sqlite_memory.store
+            if store is None:
+                store = getattr(self._memory, "store", None)
+                if store is None and hasattr(self._memory, "_sqlite_memory"):
+                    store = self._memory._sqlite_memory.store
             if store is not None:
+                link_weight = max(0.35, min(0.95, confidence))
                 for source_id in comm:
-                    if int(source_id) != int(derived_id):
-                        store.add_connection(int(derived_id), int(source_id), max(0.35, min(0.95, confidence)), edge_type="derived_from")
+                    sid = int(source_id)
+                    if sid != int(derived_id):
+                        store.add_connection(int(derived_id), sid, link_weight, edge_type="derived_from")
         except Exception:
             pass
+
         return int(derived_id)
 
     # -- Helpers -------------------------------------------------------------

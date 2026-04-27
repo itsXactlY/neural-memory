@@ -151,6 +151,8 @@ class DreamWorker:
         from embed_provider import EmbeddingProvider as _EP
         self.embedder = _EP()
         self._embedding_cache: Dict[int, List[float]] = {}
+        # Prevent unbounded RAM growth in daemon mode.
+        self._embedding_cache_max = max(128, int(os.environ.get("DREAM_EMBED_CACHE_MAX", "2048")))
 
     @staticmethod
     def _detect_backend() -> str:
@@ -171,7 +173,7 @@ class DreamWorker:
     # -- Embedding helpers ---------------------------------------------------
 
     def _get_embedding(self, memory_id: int, content: str) -> Optional[List[float]]:
-        """Get embedding for a memory, with caching."""
+        """Get embedding for a memory, with bounded caching."""
         if memory_id in self._embedding_cache:
             return self._embedding_cache[memory_id]
         if not content or not content.strip():
@@ -179,6 +181,9 @@ class DreamWorker:
         try:
             emb = self.embedder.embed(content[:512])
             self._embedding_cache[memory_id] = emb
+            # Bounded cache (FIFO by insertion order) to avoid daemon RAM bloat.
+            while len(self._embedding_cache) > self._embedding_cache_max:
+                self._embedding_cache.pop(next(iter(self._embedding_cache)))
             return emb
         except Exception as e:
             logger.debug("Embed failed for memory %d: %s", memory_id, e)
@@ -210,60 +215,68 @@ class DreamWorker:
         session_id = self.store.start_session("nrem")
         stats = {"processed": 0, "strengthened": 0, "weakened": 0, "pruned": 0}
 
-        # Build embedding index
-        logger.info("NREM: computing %d embeddings...", len(memories))
-        contents = [m["content"][:512] for m in memories if m["content"]]
-        mem_ids = [m["id"] for m in memories if m["content"]]
+        try:
+            # Build embedding index
+            logger.info("NREM: computing %d embeddings...", len(memories))
+            contents = [m["content"][:512] for m in memories if m["content"]]
+            mem_ids = [m["id"] for m in memories if m["content"]]
 
-        embeddings = self.embedder.embed_batch(contents)
-        embed_map = dict(zip(mem_ids, embeddings))
+            embeddings = self.embedder.embed_batch(contents)
+            embed_map = dict(zip(mem_ids, embeddings))
 
-        # For each memory, find which of its connections lead to similar content
-        logger.info("NREM: finding activated connections...")
-        activated_edges = set()
+            # For each memory, find which of its connections lead to similar content
+            logger.info("NREM: finding activated connections...")
+            activated_edges = set()
 
-        cursor = self.store.conn.cursor()
-        for mid in mem_ids:
-            if mid not in embed_map:
-                continue
-            mid_emb = embed_map[mid]
+            cursor = self.store.conn.cursor()
+            for mid in mem_ids:
+                if mid not in embed_map:
+                    continue
+                mid_emb = embed_map[mid]
 
-            # Get connections involving this memory
-            cursor.execute(
-                "SELECT source_id, target_id, weight FROM connections "
-                "WHERE source_id = ? OR target_id = ?",
-                (mid, mid)
-            )
-            for row in cursor.fetchall():
-                src, tgt, w = row
-                other_id = tgt if src == mid else src
-                if other_id in embed_map:
-                    sim = self._similarity(mid_emb, embed_map[other_id])
-                    if sim > 0.4:
-                        key = (min(src, tgt), max(src, tgt))
-                        activated_edges.add(key)
+                # Get connections involving this memory
+                cursor.execute(
+                    "SELECT source_id, target_id, weight FROM connections "
+                    "WHERE source_id = ? OR target_id = ?",
+                    (mid, mid)
+                )
+                for row in cursor.fetchall():
+                    src, tgt, w = row
+                    other_id = tgt if src == mid else src
+                    if other_id in embed_map:
+                        sim = self._similarity(mid_emb, embed_map[other_id])
+                        if sim > 0.4:
+                            key = (min(src, tgt), max(src, tgt))
+                            activated_edges.add(key)
 
-            stats["processed"] += 1
+                stats["processed"] += 1
 
-        # Strengthen activated connections
-        logger.info("NREM: strengthening %d connections...", len(activated_edges))
-        for (src, tgt) in activated_edges:
-            cursor.execute(
-                "UPDATE connections SET weight = CASE "
-                "WHEN weight + 0.05 > 1.0 THEN 1.0 ELSE weight + 0.05 END "
-                "WHERE source_id = ? AND target_id = ?",
-                (src, tgt)
-            )
-        self.store.conn.commit()
-        stats["strengthened"] = len(activated_edges)
+            # Strengthen activated connections
+            logger.info("NREM: strengthening %d connections...", len(activated_edges))
+            for (src, tgt) in activated_edges:
+                cursor.execute(
+                    "UPDATE connections SET weight = CASE "
+                    "WHEN weight + 0.05 > 1.0 THEN 1.0 ELSE weight + 0.05 END "
+                    "WHERE source_id = ? AND target_id = ?",
+                    (src, tgt)
+                )
+            self.store.conn.commit()
+            stats["strengthened"] = len(activated_edges)
 
-        # Prune
-        stats["pruned"] = self.store.prune_weak(0.05)
+            # Prune
+            stats["pruned"] = self.store.prune_weak(0.05)
 
-        self.store.finish_session(session_id, stats)
-        logger.info("NREM: %d processed, %d strengthened, %d weakened, %d pruned",
-                    stats["processed"], stats["strengthened"],
-                    stats["weakened"], stats["pruned"])
+            logger.info("NREM: %d processed, %d strengthened, %d weakened, %d pruned",
+                        stats["processed"], stats["strengthened"],
+                        stats["weakened"], stats["pruned"])
+        except Exception as e:
+            logger.debug("NREM phase error: %s", e)
+        finally:
+            try:
+                self.store.finish_session(session_id, stats)
+            except Exception as e:
+                logger.debug("NREM finish_session failed: %s", e)
+
         return stats
 
     # -- Phase 2: REM --------------------------------------------------------
@@ -284,48 +297,56 @@ class DreamWorker:
         session_id = self.store.start_session("rem")
         stats = {"explored": 0, "bridges": 0, "rejected": 0}
 
-        # Embed isolated memories
-        logger.info("REM: embedding %d isolated memories...", len(isolated))
-        iso_embeds: Dict[int, List[float]] = {}
-        for mem in isolated:
-            emb = self._get_embedding(mem["id"], mem["content"])
-            if emb:
-                iso_embeds[mem["id"]] = emb
+        try:
+            # Embed isolated memories
+            logger.info("REM: embedding %d isolated memories...", len(isolated))
+            iso_embeds: Dict[int, List[float]] = {}
+            for mem in isolated:
+                emb = self._get_embedding(mem["id"], mem["content"])
+                if emb:
+                    iso_embeds[mem["id"]] = emb
 
-        # Get a sample of ALL memories for comparison
-        all_recent = self.store.get_recent_memories(500)
-        logger.info("REM: embedding %d comparison memories...", len(all_recent))
-        comp_embeds: Dict[int, List[float]] = {}
-        for mem in all_recent:
-            if mem["id"] in iso_embeds:
-                continue
-            emb = self._get_embedding(mem["id"], mem["content"])
-            if emb:
-                comp_embeds[mem["id"]] = emb
+            # Get a sample of ALL memories for comparison
+            all_recent = self.store.get_recent_memories(500)
+            logger.info("REM: embedding %d comparison memories...", len(all_recent))
+            comp_embeds: Dict[int, List[float]] = {}
+            for mem in all_recent:
+                if mem["id"] in iso_embeds:
+                    continue
+                emb = self._get_embedding(mem["id"], mem["content"])
+                if emb:
+                    comp_embeds[mem["id"]] = emb
 
-        # Find bridges: for each isolated memory, find similar unconnected
-        for iso_id, iso_emb in iso_embeds.items():
-            similarities = []
-            for comp_id, comp_emb in comp_embeds.items():
-                sim = self._similarity(iso_emb, comp_emb)
-                if 0.3 < sim < 0.95:
-                    similarities.append((comp_id, sim))
+            # Find bridges: for each isolated memory, find similar unconnected
+            for iso_id, iso_emb in iso_embeds.items():
+                similarities = []
+                for comp_id, comp_emb in comp_embeds.items():
+                    sim = self._similarity(iso_emb, comp_emb)
+                    if 0.3 < sim < 0.95:
+                        similarities.append((comp_id, sim))
 
-            # Sort by similarity, take top 3
-            similarities.sort(key=lambda x: -x[1])
-            for comp_id, sim in similarities[:3]:
-                bridge_weight = round(sim * 0.3, 3)
-                self.store.add_bridge(iso_id, comp_id, bridge_weight)
-                self.store.log_connection_change(
-                    iso_id, comp_id, 0.0, bridge_weight, "rem_bridge"
-                )
-                stats["bridges"] += 1
+                # Sort by similarity, take top 3
+                similarities.sort(key=lambda x: -x[1])
+                for comp_id, sim in similarities[:3]:
+                    bridge_weight = round(sim * 0.3, 3)
+                    self.store.add_bridge(iso_id, comp_id, bridge_weight)
+                    self.store.log_connection_change(
+                        iso_id, comp_id, 0.0, bridge_weight, "rem_bridge"
+                    )
+                    stats["bridges"] += 1
 
-            stats["explored"] += 1
+                stats["explored"] += 1
 
-        self.store.finish_session(session_id, stats)
-        logger.info("REM: %d explored, %d bridges created",
-                    stats["explored"], stats["bridges"])
+            logger.info("REM: %d explored, %d bridges created",
+                        stats["explored"], stats["bridges"])
+        except Exception as e:
+            logger.debug("REM phase error: %s", e)
+        finally:
+            try:
+                self.store.finish_session(session_id, stats)
+            except Exception as e:
+                logger.debug("REM finish_session failed: %s", e)
+
         return stats
 
     # -- Phase 3: Insights ---------------------------------------------------
@@ -336,89 +357,97 @@ class DreamWorker:
         stats = {"communities": 0, "bridges": 0, "insights": 0}
         session_id = self.store.start_session("insight")
 
-        edges = self.store.get_connections()
-        if not edges:
-            return stats
+        try:
+            edges = self.store.get_connections()
+            if not edges:
+                return stats
 
-        # Build adjacency
-        adj: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
-        nodes = set()
-        for e in edges:
-            s, t, w = e["source_id"], e["target_id"], e["weight"]
-            if w >= 0.3:
-                adj[s].append((t, w))
-                adj[t].append((s, w))
-                nodes.add(s)
-                nodes.add(t)
-
-        # Connected components (BFS)
-        visited = set()
-        communities: List[List[int]] = []
-        for node in nodes:
-            if node in visited:
-                continue
-            component = []
-            queue = [node]
-            while queue:
-                curr = queue.pop(0)
-                if curr in visited:
-                    continue
-                visited.add(curr)
-                component.append(curr)
-                for neighbor, _ in adj.get(curr, []):
-                    if neighbor not in visited:
-                        queue.append(neighbor)
-            communities.append(component)
-
-        stats["communities"] = len(communities)
-        logger.info("Insight: found %d communities", len(communities))
-
-        # Map nodes to communities
-        node_to_comm = {}
-        for i, comm in enumerate(communities):
-            for node in comm:
-                node_to_comm[node] = i
-
-        # Find bridge nodes
-        bridge_nodes = set()
-        for e in edges:
-            if e["weight"] < 0.3:
-                continue
-            s_comm = node_to_comm.get(e["source_id"], -1)
-            t_comm = node_to_comm.get(e["target_id"], -1)
-            if s_comm != t_comm and s_comm >= 0 and t_comm >= 0:
-                bridge_nodes.add(e["source_id"])
-                bridge_nodes.add(e["target_id"])
-
-        stats["bridges"] = len(bridge_nodes)
-
-        # Cluster insights (only for communities >= 5 members)
-        for i, comm in enumerate(communities):
-            if len(comm) < 5:
-                continue
-            theme = self._extract_theme(comm)
-            confidence = min(len(comm) / 20.0, 1.0)
-            content = f"Cluster of {len(comm)} memories: {theme}"
-            self.store.add_insight(session_id, "cluster", comm[0], content, confidence)
-            stats["insights"] += 1
-
-        # Bridge insights
-        for bnode in bridge_nodes:
-            bridging_communities = set()
+            # Build adjacency
+            adj: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+            nodes = set()
             for e in edges:
-                if e["source_id"] == bnode or e["target_id"] == bnode:
-                    other = e["target_id"] if e["source_id"] == bnode else e["source_id"]
-                    bridging_communities.add(node_to_comm.get(other, -1))
-            bridging_communities.discard(-1)
+                s, t, w = e["source_id"], e["target_id"], e["weight"]
+                if w >= 0.3:
+                    adj[s].append((t, w))
+                    adj[t].append((s, w))
+                    nodes.add(s)
+                    nodes.add(t)
 
-            if len(bridging_communities) >= 3:
-                content = f"Bridge connecting {len(bridging_communities)} communities, memory #{bnode}"
-                self.store.add_insight(session_id, "bridge", bnode, content, 0.8)
+            # Connected components (BFS)
+            visited = set()
+            communities: List[List[int]] = []
+            for node in nodes:
+                if node in visited:
+                    continue
+                component = []
+                queue = [node]
+                while queue:
+                    curr = queue.pop(0)
+                    if curr in visited:
+                        continue
+                    visited.add(curr)
+                    component.append(curr)
+                    for neighbor, _ in adj.get(curr, []):
+                        if neighbor not in visited:
+                            queue.append(neighbor)
+                communities.append(component)
+
+            stats["communities"] = len(communities)
+            logger.info("Insight: found %d communities", len(communities))
+
+            # Map nodes to communities
+            node_to_comm = {}
+            for i, comm in enumerate(communities):
+                for node in comm:
+                    node_to_comm[node] = i
+
+            # Find bridge nodes
+            bridge_nodes = set()
+            for e in edges:
+                if e["weight"] < 0.3:
+                    continue
+                s_comm = node_to_comm.get(e["source_id"], -1)
+                t_comm = node_to_comm.get(e["target_id"], -1)
+                if s_comm != t_comm and s_comm >= 0 and t_comm >= 0:
+                    bridge_nodes.add(e["source_id"])
+                    bridge_nodes.add(e["target_id"])
+
+            stats["bridges"] = len(bridge_nodes)
+
+            # Cluster insights (only for communities >= 5 members)
+            for i, comm in enumerate(communities):
+                if len(comm) < 5:
+                    continue
+                theme = self._extract_theme(comm)
+                confidence = min(len(comm) / 20.0, 1.0)
+                content = f"Cluster of {len(comm)} memories: {theme}"
+                self.store.add_insight(session_id, "cluster", comm[0], content, confidence)
                 stats["insights"] += 1
 
-        self.store.finish_session(session_id, stats)
-        logger.info("Insight: %d communities, %d bridges, %d insights",
-                    stats["communities"], stats["bridges"], stats["insights"])
+            # Bridge insights
+            for bnode in bridge_nodes:
+                bridging_communities = set()
+                for e in edges:
+                    if e["source_id"] == bnode or e["target_id"] == bnode:
+                        other = e["target_id"] if e["source_id"] == bnode else e["source_id"]
+                        bridging_communities.add(node_to_comm.get(other, -1))
+                bridging_communities.discard(-1)
+
+                if len(bridging_communities) >= 3:
+                    content = f"Bridge connecting {len(bridging_communities)} communities, memory #{bnode}"
+                    self.store.add_insight(session_id, "bridge", bnode, content, 0.8)
+                    stats["insights"] += 1
+
+            logger.info("Insight: %d communities, %d bridges, %d insights",
+                        stats["communities"], stats["bridges"], stats["insights"])
+        except Exception as e:
+            logger.debug("Insight phase error: %s", e)
+        finally:
+            try:
+                self.store.finish_session(session_id, stats)
+            except Exception as e:
+                logger.debug("Insight finish_session failed: %s", e)
+
         return stats
 
     def _extract_theme(self, node_ids: List[int]) -> str:
@@ -465,17 +494,29 @@ class DreamWorker:
         start = time.time()
         result: Dict[str, Any] = {}
 
-        if phase in ("all", "nrem"):
-            result["nrem"] = self.phase_nrem()
+        try:
+            if phase in ("all", "nrem"):
+                result["nrem"] = self.phase_nrem()
 
-        if phase in ("all", "rem"):
-            result["rem"] = self.phase_rem()
+            if phase in ("all", "rem"):
+                result["rem"] = self.phase_rem()
 
-        if phase in ("all", "insight"):
-            result["insights"] = self.phase_insights()
+            if phase in ("all", "insight"):
+                result["insights"] = self.phase_insights()
 
-        result["duration"] = time.time() - start
-        return result
+            result["duration"] = time.time() - start
+            return result
+        finally:
+            # Hard cleanup to prevent cache accumulation in long-lived daemon mode.
+            cached = len(self._embedding_cache)
+            self._embedding_cache.clear()
+            if cached:
+                logger.debug("Dream cycle cache cleanup: cleared %d embeddings", cached)
+            try:
+                import gc
+                gc.collect()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +539,10 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Keep model on GPU during dream cycles — prevent idle eject timer from
+    # evicting during long non-embedding phases (e.g. 57s Insight BFS).
+    os.environ["EMBED_IDLE_TIMEOUT"] = "0"
 
     worker = DreamWorker(backend=args.backend, db_path=args.db)
 

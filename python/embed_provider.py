@@ -82,6 +82,7 @@ class SharedEmbedServer:
     def _load_model(self):
         from sentence_transformers import SentenceTransformer
         import torch
+        import time as time_module
         
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         
@@ -123,11 +124,44 @@ class SharedEmbedServer:
             raise FileNotFoundError(f"No cached model: {self.model_name}")
         
         print(f"[embed-server] Loading {model_path} on {device}...")
+        
+        # If target is CUDA, wait for sufficient GPU memory (no silent fallback)
+        if device == 'cuda':
+            self._wait_for_gpu_memory(min_free_mb=2000, timeout=120, poll_interval=5)
+        
         self.model = SentenceTransformer(model_path, device=device)
         self.dim = self.model.get_sentence_embedding_dimension()
         self._original_device = device
         self._last_used = time.time()
         print(f"[embed-server] Ready: {self.model_name} ({self.dim}d) on {device}")
+    
+    def _wait_for_gpu_memory(self, min_free_mb: float = 2000, timeout: float = 120, poll_interval: float = 5):
+        """Wait for sufficient GPU memory to be available.
+        
+        Policy: GPU FIRST — if CUDA was chosen as target, wait for memory.
+        Do NOT fall back to CPU silently.
+        """
+        import torch
+        import time as time_module
+        
+        deadline = time_module.time() + timeout
+        attempt = 0
+        
+        while time_module.time() < deadline:
+            attempt += 1
+            free = torch.cuda.mem_get_info(0)[0] / 1024**2
+            if free >= min_free_mb:
+                if attempt > 1:
+                    print(f"[embed-server] GPU memory sufficient: {free:.0f} MB (after {attempt} attempts)")
+                return
+            if attempt <= 3:
+                print(f"[embed-server] WARNING: Only {free:.0f}MB free GPU memory, need {min_free_mb}MB+ (attempt {attempt}, waiting {poll_interval}s...)", file=sys.stderr)
+            time_module.sleep(poll_interval)
+        
+        # Timeout — GPU genuinely unavailable
+        print(f"[embed-server] FATAL: GPU memory timeout ({free:.0f}MB < {min_free_mb}MB after {timeout}s)", file=sys.stderr)
+        print(f"[embed-server] Policy: NO FALLBACK — GPU was target, not falling back to CPU", file=sys.stderr)
+        raise RuntimeError(f"GPU memory insufficient after {timeout}s: {free:.0f}MB < {min_free_mb}MB")
     
     def _start_listener(self):
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -209,26 +243,54 @@ class SharedEmbedServer:
             except Exception as e:
                 return {"ok": False, "error": str(e)}
     
-    def _ensure_on_device(self):
-        if self._original_device == 'cpu':
+    def _ensure_on_device(self, timeout: float = 60.0, poll_interval: float = 2.0):
+        """Ensure model is on GPU, waiting if necessary. Raises on failure.
+        
+        Policy: GPU FIRST — wait for GPU, never silently fall back to CPU.
+        This runs in the shared server process and must enforce the same
+        no-fallback rule to prevent CUDA crashes from silent degradation.
+        """
+        import torch
+        import time as time_module
+        
+        if self._original_device != 'cuda':
             return True
-        try:
-            import torch
-            current = next(self.model.parameters()).device
-            if current.type == 'cpu' and self._original_device == 'cuda':
+        
+        current = next(self.model.parameters()).device
+        if current.type != 'cpu':
+            return True  # Already on GPU
+        
+        # Model is on CPU but CUDA was intended — wait and retry
+        deadline = time_module.time() + timeout
+        attempt = 0
+        last_error = None
+        
+        while time_module.time() < deadline:
+            attempt += 1
+            try:
                 free = torch.cuda.mem_get_info(0)[0] / 1024**2
                 if free < 500:
-                    print(f"[embed-server] WARNING: Only {free:.0f}MB free VRAM, staying on CPU", file=sys.stderr)
-                    return False
+                    last_error = f"GPU memory critically low: {free:.0f}MB"
+                    if attempt <= 3:
+                        print(f"[embed-server] WARNING: {last_error}, waiting... ({attempt})", file=sys.stderr)
+                    time_module.sleep(poll_interval)
+                    continue
+                
                 self.model.to('cuda')
-                print(f"[embed-server] Reloaded to GPU")
-            elif current.type == 'cpu' and self._original_device == 'mps':
-                self.model.to('mps')
-                print(f"[embed-server] Reloaded to MPS")
-            return True
-        except Exception as e:
-            print(f"[embed-server] GPU reload failed: {e}, staying on CPU", file=sys.stderr)
-            return False
+                torch.cuda.synchronize()
+                print(f"[embed-server] Reloaded to GPU after {attempt} attempt(s)")
+                return True
+                
+            except Exception as e:
+                last_error = str(e)
+                if attempt <= 3:
+                    print(f"[embed-server] GPU reload attempt {attempt} failed: {last_error}, retrying...", file=sys.stderr)
+                time_module.sleep(poll_interval)
+        
+        # Timeout — GPU genuinely unavailable
+        print(f"[embed-server] FATAL: GPU reload timed out after {attempt} attempts", file=sys.stderr)
+        print(f"[embed-server] Policy: NO FALLBACK — GPU was intended, not falling back to CPU", file=sys.stderr)
+        raise RuntimeError(f"GPU unavailable after {attempt} attempts: {last_error}")
     
     def _eject_to_cpu(self):
         try:
@@ -441,6 +503,7 @@ class SentenceTransformerBackend:
         from sentence_transformers import SentenceTransformer
         import torch
         import threading
+        import time as time_module
         
         if SentenceTransformerBackend._lock is None:
             SentenceTransformerBackend._lock = threading.Lock()
@@ -480,6 +543,10 @@ class SentenceTransformerBackend:
         if model_path is None:
             raise FileNotFoundError(f"No cached model: {self.MODEL_NAME}")
         
+        # GPU-FIRST: if CUDA was chosen, wait for memory (no silent fallback)
+        if device == 'cuda':
+            _wait_for_gpu(self, min_free_mb=2000, timeout=120, poll_interval=5)
+        
         print(f"[embed] Loading {model_path} directly on {device}...")
         self.model = SentenceTransformer(model_path, device=device)
         self.dim = self.model.get_sentence_embedding_dimension()
@@ -487,7 +554,7 @@ class SentenceTransformerBackend:
         SentenceTransformerBackend._shared_dim = self.dim
         SentenceTransformerBackend._shared_device = device
         print(f"[embed] {self.MODEL_NAME} ready ({self.dim}d)")
-    
+
     def embed(self, text: str) -> list[float]:
         if self._is_client:
             try:
@@ -496,16 +563,15 @@ class SentenceTransformerBackend:
                 print(f"[embed] Server timeout ({e}), reconnecting...", file=sys.stderr)
                 try:
                     self._client.close()
-                except:
+                except Exception:
                     pass
-                # Reconnect — server should be on GPU now
                 self._client = SharedEmbedClient(timeout=15.0)
                 return self._client.embed(text)
         SentenceTransformerBackend._touch()
         SentenceTransformerBackend._ensure_on_device()
         vec = self.model.encode(text, normalize_embeddings=True)
         return vec.tolist()
-    
+
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if self._is_client:
             try:
@@ -514,7 +580,7 @@ class SentenceTransformerBackend:
                 print(f"[embed] Server timeout ({e}), reconnecting...", file=sys.stderr)
                 try:
                     self._client.close()
-                except:
+                except Exception:
                     pass
                 self._client = SharedEmbedClient(timeout=15.0)
                 return self._client.embed_batch(texts)
@@ -522,43 +588,60 @@ class SentenceTransformerBackend:
         SentenceTransformerBackend._ensure_on_device()
         vecs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
         return [v.tolist() for v in vecs]
-    
+
     @classmethod
     def _touch(cls):
         """Record last use time for idle eject timer."""
         cls._last_used = time.time()
-    
+
     @classmethod
-    def _ensure_on_device(cls):
-        """Ensure model is on GPU (reloads from CPU if necessary)."""
+    def _ensure_on_device(cls, timeout: float = 60.0, poll_interval: float = 2.0):
+        import torch
+        import time as time_module
+
         if cls._shared_device != 'cuda':
             return
-        try:
-            import torch
-            if cls._shared_model is None:
-                return
-            current = next(cls._shared_model.parameters()).device
-            if current.type == 'cpu':
+        if cls._shared_model is None:
+            return
+        current = next(cls._shared_model.parameters()).device
+        if current.type != 'cpu':
+            return
+
+        deadline = time_module.time() + timeout
+        attempt = 0
+        last_error = None
+        while time_module.time() < deadline:
+            attempt += 1
+            try:
                 free = torch.cuda.mem_get_info(0)[0] / 1024**2
                 if free < 500:
-                    return
+                    last_error = f"GPU memory critically low: {free:.0f}MB"
+                    if attempt == 1:
+                        print(f"[embed] WARNING: {last_error}, waiting... ({attempt})", file=sys.stderr)
+                    time_module.sleep(poll_interval)
+                    continue
                 cls._shared_model.to('cuda')
-                print("[embed] Reloaded to GPU")
-        except Exception as e:
-            print(f"[embed] GPU reload failed: {e}", file=sys.stderr)
+                torch.cuda.synchronize()
+                print(f"[embed] Reloaded to GPU after {attempt} attempt(s)")
+                return
+            except Exception as e:
+                last_error = str(e)
+                if attempt <= 3:
+                    print(f"[embed] GPU reload attempt {attempt} failed: {last_error}, retrying...", file=sys.stderr)
+                time_module.sleep(poll_interval)
+        print(f"[embed] FATAL: GPU reload timed out after {attempt} attempts. Last error: {last_error}", file=sys.stderr)
+        raise RuntimeError(f"GPU unavailable after {attempt} attempts: {last_error}")
 
     @classmethod
     def eject(cls):
         """Manually eject model to CPU (frees GPU memory now)."""
-        # Try shared server eject
         try:
             client = SharedEmbedClient()
             client._send({"cmd": "eject"})
             client.close()
             return
-        except:
+        except Exception:
             pass
-        # Direct model eject
         if cls._shared_model is None:
             return
         try:
@@ -571,21 +654,18 @@ class SentenceTransformerBackend:
                 print(f"[embed] Ejected to CPU")
         except Exception as e:
             print(f"[embed] Eject failed: {e}", file=sys.stderr)
-    
+
     @classmethod
     def status(cls):
         """Return model status dict."""
-        # Try shared server status
         try:
             client = SharedEmbedClient()
             resp = client._send({"cmd": "status"})
             client.close()
             resp["mode"] = "shared"
             return resp
-        except:
+        except Exception:
             pass
-        
-        # Direct model status
         if cls._shared_model is None:
             return {"loaded": False, "mode": "none"}
         try:
@@ -601,8 +681,29 @@ class SentenceTransformerBackend:
                 "eject_timeout": cls.IDLE_TIMEOUT,
                 "ejected": device.type == 'cpu' and cls._shared_device != 'cpu',
             }
-        except:
+        except Exception:
             return {"loaded": True, "mode": "direct", "error": "could not determine status"}
+
+
+def _wait_for_gpu(min_free_mb: float = 2000, timeout: float = 120, poll_interval: float = 5):
+    """Wait for sufficient GPU memory. Raises on timeout (no fallback)."""
+    import torch
+    import time as time_module
+
+    deadline = time_module.time() + timeout
+    attempt = 0
+    while time_module.time() < deadline:
+        attempt += 1
+        free = torch.cuda.mem_get_info(0)[0] / 1024**2
+        if free >= min_free_mb:
+            if attempt > 1:
+                print(f"[embed] GPU memory sufficient: {free:.0f} MB (after {attempt} attempts)")
+            return
+        if attempt <= 3:
+            print(f"[embed] WARNING: Only {free:.0f}MB free GPU memory, need {min_free_mb}MB+ (attempt {attempt}, waiting {poll_interval}s...)", file=sys.stderr)
+        time_module.sleep(poll_interval)
+    print(f"[embed] FATAL: GPU memory timeout ({free:.0f}MB < {min_free_mb}MB after {timeout}s)", file=sys.stderr)
+    raise RuntimeError(f"GPU memory insufficient after {timeout}s: {free:.0f}MB < {min_free_mb}MB")
 
 
 class TfidfSvdBackend:
@@ -941,11 +1042,19 @@ class EmbeddingProvider:
                 pass  # No server running, fall through to direct load
 
         # 1. CUDA sentence-transformers (user's RTX 4060 Ti has 15GB VRAM)
+        # Policy: GPU FIRST — if CUDA is available and we attempt it, do NOT fall back
+        # to FastEmbed/CPU on failure. Either GPU succeeds or we raise.
         if torch and torch.cuda.is_available():
             try:
                 free = torch.cuda.mem_get_info(0)[0] / 1024**2
                 if free > 2000:  # At least 2GB VRAM for batching
                     backend = SentenceTransformerBackend()
+                    # SentenceTransformerBackend() may have started the shared server
+                    # and connected as a client. If so, the model is already loaded in
+                    # the server process — return immediately without loading it again.
+                    if backend._is_client:
+                        print(f"[embed] Auto-selected: sentence-transformers CUDA ({backend.dim}d, {free:.0f}MB free)")
+                        return backend
                     backend._is_client = False
                     # Force CUDA load directly
                     backend._load_direct = lambda: None  # prevent recursion
@@ -976,7 +1085,13 @@ class EmbeddingProvider:
                         print(f"[embed] Auto-selected: sentence-transformers CUDA ({backend.dim}d, {free:.0f}MB free)")
                         return backend
             except (ImportError, Exception) as e:
-                print(f"[embed] CUDA sentence-transformers failed: {e}", file=sys.stderr)
+                # CUDA was available and we attempted it — GPU was the target.
+                # Do NOT fall back to FastEmbed/CPU. Raise immediately.
+                print(f"[embed] CUDA sentence-transformers FAILED (GPU was target, not falling back): {e}", file=sys.stderr)
+                raise RuntimeError(f"CUDA embedding failed and no fallback allowed by policy: {e}") from e
+
+        # Below this line: CUDA was NOT available — these are legitimate fallbacks
+        # for systems WITHOUT GPU access. NOT for systems that chose GPU and failed.
 
         # 2. FastEmbed ONNX (CPU, no PyTorch dependency, fast)
         try:
