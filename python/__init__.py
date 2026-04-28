@@ -929,7 +929,14 @@ class NeuralMemoryProvider(MemoryProvider):
             return ""
 
     def shutdown(self) -> None:
-        """Clean shutdown."""
+        """Clean shutdown.
+
+        Stops every background thread the provider owns: dream engine,
+        consolidation loop, and the sponge worker. Previous code skipped
+        the sponge worker entirely, so an orderly shutdown leaked the
+        sponge thread on every exit (it survived only because it's a
+        daemon thread, not because shutdown handled it).
+        """
         # Stop dream engine
         if hasattr(self, '_dream') and self._dream:
             try:
@@ -937,9 +944,16 @@ class NeuralMemoryProvider(MemoryProvider):
             except Exception:
                 pass
             self._dream = None
+        # Stop consolidation
         self._consolidation_stop.set()
         if self._consolidation_thread and self._consolidation_thread.is_alive():
             self._consolidation_thread.join(timeout=2.0)
+        # Stop sponge worker (was leaked previously)
+        try:
+            if hasattr(self, '_sponge_running') and self._sponge_running:
+                self._stop_sponge()
+        except Exception as e:
+            logger.debug("Sponge stop during shutdown failed: %s", e)
         if self._memory:
             try:
                 self._memory.close()
