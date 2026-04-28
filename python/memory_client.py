@@ -184,7 +184,15 @@ class SQLiteStore:
         self._fts_available = self._ensure_fts()
         self.conn.commit()
         self._lock = threading.Lock()
-        self._checkpoint_thread = threading.Thread(target=self._bg_checkpoint, daemon=True)
+        # Stop event for bg_checkpoint — without it, close() would leave the
+        # thread running forever (waking every 60s to call .execute on a
+        # closed connection, eat the exception, sleep again). With many
+        # short-lived SQLiteStore instances (test runs, tools), that's a
+        # thread-leak per close. Daemon=True only saves us at process exit.
+        self._stop_checkpoint = threading.Event()
+        self._checkpoint_thread = threading.Thread(
+            target=self._bg_checkpoint, daemon=True, name="sqlite-wal-checkpoint",
+        )
         self._checkpoint_thread.start()
 
     def get_meta(self, key: str) -> Optional[str]:
@@ -298,12 +306,16 @@ class SQLiteStore:
         return conn
 
     def _bg_checkpoint(self):
-        while True:
-            time.sleep(60)
+        # Wait on the stop event instead of plain time.sleep so close() can
+        # signal an immediate exit. wait(60) returns True if the event was
+        # set during the wait — that's our shutdown signal.
+        while not self._stop_checkpoint.wait(60):
             try:
                 with self._lock:
                     self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             except Exception:
+                # On a closed connection (post-close race) this raises;
+                # the stop event will fire next iteration and break us out.
                 pass
 
     @staticmethod
@@ -670,6 +682,13 @@ class SQLiteStore:
         return {"memories": mem_count, "connections": conn_count, "revisions": rev_count, "fts": self._fts_available}
 
     def close(self):
+        # Signal the bg_checkpoint thread to stop and give it a brief window
+        # to exit cleanly before we close the connection out from under it.
+        # daemon=True still saves us at process exit, but during in-process
+        # store lifecycle (tests, tools) we want a clean teardown.
+        self._stop_checkpoint.set()
+        if self._checkpoint_thread is not None and self._checkpoint_thread.is_alive():
+            self._checkpoint_thread.join(timeout=2.0)
         self.conn.close()
 
 
