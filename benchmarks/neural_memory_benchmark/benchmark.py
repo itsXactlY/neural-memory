@@ -57,6 +57,8 @@ ALL_SUITES = [
     # v3 suites — codex audit 2026-04-28 follow-ups:
     "graph_reasoning", "channel_ablation", "hnsw_exactness",
     "dream_derived_fact", "continuity_controls",
+    # v5 suites — codex 2026-04-28 caveat fixes:
+    "lean_skynet",
 ]
 
 
@@ -240,6 +242,15 @@ def _run_conflict_quality(cfg, memories, queries):
     return bm.run()
 
 
+def _run_lean_skynet(cfg, memories, queries):
+    from suites.lean_skynet import LeanSkynetBenchmark
+    return LeanSkynetBenchmark(
+        memories=memories,
+        queries=queries,
+        output_dir=cfg.paths.results_dir,
+    ).run()
+
+
 def _run_baseline(cfg, memories, queries):
     from suites.baseline import BaselineComparisonBenchmark
     bm = BaselineComparisonBenchmark(
@@ -325,6 +336,8 @@ SUITE_RUNNERS = {
     "hnsw_exactness":     _run_hnsw_exactness,
     "dream_derived_fact": _run_dream_derived_fact,
     "continuity_controls": _run_continuity_controls,
+    # v5 suites — codex 2026-04-28 caveat fixes:
+    "lean_skynet":        _run_lean_skynet,
 }
 
 
@@ -376,12 +389,25 @@ class NeuralMemoryBenchmark:
         print(f"Started: {datetime.now().isoformat()}")
 
         print(banner("Generating Dataset"))
+        # Realistic mode: real prose from the project itself (.md + .py).
+        # Codex v5 caveat — "synthetic data only" — addressed by
+        # dataset_real.RealTextGenerator which produces (chunk, query)
+        # pairs over actual repository text. Anchors are real
+        # identifiers (snake_case / CamelCase / *.py) that occur in
+        # exactly one chunk thanks to the global registry.
+        if getattr(self.cfg, "realistic", False):
+            from dataset_real import RealTextGenerator
+            n = self.cfg.dataset.queries_per_tier or 200
+            rgen = RealTextGenerator(seed=self.cfg.dataset.seed)
+            memories, queries = rgen.generate(n)
+            print(f"Generated {len(memories)} REAL-TEXT memories from project corpus")
+            print(f"Generated {len(queries)} concept queries over real prose")
         # Paraphrase mode swaps the bag-of-tokens query generator for the
         # disjoint-vocabulary one in dataset_v2. The synthetic anchor
         # tokens make ground-truth a 1:1 lookup that can't be cheated by
         # lexical overlap, so the v2 suites (diversity / lstm_knn /
         # baseline / dream-recall-quality) have a clean signal.
-        if getattr(self.cfg, "paraphrase", False):
+        elif getattr(self.cfg, "paraphrase", False):
             from dataset_v2 import ParaphraseGenerator
             n = self.cfg.dataset.queries_per_tier or 200
             pgen = ParaphraseGenerator(seed=self.cfg.dataset.seed)
@@ -491,6 +517,11 @@ Examples:
                         help="Use the disjoint-vocabulary paraphrase dataset "
                              "(dataset_v2) for queries — required for the v2 "
                              "suites (diversity, lstm_knn, baseline, dream).")
+    parser.add_argument("--realistic", action="store_true",
+                        help="Use real prose from the project itself "
+                             "(dataset_real) — addresses the codex v5 "
+                             "'synthetic-only' caveat. Mutually exclusive "
+                             "with --paraphrase; --realistic wins.")
 
     args = parser.parse_args()
 
@@ -512,6 +543,7 @@ Examples:
     cfg.suites = args.suites or []
     cfg.dry_run = args.dry_run
     cfg.paraphrase = bool(args.paraphrase)
+    cfg.realistic = bool(args.realistic)
 
     if args.dry_run:
         print("Generating dataset only (dry run)...")

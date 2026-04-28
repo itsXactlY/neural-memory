@@ -761,7 +761,21 @@ class NeuralMemory:
         # Hard noise floor: drop any result whose final relevance lands below
         # this. Off by default; set to e.g. 0.15 to refuse to surface garbage
         # when nothing relevant exists, instead of returning weak top-k.
+        # NOTE: relevance is RRF-derived and operates in ~[0, 0.05]; the
+        # codex 2026-04-28 benchmark caught that values >= 0.2 nuke
+        # everything. Use the new `score_percentile` kwarg on recall() for
+        # a properly calibrated [0,1] alternative.
         self._recall_score_floor = max(0.0, float(recall_score_floor or 0.0))
+        # Default channel mix. The 2026-04-28 benchmark's channel_ablation
+        # measured per-channel contribution on paraphrase data:
+        #   ppr      Δmrr=-0.1216 (most helpful)
+        #   semantic Δmrr=-0.0416
+        #   entity   Δmrr=-0.0216 / Δrecall=-0.04
+        #   bm25     null
+        #   temporal null
+        #   salience Δmrr=+0.0064 (slightly harmful when ON)
+        # Defaults preserved for backwards compatibility — but
+        # retrieval_mode="lean" zeroes the dead-weight channels.
         self._channel_weights = {
             "semantic": 1.0,
             "bm25": 0.9,
@@ -770,6 +784,16 @@ class NeuralMemory:
             "ppr": 0.55,
             "salience": 0.25,
         }
+        # Lean preset: only the channels that empirically pull weight on the
+        # 2026-04-28 benchmark. Halves skynet's candidate-channel surface
+        # area, which is the dominant cost in p50 latency. Opt-in via
+        # retrieval_mode="lean"; existing modes unchanged.
+        if self._retrieval_mode == "lean":
+            self._channel_weights.update({
+                "bm25": 0.0,
+                "temporal": 0.0,
+                "salience": 0.0,
+            })
         if isinstance(channel_weights, dict):
             self._channel_weights.update({k: float(v) for k, v in channel_weights.items() if v is not None})
 
@@ -1431,6 +1455,14 @@ class NeuralMemory:
         at_time: Optional[float] = None,
         mmr_lambda: Optional[float] = None,
         score_floor: Optional[float] = None,
+        # score_percentile: drop the bottom X fraction of candidates BY
+        # RANK before truncating to k. Calibrated [0,1] alternative to
+        # score_floor (which operates on the RRF-derived raw relevance
+        # scale ~[0, 0.05] and is therefore badly calibrated — codex
+        # 2026-04-28 benchmark caught that score_floor>=0.2 nukes
+        # results). e.g. score_percentile=0.5 keeps the top half of
+        # ranked candidates. Off by default (0.0).
+        score_percentile: Optional[float] = None,
     ) -> list[dict]:
         if k <= 0:
             return []
@@ -1438,7 +1470,9 @@ class NeuralMemory:
         now = time.time()
         limit = max(k * 4, self._retrieval_candidates)
         if hybrid is None:
-            hybrid = self._retrieval_mode in {"hybrid", "advanced", "skynet"}
+            # `lean` is the cost-conscious skynet variant (zeroes dead-weight
+            # channels per benchmark findings) — still hybrid retrieval.
+            hybrid = self._retrieval_mode in {"hybrid", "advanced", "skynet", "lean"}
 
         if hybrid:
             channels = self._parallel_retrieve(query, query_vec, limit, now)
@@ -1533,6 +1567,16 @@ class NeuralMemory:
         floor = self._recall_score_floor if score_floor is None else float(score_floor or 0.0)
         if floor > 0.0:
             results = [r for r in results if r.get("relevance", 0.0) >= floor]
+
+        # Calibrated percentile alternative: keep only the top (1-pct)
+        # fraction by rank. Operates on the sorted result list, not on
+        # raw RRF scores, so it's well-defined regardless of the
+        # underlying relevance scale. e.g. score_percentile=0.5 → keep
+        # top half. Combines with score_floor — both are applied if set.
+        pct = float(score_percentile or 0.0)
+        if pct > 0.0:
+            keep_n = max(1, int(round(len(results) * (1.0 - min(1.0, pct)))))
+            results = results[:keep_n]
 
         # MMR diversification: trade marginal relevance for non-redundancy in
         # the returned set. Greedy O(k * |candidates|), bounded by k * limit.

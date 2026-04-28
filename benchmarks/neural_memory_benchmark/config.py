@@ -255,6 +255,12 @@ class BenchmarkConfig:
     # suites that depend on 1:1 ground truth.
     paraphrase: bool = False
 
+    # Use the real-text dataset (dataset_real) — chunks pulled from the
+    # project's own .md/.py prose, anchored by real CamelCase / snake_case
+    # / *.py tokens. Addresses codex v5's "synthetic data only" caveat.
+    # Wins over `paraphrase` if both are set.
+    realistic: bool = False
+
     # Report format: "text" | "json" | "both"
     report_format: str = "both"
 
