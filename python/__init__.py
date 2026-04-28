@@ -594,33 +594,15 @@ memory?") call `neural_graph` to summarise.
 
         def _run():
             try:
-                results = self._memory.recall(query, k=limit * 2)  # Over-fetch, then filter
-                if not results:
+                lines = self._format_prefetch_lines(query)
+                if not lines:
                     return
-                lines = []
-                for r in results:
-                    sim = r.get("similarity", 0)
-                    if sim < 0.5:
-                        continue  # Skip low-quality matches
-                    content = r.get("content", "")
-                    # Skip meta/debug content
-                    content_lower = content.lower()
-                    if any(skip in content_lower for skip in (
-                        "neural memory", "tool_result", "test_suite", "mssql",
-                        "config.yaml", "odbc", "embedding", "connection string",
-                        "archive:session",
-                    )):
-                        continue
-                    lines.append(f"- [{sim:.2f}] {content[:150]}")
-                    if len(lines) >= limit:
-                        break
-                if lines:
-                    with self._lock:
-                        # Drop our result if a newer prefetch has been queued
-                        # in the meantime — its result is the one the next
-                        # turn should see, not ours.
-                        if my_gen == self._prefetch_gen:
-                            self._prefetch_result = "\n".join(lines)
+                with self._lock:
+                    # Drop our result if a newer prefetch has been queued
+                    # in the meantime — its result is the one the next
+                    # turn should see, not ours.
+                    if my_gen == self._prefetch_gen:
+                        self._prefetch_result = "\n".join(lines)
             except Exception as e:
                 logger.debug("Neural prefetch failed: %s", e)
 
@@ -950,40 +932,60 @@ memory?") call `neural_graph` to summarise.
             return False
         return True
 
-    def _run_sync_prefetch(self, query: str) -> None:
-        """Synchronous version of queue_prefetch — runs the recall inline
-        so prefetch() reads a current result. Same scoring/filter as the
-        async path (cf. queue_prefetch._run); keeping the two implementations
-        in sync is the small cost we pay for the latency win.
+    # Skip list for prefetch result content — drops meta/debug recalls
+    # that would feed a self-referential loop in the model's context.
+    _PREFETCH_SKIP_PATTERNS = (
+        "neural memory", "tool_result", "test_suite", "mssql",
+        "config.yaml", "odbc", "embedding", "connection string",
+        "archive:session",
+    )
+
+    def _format_prefetch_lines(self, query: str) -> list[str]:
+        """Run a recall and produce the formatted bullet lines used by both
+        the sync (pre_llm_call) and async (queue_prefetch) prefetch paths.
+
+        Single source of truth for the score floor (0.5), the skip-pattern
+        list, the line format (\`- [sim] content[:150]\`), and the limit
+        (config.prefetch_limit, capped at 3). Empty list = no usable hits.
         """
         if not self._memory or not query:
-            return
+            return []
         limit = min(self._config.get("prefetch_limit", 3), 3) if self._config else 3
-        results = self._memory.recall(query, k=limit * 2)
+        try:
+            results = self._memory.recall(query, k=limit * 2)
+        except Exception as e:
+            logger.debug("Prefetch recall failed: %s", e)
+            return []
         if not results:
-            return
-        lines = []
+            return []
+        lines: list[str] = []
         for r in results:
             sim = r.get("similarity", 0)
             if sim < 0.5:
                 continue
-            content = r.get("content", "")
+            content = r.get("content", "") or ""
             content_lower = content.lower()
-            if any(skip in content_lower for skip in (
-                "neural memory", "tool_result", "test_suite", "mssql",
-                "config.yaml", "odbc", "embedding", "connection string",
-                "archive:session",
-            )):
+            if any(skip in content_lower for skip in self._PREFETCH_SKIP_PATTERNS):
                 continue
             lines.append(f"- [{sim:.2f}] {content[:150]}")
             if len(lines) >= limit:
                 break
-        if lines:
-            with self._lock:
-                # Bump generation — any in-flight async fetch from a previous
-                # turn must drop its result rather than stomp ours.
-                self._prefetch_gen += 1
-                self._prefetch_result = "\n".join(lines)
+        return lines
+
+    def _run_sync_prefetch(self, query: str) -> None:
+        """Synchronous prefetch — runs the recall inline so prefetch()
+        reads a current result. Used from _on_pre_llm_call so the model
+        sees the auto-recall context for the CURRENT turn (the iter-73
+        async path lost a 50-200ms race against prefetch()).
+        """
+        lines = self._format_prefetch_lines(query)
+        if not lines:
+            return
+        with self._lock:
+            # Bump generation — any in-flight async fetch from a previous
+            # turn must drop its result rather than stomp ours.
+            self._prefetch_gen += 1
+            self._prefetch_result = "\n".join(lines)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return ALL_TOOL_SCHEMAS
