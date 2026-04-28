@@ -917,7 +917,10 @@ memory?") call `neural_graph` to summarise.
         # which is negligible against a multi-second LLM call.
         # Falls back to queue_prefetch if the sync path raises so we
         # still have SOMETHING for the next turn.
-        if user_message and len(user_message.strip()) >= 4:
+        # Skip auto-recall for system/meta messages (compaction headers,
+        # tool-result wrappers, etc.) so we don't burn a recall on text
+        # that would never benefit from memory.
+        if self._should_auto_recall(user_message):
             try:
                 self._run_sync_prefetch(user_message)
             except Exception as e:
@@ -926,6 +929,26 @@ memory?") call `neural_graph` to summarise.
                     self.queue_prefetch(user_message, session_id=session_id)
                 except Exception:
                     pass
+
+    def _should_auto_recall(self, message: str) -> bool:
+        """Decide whether the per-turn auto-recall should fire.
+
+        Skip cases where the recall would be noise: empty/very-short
+        messages (greetings, acknowledgements), system-injected wrappers
+        (compaction headers, [SYSTEM:..] markers), and content already
+        flagged by _is_garbage. The rest pass through.
+        """
+        if not message or len(message.strip()) < 4:
+            return False
+        stripped = message.strip()
+        # System markers — never recall on these.
+        if stripped.startswith(("[SYSTEM:", "SYSTEM:", "<memory-context",
+                                "[CONTEXT COMPACTION", "```memory-context")):
+            return False
+        # Reuse the broader garbage filter.
+        if self._is_garbage(stripped):
+            return False
+        return True
 
     def _run_sync_prefetch(self, query: str) -> None:
         """Synchronous version of queue_prefetch — runs the recall inline
