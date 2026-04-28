@@ -783,10 +783,21 @@ class NeuralMemory:
         _pin_fingerprint_if_unset). Empty DBs and mid-init reads are
         therefore harmless; only an actual mismatch against a
         previously-pinned fingerprint produces dim_locked=False.
+
+        Stores without db_meta support (currently MSSQLStore) get a
+        \"locked-on-current-backend\" result so writes proceed. The earlier
+        \"return False\" here was a critical regression: it tripped the
+        remember() dim_locked guard on every MSSQL write, blocking the
+        entire MSSQL deployment path. The one-model invariant on MSSQL
+        is enforced server-side via the schema's vector_dim column
+        (and ultimately by the ONE-MODEL discipline of the ops team)
+        rather than by a Python-side fingerprint.
         """
         if not hasattr(self.store, "get_meta"):
-            # MSSQLStore doesn't expose db_meta; treat as unlocked.
-            return False, ""
+            # MSSQLStore: no Python-side fingerprint, but writes are not
+            # blocked. The \"\" reason field stays empty so stats() shows
+            # mismatch_reason=None.
+            return True, ""
         stored = self.store.get_meta("embed_fingerprint")
         if stored is None:
             # Empty DB or read-only init — no pin yet. The first remember()
