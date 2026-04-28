@@ -22,7 +22,7 @@ namespace simd {
 struct CpuFeatures {
     bool sse41 = false;
     bool avx2 = false;
-    bool avx512 = false;
+    bool avx512f = false;
     bool fma = false;
 };
 
@@ -40,10 +40,10 @@ const CpuFeatures& detect_cpu() {
         g_features.fma = (ecx >> 12) & 1;
     }
     
-    // Check AVX2 (CPUID leaf 7)
+    // Check AVX2 and AVX-512F (CPUID leaf 7, subleaf 0)
     if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
         g_features.avx2 = (ebx >> 5) & 1;
-        g_features.avx512 = (ebx >> 16) & 1;  // AVX-512F
+        g_features.avx512f = (ebx >> 16) & 1;  // AVX-512 Foundation
     }
     
     g_detected = true;
@@ -53,10 +53,10 @@ const CpuFeatures& detect_cpu() {
 void print_simd_info() {
     auto& f = detect_cpu();
     std::cout << "CPU Features:\n";
-    std::cout << "  SSE4.1: " << (f.sse41 ? "YES" : "NO") << "\n";
-    std::cout << "  AVX2:   " << (f.avx2 ? "YES" : "NO") << "\n";
-    std::cout << "  AVX512: " << (f.avx512 ? "YES" : "NO") << "\n";
-    std::cout << "  FMA:    " << (f.fma ? "YES" : "NO") << "\n";
+    std::cout << "  SSE4.1:  " << (f.sse41 ? "YES" : "NO") << "\n";
+    std::cout << "  AVX2:    " << (f.avx2 ? "YES" : "NO") << "\n";
+    std::cout << "  AVX-512F: " << (f.avx512f ? "YES" : "NO") << "\n";
+    std::cout << "  FMA:     " << (f.fma ? "YES" : "NO") << "\n";
     #ifdef _OPENMP
     std::cout << "  OpenMP: YES (max threads: " << omp_get_max_threads() << ")\n";
     #else

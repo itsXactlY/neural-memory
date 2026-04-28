@@ -22,7 +22,7 @@ import logging
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -150,7 +150,7 @@ class DreamWorker:
 
         from embed_provider import EmbeddingProvider as _EP
         self.embedder = _EP()
-        self._embedding_cache: Dict[int, List[float]] = {}
+        self._embedding_cache: OrderedDict[int, List[float]] = OrderedDict()
         # Prevent unbounded RAM growth in daemon mode.
         self._embedding_cache_max = max(128, int(os.environ.get("DREAM_EMBED_CACHE_MAX", "2048")))
 
@@ -175,15 +175,17 @@ class DreamWorker:
     def _get_embedding(self, memory_id: int, content: str) -> Optional[List[float]]:
         """Get embedding for a memory, with bounded caching."""
         if memory_id in self._embedding_cache:
+            # Move to end (most recently used)
+            self._embedding_cache.move_to_end(memory_id)
             return self._embedding_cache[memory_id]
         if not content or not content.strip():
             return None
         try:
             emb = self.embedder.embed(content[:512])
-            self._embedding_cache[memory_id] = emb
-            # Bounded cache (FIFO by insertion order) to avoid daemon RAM bloat.
-            while len(self._embedding_cache) > self._embedding_cache_max:
+            # Bounded cache (FIFO by insertion order) — evict BEFORE adding.
+            while len(self._embedding_cache) >= self._embedding_cache_max:
                 self._embedding_cache.pop(next(iter(self._embedding_cache)))
+            self._embedding_cache[memory_id] = emb
             return emb
         except Exception as e:
             logger.debug("Embed failed for memory %d: %s", memory_id, e)

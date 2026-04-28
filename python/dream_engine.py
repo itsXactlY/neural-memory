@@ -25,6 +25,12 @@ import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+try:
+    import networkx as nx
+    HAS_NETWORKX = True
+except ImportError:
+    HAS_NETWORKX = False
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -523,10 +529,22 @@ class SQLiteDreamBackend(DreamBackend):
             conn.close()
 
     def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
-        """Delete dream sessions older than keep_days."""
+        """Delete dream sessions older than keep_days and their associated insights."""
         conn = self._connect()
         try:
             cutoff = time.time() - (keep_days * 86400)
+            # Delete insights for old sessions first (no FK cascade on SQLite)
+            old_sessions = conn.execute(
+                "SELECT id FROM dream_sessions WHERE started_at < ?",
+                (cutoff,)
+            ).fetchall()
+            old_ids = [s[0] for s in old_sessions]
+            if old_ids:
+                placeholders = ",".join("?" * len(old_ids))
+                conn.execute(
+                    f"DELETE FROM dream_insights WHERE session_id IN ({placeholders})",
+                    old_ids
+                )
             count = conn.execute(
                 "DELETE FROM dream_sessions WHERE started_at < ?",
                 (cutoff,)
@@ -780,20 +798,19 @@ class DreamEngine:
             # Prune dead connections
             stats["pruned"] = self._backend.prune_weak(0.05)
 
-            # Periodic maintenance: prune old history + orphans every 50 cycles
-            if self._dream_count % 50 == 0:
-                try:
-                    pruned_hist = self._backend.prune_connection_history(keep_days=7)
-                    if pruned_hist:
-                        logger.info("Pruned %d old connection_history entries", pruned_hist)
-                    pruned_sessions = self._backend.prune_old_dream_sessions(keep_days=30)
-                    if pruned_sessions:
-                        logger.info("Pruned %d old dream sessions", pruned_sessions)
-                    pruned_orphans = self._backend.prune_orphans()
-                    if pruned_orphans:
-                        logger.info("Pruned %d orphan connections", pruned_orphans)
-                except Exception as e:
-                    logger.debug("Maintenance cleanup error: %s", e)
+            # Every NREM cycle: prune old history + orphans
+            try:
+                pruned_hist = self._backend.prune_connection_history(keep_days=7)
+                if pruned_hist:
+                    logger.info("Pruned %d old connection_history entries", pruned_hist)
+                pruned_sessions = self._backend.prune_old_dream_sessions(keep_days=30)
+                if pruned_sessions:
+                    logger.info("Pruned %d old dream sessions", pruned_sessions)
+                pruned_orphans = self._backend.prune_orphans()
+                if pruned_orphans:
+                    logger.info("Pruned %d orphan connections", pruned_orphans)
+            except Exception as e:
+                logger.debug("Maintenance cleanup error: %s", e)
 
         except Exception as e:
             logger.debug("NREM phase error: %s", e)
@@ -950,20 +967,20 @@ class DreamEngine:
     def _detect_communities(self, edges: List[Dict[str, Any]], nodes: set,
                             adj: Dict[int, List[Tuple[int, float]]]) -> List[List[int]]:
         """Louvain community detection with deterministic BFS fallback."""
-        try:
-            import networkx as nx
-            graph = nx.Graph()
-            graph.add_nodes_from(nodes)
-            for e in edges:
-                graph.add_edge(e["source_id"], e["target_id"], weight=float(e.get("weight", 0.0) or 0.0))
-            if hasattr(nx.algorithms.community, "louvain_communities"):
-                comms = nx.algorithms.community.louvain_communities(graph, weight="weight", seed=42)
-                out = [sorted(int(n) for n in comm) for comm in comms if comm]
-                if out:
-                    out.sort(key=lambda c: (-len(c), c[0]))
-                    return out
-        except Exception:
-            pass
+        if HAS_NETWORKX:
+            try:
+                graph = nx.Graph()
+                graph.add_nodes_from(nodes)
+                for e in edges:
+                    graph.add_edge(e["source_id"], e["target_id"], weight=float(e.get("weight", 0.0) or 0.0))
+                if hasattr(nx.algorithms.community, "louvain_communities"):
+                    comms = nx.algorithms.community.louvain_communities(graph, weight="weight", seed=42)
+                    out = [sorted(int(n) for n in comm) for comm in comms if comm]
+                    if out:
+                        out.sort(key=lambda c: (-len(c), c[0]))
+                        return out
+            except Exception:
+                pass
 
         visited = set()
         communities: List[List[int]] = []

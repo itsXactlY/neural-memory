@@ -13,7 +13,8 @@ import json
 import os
 import time
 import threading
-from collections import defaultdict
+import itertools
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
 
@@ -50,8 +51,7 @@ class AccessLogger:
                  max_sequence: int = 20):
         self._log_dir = Path(os.path.expanduser(log_dir))
         self._max_sequence = max_sequence
-        self._buffer: list[dict] = []
-        self._max_buffer = 1000
+        self._buffer: deque[dict] = deque(maxlen=1000)
         self._flush_threshold = 100
         self._ops_since_flush = 0
         self._file_lock = threading.Lock()
@@ -88,10 +88,6 @@ class AccessLogger:
             self._buffer.append(event)
             self._ops_since_flush += 1
 
-            # Circular buffer eviction
-            if len(self._buffer) > self._max_buffer:
-                self._buffer = self._buffer[-self._max_buffer:]
-
             # Periodic disk flush
             if self._ops_since_flush >= self._flush_threshold:
                 self._flush_buffer()
@@ -105,7 +101,9 @@ class AccessLogger:
             List of event dicts in chronological order.
         """
         with self._file_lock:
-            return list(self._buffer[-n:])
+            # deque doesn't support slicing; use islice to get last n items
+            start = max(0, len(self._buffer) - n)
+            return list(itertools.islice(self._buffer, start, None))
 
     def get_co_occurrence_pairs(self, min_count: int = 3) -> list[tuple[int, int, int]]:
         """Find memory pairs frequently recalled together.
@@ -162,7 +160,7 @@ class AccessLogger:
             return
 
         with self._file_lock:
-            self._buffer = events[-n:]
+            self._buffer = deque(itertools.islice(self._buffer, max(0, len(self._buffer) - n), None), maxlen=1000)
 
     def get_training_pair(self, max_seq: int = 20) -> Optional[tuple[list[list[float]], list[float]]]:
         """Extract one LSTM training sample from recent access history.
@@ -225,16 +223,71 @@ class AccessLogger:
         with self._file_lock:
             self._flush_buffer()
 
+    # Log rotation config
+    MAX_LOG_SIZE_MB = 100
+    MAX_ROTATED_FILES = 5
+
+    def _should_rotate(self) -> bool:
+        """Check if current log file exceeds size threshold."""
+        if not self._log_file.exists():
+            return False
+        try:
+            size_mb = self._log_file.stat().st_size / (1024 * 1024)
+            return size_mb >= self.MAX_LOG_SIZE_MB
+        except OSError:
+            return False
+
+    def _rotate_log(self):
+        """Rotate log files: access_log.jsonl → access_log.1.jsonl, etc."""
+        if not self._log_file.exists():
+            return
+        # Delete oldest if at cap
+        oldest = self._log_dir / f"access_log.{self.MAX_ROTATED_FILES}.jsonl"
+        if oldest.exists():
+            oldest.unlink()
+        # Shift others down
+        for i in range(self.MAX_ROTATED_FILES - 1, 0, -1):
+            src = self._log_dir / f"access_log.{i}.jsonl"
+            dst = self._log_dir / f"access_log.{i + 1}.jsonl"
+            if src.exists():
+                src.rename(dst)
+        # Rename current to .1
+        dst = self._log_dir / "access_log.1.jsonl"
+        self._log_file.rename(dst)
+
+    def _clean_old_logs(self, keep_days: int = 30):
+        """Delete rotated log files older than keep_days."""
+        if not self._log_dir.exists():
+            return
+        cutoff = time.time() - (keep_days * 86400)
+        for f in self._log_dir.iterdir():
+            if f.is_file() and f.name.startswith("access_log.") and f.suffix == ".jsonl":
+                if f.stat().st_mtime < cutoff:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+
     def _flush_buffer(self):
         """Write buffered events to JSONL file (internal, assumes lock held)."""
         if not self._buffer:
             return
 
         try:
+            # Rotate if needed
+            if self._should_rotate():
+                self._rotate_log()
+
+            # Clean old rotated logs on every flush (removes logs older than 30 days)
+            self._clean_old_logs(keep_days=30)
+
+            # Get events since last flush (deque: convert slice to list of recent items)
+            import itertools
+            start = max(0, len(self._buffer) - self._ops_since_flush)
+            events_to_flush = list(itertools.islice(self._buffer, start, None))
+
             with open(self._log_file, "a") as f:
-                # Write events since last flush
-                start = max(0, len(self._buffer) - self._ops_since_flush)
-                for event in self._buffer[start:]:
+                for event in events_to_flush:
                     f.write(json.dumps(event, separators=(",", ":")) + "\n")
             self._ops_since_flush = 0
         except IOError as e:
