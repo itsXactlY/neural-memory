@@ -428,11 +428,36 @@ class Memory:
                 pass
         return mem_id
     
-    def remember_embedding(self, embedding: list[float], label: str = "", 
+    def remember_embedding(self, embedding: list[float], label: str = "",
                            content: str = "") -> int:
-        """Store a memory with pre-computed embedding. SQLite primary, MSSQL mirror."""
+        """Store a memory with pre-computed embedding. SQLite primary, MSSQL mirror.
+
+        Honours the same dim-lock invariants as remember(): refuses to write
+        when the SQLite-side dim_lock is False, and refuses embeddings whose
+        length doesn't match the active backend's dim. Without these checks,
+        a caller could bypass the iter-12 ONE-MODEL invariant entirely by
+        going through this method instead of remember().
+        """
+        nm = self._sqlite_memory
+        if hasattr(nm, "_dim_locked") and not nm._dim_locked:
+            raise RuntimeError(
+                f"refusing to write: {nm._dim_mismatch_reason} "
+                "Re-open with the original embedding backend, or drop the DB."
+            )
+        if hasattr(nm, "dim") and len(embedding) != nm.dim:
+            raise RuntimeError(
+                f"embedding dim={len(embedding)}, expected {nm.dim} "
+                f"({getattr(nm, '_embed_fingerprint', '?')})"
+            )
+        # First write to a fresh DB pins the fingerprint via the same helper
+        # remember() uses, so this entry point can't end-run the pin either.
+        if hasattr(nm, "_pin_fingerprint_if_unset"):
+            try:
+                nm._pin_fingerprint_if_unset()
+            except Exception:
+                pass
         # SQLite always
-        mem_id = self._sqlite_memory.store.store(label or content[:60], content, embedding)
+        mem_id = nm.store.store(label or content[:60], content, embedding)
         # MSSQL mirror
         if self._mssql_store:
             try:
