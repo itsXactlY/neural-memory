@@ -753,6 +753,15 @@ class DreamEngine:
             except Exception as e:
                 logger.error("Dream cycle failed: %s", e)
                 total_stats["error"] = str(e)
+            finally:
+                # Reset the idle timer after every cycle, regardless of how
+                # _run_dream_cycle was invoked (loop poll OR explicit dream_now()).
+                # Without this in the finally, dream_now() leaves _last_activity
+                # untouched, so the very next 30s loop wake sees idle >>
+                # idle_threshold and immediately fires another cycle — pegging
+                # CPU on spreading activation. The duplicate reset in the loop
+                # caller is now redundant but harmless.
+                self._last_activity = time.time()
 
             return total_stats
 
