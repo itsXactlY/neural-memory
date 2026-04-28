@@ -1041,7 +1041,52 @@ class NeuralMemory:
         self._hnsw_dirty = True
 
         if auto_connect:
-            # Hot-path: use hydrated graph nodes instead of re-reading/unpacking the full DB every insert.
+            self._auto_connect(mem_id, embedding, text)
+
+        return mem_id
+
+    def _auto_connect(self, mem_id: int, embedding: list[float], text: str) -> None:
+        """Connect a freshly-stored memory to its semantic neighbours.
+
+        Two strategies depending on graph size:
+
+          1. HNSW ANN fast-path (used when _ensure_hnsw succeeds — typically
+             >= 1000 memories). Pulls the top ~32 candidates above the 0.70
+             cosine floor in O(log N) and only computes exact cosine on
+             those. The brute-force loop is O(N), which on a 100K-memory
+             store added measurable latency to every remember() call.
+
+          2. Brute-force fallback (small graphs, HNSW disabled, or hnswlib
+             missing). Identical to the previous implementation: walk
+             _graph_nodes, exact-cosine each, threshold at 0.70.
+        """
+        candidates: list[tuple[int, float]] = []  # (other_id, similarity)
+
+        if self._ensure_hnsw():
+            try:
+                import numpy as np
+                # Fetch a generous neighbourhood; HNSW recall@k is high but
+                # not perfect, so over-fetching ensures the 0.70+ true
+                # positives aren't missed. Capped at the index size to avoid
+                # asking hnswlib for more than it knows.
+                k_probe = min(64, len(self._hnsw_ids))
+                if k_probe > 0:
+                    labels, distances = self._hnsw_index.knn_query(
+                        np.asarray([embedding], dtype=np.float32),
+                        k=k_probe,
+                    )
+                    for nid, dist in zip(labels[0], distances[0]):
+                        nid = int(nid)
+                        if nid == mem_id:
+                            continue
+                        sim = max(0.0, 1.0 - float(dist))
+                        if sim > 0.70:
+                            candidates.append((nid, sim))
+            except Exception:
+                # Fall through to brute-force if hnswlib chokes.
+                candidates = []
+
+        if not candidates:
             for other_id, node in list(self._graph_nodes.items()):
                 other_id = int(other_id)
                 if other_id == mem_id:
@@ -1050,17 +1095,22 @@ class NeuralMemory:
                 if not other_emb:
                     continue
                 sim = self._cosine_similarity(embedding, other_emb)
-                # 0.45 is a noise floor with FastEmbed/e5-large — produces O(n²)
-                # edge growth (spurious matches); 0.70 keeps semantically-related
-                # pairs while killing low-signal connections.
+                # 0.45 is a noise floor with FastEmbed/e5-large — produces
+                # O(n²) edge growth (spurious matches); 0.70 keeps
+                # semantically-related pairs while killing low-signal
+                # connections.
                 if sim > 0.70:
-                    edge_type = self._infer_edge_type(text, node.get("content", ""))
-                    self.store.add_connection(mem_id, other_id, sim, edge_type=edge_type)
-                    if other_id in self._graph_nodes:
-                        self._graph_nodes[other_id].setdefault("connections", {})[mem_id] = sim
-                    self._graph_nodes[mem_id].setdefault("connections", {})[other_id] = sim
+                    candidates.append((other_id, sim))
 
-        return mem_id
+        for other_id, sim in candidates:
+            other_node = self._graph_nodes.get(other_id, {})
+            edge_type = self._infer_edge_type(text, other_node.get("content", ""))
+            self.store.add_connection(mem_id, other_id, sim, edge_type=edge_type)
+            self._graph_nodes.setdefault(other_id, {
+                "embedding": [], "label": f"memory:{other_id}",
+                "content": "", "connections": {},
+            }).setdefault("connections", {})[mem_id] = sim
+            self._graph_nodes[mem_id].setdefault("connections", {})[other_id] = sim
 
     def _fuse_conflict(self, old_text: str, new_text: str) -> str:
         old_clean = old_text.replace("[SUPERSEDED]", "").replace("[UPDATED TO]", "").replace("[CANONICAL]", "").replace("[PREVIOUSLY]", "").strip()
