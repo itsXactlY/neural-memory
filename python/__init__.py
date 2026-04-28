@@ -1189,12 +1189,37 @@ memory?") call `neural_graph` to summarise.
             return tool_error("Neural memory provider not initialized")
         try:
             content = args["content"]
-            label = args.get("label", "")
+            # Type-check: weak models sometimes pass nested dicts/lists for
+            # `content` because the schema says \"string\". Coerce to string
+            # via str() if it's a primitive number/bool, reject anything
+            # structured up front with a clear message.
+            if isinstance(content, (dict, list)):
+                return tool_error(
+                    "content must be a string, not a JSON object/array — "
+                    "summarise the fact in one sentence"
+                )
+            if content is None:
+                return tool_error("content must be a non-empty string, got null")
+            if not isinstance(content, str):
+                content = str(content)
+            if not content.strip():
+                return tool_error("content must be a non-empty string")
+            label = args.get("label") or ""
+            if not isinstance(label, str):
+                label = str(label)
             mem_id = self._memory.remember(content, label=label)
             # Touch dream engine (reset idle timer)
             if hasattr(self, '_dream') and self._dream:
                 self._dream.touch()
-            return json.dumps({"id": mem_id, "status": "stored"})
+            # iter-60 rejects empty-after-strip text by returning -1; surface
+            # that clearly instead of pretending the write succeeded.
+            if mem_id == -1:
+                return json.dumps({"status": "skipped", "reason": "empty content after strip"})
+            # remember_chunked returns a list[int]; keep the response shape
+            # consistent so tool consumers can rely on it.
+            if isinstance(mem_id, list):
+                return json.dumps({"ids": mem_id, "status": "stored", "count": len(mem_id)})
+            return json.dumps({"id": int(mem_id), "status": "stored"})
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
         except Exception as exc:
