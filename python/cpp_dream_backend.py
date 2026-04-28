@@ -103,34 +103,37 @@ class CppDreamBackend(DreamBackend):
     def start_session(self, phase: str) -> int:
         import sqlite3, time
         conn = sqlite3.connect(self._session_db)
-        cur = conn.execute(
-            "INSERT INTO dream_sessions (started_at, phase) VALUES (?, ?)",
-            (time.time(), phase)
-        )
-        conn.commit()
-        sid = cur.lastrowid
-        conn.close()
-        return sid
+        try:
+            cur = conn.execute(
+                "INSERT INTO dream_sessions (started_at, phase) VALUES (?, ?)",
+                (time.time(), phase)
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
 
     def finish_session(self, session_id: int, stats: Dict[str, Any]) -> None:
         if session_id < 0:
             return
         import sqlite3, time
         conn = sqlite3.connect(self._session_db)
-        conn.execute(
-            "UPDATE dream_sessions SET finished_at=?, memories_processed=?, "
-            "connections_strengthened=?, connections_pruned=?, "
-            "bridges_found=?, insights_created=? WHERE id=?",
-            (time.time(),
-             stats.get("processed", stats.get("explored", 0)),
-             stats.get("strengthened", 0),
-             stats.get("pruned", 0),
-             stats.get("bridges", 0),
-             stats.get("insights", 0),
-             session_id)
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "UPDATE dream_sessions SET finished_at=?, memories_processed=?, "
+                "connections_strengthened=?, connections_pruned=?, "
+                "bridges_found=?, insights_created=? WHERE id=?",
+                (time.time(),
+                 stats.get("processed", stats.get("explored", 0)),
+                 stats.get("strengthened", 0),
+                 stats.get("pruned", 0),
+                 stats.get("bridges", 0),
+                 stats.get("insights", 0),
+                 session_id)
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     # -- Graph Operations (ALL via C++ → MSSQL) --
 
@@ -379,24 +382,22 @@ class CppDreamBackend(DreamBackend):
             return 0
 
     def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
-        """Prune old dream sessions AND their associated insights from SQLite tracking DB."""
+        """Prune old dream sessions AND their associated insights from SQLite tracking DB.
+
+        Uses a correlated DELETE+subquery so backlogs of any size are safe;
+        the previous IN (?,?,?...) form would hit SQLITE_MAX_VARIABLE_NUMBER
+        on first cleanup of a long-lived MSSQL deployment.
+        """
         import sqlite3, time
         conn = sqlite3.connect(self._session_db)
         try:
             cutoff = time.time() - (keep_days * 86400)
-            # Delete insights for old sessions first (foreign key cascade if defined,
-            # otherwise explicit delete)
-            old_sessions = conn.execute(
-                "SELECT id FROM dream_sessions WHERE started_at < ?",
+            # Insights first — SQLite has no FK cascade by default on this schema.
+            conn.execute(
+                "DELETE FROM dream_insights "
+                "WHERE session_id IN (SELECT id FROM dream_sessions WHERE started_at < ?)",
                 (cutoff,)
-            ).fetchall()
-            old_session_ids = [s[0] for s in old_sessions]
-            if old_session_ids:
-                placeholders = ",".join("?" * len(old_session_ids))
-                conn.execute(
-                    f"DELETE FROM dream_insights WHERE session_id IN ({placeholders})",
-                    old_session_ids
-                )
+            )
             count = conn.execute(
                 "DELETE FROM dream_sessions WHERE started_at < ?",
                 (cutoff,)
@@ -429,14 +430,16 @@ class CppDreamBackend(DreamBackend):
         """Store insight in lightweight SQLite."""
         import sqlite3, time
         conn = sqlite3.connect(self._session_db)
-        conn.execute(
-            "INSERT INTO dream_insights "
-            "(session_id, insight_type, source_memory_id, content, confidence, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, insight_type, source_memory_id, content, confidence, time.time())
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                "INSERT INTO dream_insights "
+                "(session_id, insight_type, source_memory_id, content, confidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, insight_type, source_memory_id, content, confidence, time.time())
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_dream_stats(self) -> Dict[str, Any]:
         """Get dream stats from SQLite tracking + C++ graph stats."""
