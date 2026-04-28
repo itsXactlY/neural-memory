@@ -414,16 +414,21 @@ class Memory:
         """Store a memory. SQLite primary, MSSQL mirror. Returns memory ID."""
         if auto_chunk and len(text) > self._default_chunk_size * 2:
             return self.remember_chunked(text, label)
-        
+
         embedding = self._embedder.embed(text)
-        
+
         # SQLite always (source of truth)
         mem_id = self._sqlite_memory.remember(text, label, auto_connect=auto_connect,
                                               detect_conflicts=detect_conflicts)
-        # MSSQL mirror (optional backup)
+        # MSSQL mirror — pass the SQLite id_ so MSSQL's row carries the same
+        # primary key. Without this, the two backends drift into separate id
+        # spaces and any cross-backend lookup (recall_multihop, think) silently
+        # returns nothing because it queries MSSQL with the SQLite id.
         if self._mssql_store:
             try:
-                self._mssql_store.store(label or text[:60], text, embedding)
+                self._mssql_store.store(
+                    label or text[:60], text, embedding, id_=int(mem_id)
+                )
             except Exception:
                 pass
         return mem_id
@@ -458,10 +463,12 @@ class Memory:
                 pass
         # SQLite always
         mem_id = nm.store.store(label or content[:60], content, embedding)
-        # MSSQL mirror
+        # MSSQL mirror — preserve the SQLite-assigned id (see remember())
         if self._mssql_store:
             try:
-                self._mssql_store.store(label or content[:60], content, embedding)
+                self._mssql_store.store(
+                    label or content[:60], content, embedding, id_=int(mem_id)
+                )
             except Exception:
                 pass
         return mem_id

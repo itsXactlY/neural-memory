@@ -140,16 +140,64 @@ class MSSQLStore:
                         pass  # Ignore if already exists
             self.conn.commit()
     
-    def store(self, label: str, content: str, embedding: list[float]) -> int:
+    def store(self, label: str, content: str, embedding: list[float],
+              id_: Optional[int] = None) -> int:
+        """Insert or upsert a memory.
+
+        When `id_` is provided, the row is written with that exact id via
+        SET IDENTITY_INSERT — used by Memory.remember() to keep the MSSQL
+        mirror's IDs aligned with SQLite's source-of-truth IDs. Without
+        ID alignment:
+
+          - recall_multihop / think query MSSQL with SQLite IDs and miss
+            every memory (silent zero-result graph expansion).
+          - sync_bridge subsequently inserts the same memory AGAIN with
+            the SQLite ID (since it sees id > max_id), producing
+            duplicate rows.
+
+        On collision (existing row with the same id), MERGE updates
+        label/content/embedding so the mirror stays consistent with
+        SQLite's current state — important after conflict-fusion
+        rewrites in NeuralMemory.remember.
+        """
         blob = struct.pack(f'{len(embedding)}f', *embedding)
         cursor = self.conn.cursor()
-        cursor.execute(
-            "INSERT INTO memories (label, content, embedding, vector_dim) OUTPUT INSERTED.id VALUES (?, ?, ?, ?)",
-            label, content, blob, len(embedding)
-        )
-        row = cursor.fetchone()
-        self.conn.commit()
-        return row[0] if row else 0
+        with self._lock:
+            if id_ is None:
+                cursor.execute(
+                    "INSERT INTO memories (label, content, embedding, vector_dim) "
+                    "OUTPUT INSERTED.id VALUES (?, ?, ?, ?)",
+                    label, content, blob, len(embedding)
+                )
+                row = cursor.fetchone()
+                self.conn.commit()
+                return row[0] if row else 0
+            # Explicit-id path: SET IDENTITY_INSERT + MERGE on id so a
+            # second mirror call with the same id is idempotent.
+            try:
+                cursor.execute("SET IDENTITY_INSERT memories ON")
+                cursor.execute(
+                    "MERGE memories AS tgt "
+                    "USING (VALUES (?, ?, ?, ?, ?)) "
+                    "  AS src (id, label, content, embedding, vector_dim) "
+                    "ON tgt.id = src.id "
+                    "WHEN MATCHED THEN UPDATE SET "
+                    "  label = src.label, content = src.content, "
+                    "  embedding = src.embedding, vector_dim = src.vector_dim "
+                    "WHEN NOT MATCHED THEN INSERT (id, label, content, embedding, vector_dim) "
+                    "  VALUES (src.id, src.label, src.content, src.embedding, src.vector_dim);",
+                    int(id_), label, content, blob, len(embedding)
+                )
+                self.conn.commit()
+            finally:
+                # IDENTITY_INSERT is per-session; turn it off before any
+                # other code on this connection runs an autoincrement INSERT.
+                try:
+                    cursor.execute("SET IDENTITY_INSERT memories OFF")
+                    self.conn.commit()
+                except Exception:
+                    pass
+            return int(id_)
     
     def get_all(self) -> list[dict]:
         cursor = self.conn.cursor()
