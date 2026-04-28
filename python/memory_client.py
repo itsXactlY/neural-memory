@@ -885,28 +885,40 @@ class NeuralMemory:
     def _ensure_node(self, mem_id: int, at_time: Optional[float] = None) -> bool:
         """Make sure a graph node exists in the cache; populate from store on miss.
 
-        Fast path: if the node is already cached AND has a non-placeholder label
-        AND we're not doing a time-travel read (at_time is None), return immediately.
-        This is critical for the BFS / PPR think paths, which call _ensure_node
-        once per visited node — previously every call paid 2 SQL queries
-        (store.get + _refresh_connections) regardless of cache state.
+        Two-tier optimisation:
+
+          1. Cache-resident, non-placeholder, non-time-travel hit: skip the
+             metadata lookup (store.get) but STILL refresh connections, so
+             external mutations via store.add_connection are visible.
+          2. Cache miss / placeholder / time-travel: full populate path.
+
+        Iter 22 originally returned True from the cache-hit branch without
+        calling _refresh_connections, which broke any caller that mutated the
+        DB directly (e.g. test_ppr_think_engine seeded edges via
+        store.add_connection then expected the in-memory graph to see them).
+        We keep the metadata-lookup savings — that was the iter 22 win — but
+        no longer skip the connection refresh.
         """
         cached = self._graph_nodes.get(mem_id)
-        if (
+        cache_hit = (
             at_time is None
             and cached is not None
-            and not cached.get("label", "").startswith("memory:")  # placeholder marker
-        ):
-            return True
-        mem = self.store.get(mem_id)
-        if not mem:
-            return False
-        self._graph_nodes[mem_id] = {
-            "embedding": mem.get("embedding", []),
-            "label": mem.get("label", ""),
-            "content": mem.get("content", ""),
-            "connections": (cached or {}).get("connections", {}),
-        }
+            and not cached.get("label", "").startswith("memory:")
+        )
+        if not cache_hit:
+            mem = self.store.get(mem_id)
+            if not mem:
+                return False
+            self._graph_nodes[mem_id] = {
+                "embedding": mem.get("embedding", []),
+                "label": mem.get("label", ""),
+                "content": mem.get("content", ""),
+                "connections": (cached or {}).get("connections", {}),
+            }
+        # Refresh connections in BOTH branches. On the cache-hit branch this
+        # is the only SQL query (was 2 before iter 22, now 1, was 0 in the
+        # buggy iter 22 fast-path); on the miss branch it's part of the
+        # original two-query populate.
         self._refresh_connections(mem_id, at_time=at_time)
         return True
 
