@@ -458,7 +458,12 @@ class SentenceTransformerBackend:
     _shared_device = None
     _last_used = 0.0
     _eject_timer = None
-    _lock = None  # threading.Lock, lazy init
+    # Initialised at class-body time. Previously lazy via
+    # \`if _lock is None: _lock = Lock()\`, which has the same lock-init
+    # race fixed in FastEmbedBackend (see iter 40 commit message). Eager
+    # init eliminates the race; the cost is negligible (one Lock object
+    # per backend class at module load).
+    _lock = threading.Lock()
     
     def __init__(self):
         # Try shared server first (unless disabled)
@@ -502,12 +507,12 @@ class SentenceTransformerBackend:
         """Fallback: load model directly into this process (original behavior)."""
         from sentence_transformers import SentenceTransformer
         import torch
-        import threading
         import time as time_module
-        
-        if SentenceTransformerBackend._lock is None:
-            SentenceTransformerBackend._lock = threading.Lock()
-        
+
+        # Lock is now class-level (initialised at class-body time, see iter
+        # 40). The previous \`if _lock is None: _lock = Lock()\` lazy-init was
+        # itself racy — two threads could install distinct Lock objects.
+
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         
         device = 'cpu'
@@ -985,20 +990,21 @@ class FastEmbedBackend:
     # Class-level singleton — shared across all instances
     _shared_model = None
     _shared_dim = None
-    _lock = None  # threading.Lock, lazy init
+    # Initialised at class-body time so the double-checked-locking idiom in
+    # __init__ is actually safe. Previously the lock itself was lazy-inited
+    # under \`if _lock is None: _lock = Lock()\`, which is not atomic — two
+    # threads racing through the first construction could each install a
+    # different Lock object, defeating the singleton-load guarantee and
+    # producing two ONNX model copies (the exact failure the singleton was
+    # meant to prevent — see commit ac02e8b).
+    _lock = threading.Lock()
 
     def __init__(self, dim: int = DIMENSION):
-        import threading
-
-        # Try to reuse shared model
+        # Try to reuse shared model — fast-path without taking the lock.
         if FastEmbedBackend._shared_model is not None:
             self._model = FastEmbedBackend._shared_model
             self.dim = FastEmbedBackend._shared_dim or dim
             return
-
-        # Acquire lock for initial load
-        if FastEmbedBackend._lock is None:
-            FastEmbedBackend._lock = threading.Lock()
 
         with FastEmbedBackend._lock:
             # Double-check after acquiring lock
