@@ -5,6 +5,7 @@ Uses the exact neural_memory.Memory API. No message_embeddings (9524d != 1024d).
 """
 
 import json
+import os
 import sqlite3
 import struct
 import sys
@@ -56,37 +57,38 @@ def import_messages(mem: Memory, batch_size: int = 256):
     
     # Direct SQLite bulk insert (skip auto-connect for speed)
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    
-    for i in range(0, total, batch_size):
-        batch_texts = texts[i:i+batch_size]
-        batch_labels = labels[i:i+batch_size]
-        
-        # Batch embed (GPU)
-        embeddings = embedder.embed_batch(batch_texts)
-        
-        # Bulk insert
-        rows = [
-            (label, text, struct.pack(f'{dim}f', *emb))
-            for label, text, emb in zip(batch_labels, batch_texts, embeddings)
-        ]
-        conn.executemany(
-            "INSERT INTO memories (label, content, embedding) VALUES (?, ?, ?)", rows
-        )
-        conn.commit()
-        
-        # In-memory graph rebuilt from DB after import completes —
-        # IDs from bulk insert don't match sequential assumptions.
-        
-        done = min(i + batch_size, total)
-        elapsed = time.time() - t0
-        rate = done / elapsed if elapsed > 0 else 0
-        eta = (total - done) / rate if rate > 0 else 0
-        
-        print(f"  [{done}/{total}] {rate:.1f} msg/s, ETA: {eta:.0f}s", flush=True)
-    
-    conn.close()
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+
+        for i in range(0, total, batch_size):
+            batch_texts = texts[i:i+batch_size]
+            batch_labels = labels[i:i+batch_size]
+
+            # Batch embed (GPU)
+            embeddings = embedder.embed_batch(batch_texts)
+
+            # Bulk insert
+            rows = [
+                (label, text, struct.pack(f'{dim}f', *emb))
+                for label, text, emb in zip(batch_labels, batch_texts, embeddings)
+            ]
+            conn.executemany(
+                "INSERT INTO memories (label, content, embedding) VALUES (?, ?, ?)", rows
+            )
+            conn.commit()
+
+            # In-memory graph rebuilt from DB after import completes —
+            # IDs from bulk insert don't match sequential assumptions.
+
+            done = min(i + batch_size, total)
+            elapsed = time.time() - t0
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (total - done) / rate if rate > 0 else 0
+
+            print(f"  [{done}/{total}] {rate:.1f} msg/s, ETA: {eta:.0f}s", flush=True)
+    finally:
+        conn.close()
     elapsed = time.time() - t0
     print(f"  Done: {total} messages in {elapsed:.1f}s ({total/elapsed:.1f} msg/s)")
 
@@ -102,15 +104,17 @@ def import_simple(mem: Memory, label_prefix: str, items: list, text_fn, label_fn
     embeddings = embedder.embed_batch(texts)
     
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL")
-    rows = [
-        (label, text, struct.pack(f'{dim}f', *emb))
-        for label, text, emb in zip(labels, texts, embeddings)
-    ]
-    conn.executemany("INSERT INTO memories (label, content, embedding) VALUES (?, ?, ?)", rows)
-    conn.commit()
-    conn.close()
-    
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        rows = [
+            (label, text, struct.pack(f'{dim}f', *emb))
+            for label, text, emb in zip(labels, texts, embeddings)
+        ]
+        conn.executemany("INSERT INTO memories (label, content, embedding) VALUES (?, ?, ?)", rows)
+        conn.commit()
+    finally:
+        conn.close()
+
     print(f"  Done: {len(items)} {label_prefix}")
 
 def build_connections(mem: Memory, sample_size: int = 5000, threshold: float = 0.15):
@@ -119,12 +123,16 @@ def build_connections(mem: Memory, sample_size: int = 5000, threshold: float = 0
     import math
     
     conn = sqlite3.connect(str(DB_PATH))
-    
+
     # Load all memories
-    rows = conn.execute("SELECT id, embedding FROM memories ORDER BY id").fetchall()
+    try:
+        rows = conn.execute("SELECT id, embedding FROM memories ORDER BY id").fetchall()
+    except Exception:
+        conn.close()
+        raise
     total = len(rows)
     print(f"  {total} memories total")
-    
+
     if total == 0:
         conn.close()
         return
@@ -174,15 +182,17 @@ def build_connections(mem: Memory, sample_size: int = 5000, threshold: float = 0
     
     # Bulk insert connections
     print(f"  Inserting {len(connections)} connections...")
-    conn.executemany(
-        "INSERT OR IGNORE INTO connections (source_id, target_id, weight, edge_type) VALUES (?, ?, ?, 'similar')",
-        connections
-    )
-    conn.commit()
-    
+    try:
+        conn.executemany(
+            "INSERT OR IGNORE INTO connections (source_id, target_id, weight, edge_type) VALUES (?, ?, ?, 'similar')",
+            connections
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
     elapsed = time.time() - t0
     print(f"  Done: {len(connections)} connections in {elapsed:.1f}s")
-    conn.close()
 
 def import_documents(mem: Memory):
     """Import documents."""
@@ -226,10 +236,12 @@ def main():
     # Clear existing DB
     print("\n[1/3] Clearing DB...")
     conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("DELETE FROM memories")
-    conn.execute("DELETE FROM connections")
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("DELETE FROM memories")
+        conn.execute("DELETE FROM connections")
+        conn.commit()
+    finally:
+        conn.close()
     
     mem = Memory(use_cpp=False)  # Python backend (SQLite + embedder)
     print(f"Backend: {mem.backend}, dim={mem.dim}")
