@@ -580,7 +580,7 @@ class Memory:
         results = self.recall(query, k)
         if not self._mssql_store:
             return results
-        
+
         expanded = []
         seen = {r['id'] for r in results}
         for r in results:
@@ -588,15 +588,27 @@ class Memory:
                 conns = self._mssql_store.get_connections(r['id'])
                 for c in conns:
                     other = c['target'] if c['source'] == r['id'] else c['source']
-                    if other not in seen:
-                        seen.add(other)
-                        mem = self._mssql_store.get(other)
-                        if mem:
-                            expanded.append({'id': other, 'label': mem['label'],
-                                            'content': mem['content'], 'activation': c['weight']})
+                    if other in seen:
+                        continue
+                    seen.add(other)
+                    # Skip embedding — we only render label/content here.
+                    mem = self._mssql_store.get(other, include_embedding=False)
+                    if mem:
+                        expanded.append({
+                            'id': other,
+                            'label': mem['label'],
+                            'content': mem['content'],
+                            'activation': c['weight'],
+                            'hop': 1,
+                        })
             except Exception:
                 pass
-        return results[:k]
+        # Previously the function built `expanded` and then returned
+        # `results[:k]` — silently throwing away every MSSQL-discovered
+        # neighbour. Append the expansions; cap the total at 2*k so the
+        # caller still gets a bounded result set.
+        merged = list(results) + expanded
+        return merged[: max(k * 2, k)]
 
     def think(self, start_id: int, depth: int = 3, decay: float = 0.85) -> list[dict]:
         """Spreading activation. SQLite primary, MSSQL enhanced if available."""
