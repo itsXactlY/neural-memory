@@ -493,13 +493,15 @@ class DreamWorker:
                 self.store.add_insight(session_id, "cluster", comm[0], content, confidence)
                 stats["insights"] += 1
 
-            # Bridge insights
+            # Bridge insights — twin of the iter 18 fix on the in-process
+            # dream engine. Use the adjacency map already built above
+            # instead of rescanning the full edge list per bridge node;
+            # adj[node] yields the node's neighbours directly so the loop
+            # collapses from O(|bridges| * |edges|) to O(B + sum-of-degrees).
             for bnode in bridge_nodes:
                 bridging_communities = set()
-                for e in edges:
-                    if e["source_id"] == bnode or e["target_id"] == bnode:
-                        other = e["target_id"] if e["source_id"] == bnode else e["source_id"]
-                        bridging_communities.add(node_to_comm.get(other, -1))
+                for neighbour, _w in adj.get(bnode, ()):
+                    bridging_communities.add(node_to_comm.get(neighbour, -1))
                 bridging_communities.discard(-1)
 
                 if len(bridging_communities) >= 3:
