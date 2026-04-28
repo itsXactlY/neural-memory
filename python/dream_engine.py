@@ -17,7 +17,6 @@ Otherwise falls back to SQLite.
 from __future__ import annotations
 
 import logging
-import math
 import sqlite3
 import struct
 import threading
@@ -397,6 +396,19 @@ class SQLiteDreamBackend(DreamBackend):
 
     def strengthen_connection(self, source_id: int, target_id: int,
                                delta: float = 0.05) -> None:
+        """Bump an edge's weight by delta, capped at 1.0.
+
+        Canonicalises (source < target) before the UPDATE so this works
+        on the canonical rows produced by the iter-62 migration. Without
+        the swap, a caller passing (max, min) would silently match no
+        rows and the update would be a no-op — observed in practice
+        when NREM activated_edges happened to be derived from a
+        non-canonical source.
+        """
+        if source_id == target_id:
+            return
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
         conn = self._connect()
         try:
             conn.execute(
@@ -423,18 +435,35 @@ class SQLiteDreamBackend(DreamBackend):
 
     def batch_strengthen_connections(self, edges: List[Tuple[int, int]],
                                       delta: float = 0.05) -> int:
-        """Bulk strengthen via executemany. Returns count updated."""
+        """Bulk strengthen via executemany. Returns count updated.
+
+        Canonicalises every (src, tgt) pair before the UPDATE — same
+        rationale as strengthen_connection above. NREM's activated_edges
+        set already stores (min, max), so this is a no-op for the
+        primary caller; the canonicalisation is here so any future
+        caller that forgets to swap still hits the right rows.
+        """
         if not edges:
+            return 0
+        canon = []
+        for src, tgt in edges:
+            src, tgt = int(src), int(tgt)
+            if src == tgt:
+                continue
+            if src > tgt:
+                src, tgt = tgt, src
+            canon.append((delta, src, tgt))
+        if not canon:
             return 0
         conn = self._connect()
         try:
             conn.executemany(
                 "UPDATE connections SET weight = MIN(weight + ?, 1.0) "
                 "WHERE source_id = ? AND target_id = ?",
-                [(delta, src, tgt) for src, tgt in edges]
+                canon,
             )
             conn.commit()
-            return len(edges)
+            return len(canon)
         finally:
             conn.close()
 
