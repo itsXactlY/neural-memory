@@ -375,10 +375,21 @@ class KNNEngine:
         graph_arr = (ctypes.c_float * count)(*graph_scores)
         results_arr = (CKNNResult * k)()
 
-        # LSTM context pointer
+        # LSTM context pointer — defensively validate the dim before
+        # constructing the C array. ctypes.c_float * N silently pads with
+        # zeros when fewer values are passed and silently truncates when
+        # more are passed; either case feeds malformed memory into the
+        # C-side dot product. The C kernel reads embed_dim floats from
+        # the pointer, so an undersized buffer would also be a true OOB
+        # read into adjacent memory.
         ctx_ptr = None
         if lstm_context is not None:
-            ctx_ptr = (ctypes.c_float * self._embed_dim)(*lstm_context)
+            if len(lstm_context) != self._embed_dim:
+                # Drop bad context rather than risking corrupt scoring.
+                # The kNN call accepts a NULL pointer for \"no context\".
+                lstm_context = None
+            else:
+                ctx_ptr = (ctypes.c_float * self._embed_dim)(*lstm_context)
 
         n = self._lib.nm_knn_search(
             self._handle, query_arr, self._embed_dim,
@@ -410,8 +421,11 @@ class KNNEngine:
         """
         assert self._handle, "kNN engine not initialized"
         ctx_ptr = None
-        if lstm_context is not None:
+        if lstm_context is not None and len(lstm_context) == self._embed_dim:
             ctx_ptr = (ctypes.c_float * self._embed_dim)(*lstm_context)
+        # If the dim doesn't match, fall through with NULL context — same
+        # safety as search(): malformed contexts are dropped, never passed
+        # to the C kernel where they'd cause OOB reads or silent zero-pad.
         self._lib.nm_knn_adjust_weights(self._handle, ctx_ptr)
 
     def close(self):
