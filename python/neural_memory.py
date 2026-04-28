@@ -183,13 +183,22 @@ class Memory:
                 result_scores=result_scores,
             )
             
-            # 2. LSTM prediction from access sequence
+            # 2. LSTM prediction from access sequence — exclude the
+            # just-logged event so predict_next is genuinely \"next from
+            # prior\", not \"copy the current input.\" Same shape as the
+            # iter-68 fix on the training path: log_recall just appended
+            # an event whose query_emb == query_embedding, so feeding
+            # recent[-10:] to predict_next would put the target itself
+            # at the end of the input sequence and degrade the prediction
+            # to ≈ query_embedding (a trivial copy).
             lstm_context = None
             recent = self._access_logger.get_sequence(n=15)
             if len(recent) >= 3:
                 try:
-                    seq_embs = [e["query_emb"] for e in recent[-10:]]
-                    lstm_context = self._lstm.predict_next(seq_embs)
+                    prior = recent[:-1]
+                    seq_embs = [e["query_emb"] for e in prior[-10:]]
+                    if len(seq_embs) >= 2:
+                        lstm_context = self._lstm.predict_next(seq_embs)
                 except Exception:
                     pass  # Fall through without LSTM context
             
