@@ -187,8 +187,26 @@ class SQLiteStore:
         self._checkpoint_thread = threading.Thread(target=self._bg_checkpoint, daemon=True)
         self._checkpoint_thread.start()
 
+    def get_meta(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM db_meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO db_meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self.conn.commit()
+
     def _ensure_schema_extensions(self) -> None:
         """Idempotent migrations for existing DBs."""
+        # Tiny key/value table used for embedding fingerprint and other
+        # invariants the codebase needs to enforce one-model-per-DB.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS db_meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(connections)").fetchall()}
         migrations = {
             "event_time": "ALTER TABLE connections ADD COLUMN event_time REAL",
@@ -615,6 +633,13 @@ class NeuralMemory:
 
         self.dim = self.embedder.dim
         self._db_path = Path(db_path)
+
+        # ONE MODEL invariant: pin the DB to whichever embedding backend
+        # wrote its first memory. A subsequent open with a different model
+        # would have produced silent dim-truncation in cosine similarity
+        # (see iter 11) — surface it loudly instead.
+        self._embed_fingerprint = self._compute_embed_fingerprint()
+        self._dim_locked, self._dim_mismatch_reason = self._enforce_dim_lock()
         self._retrieval_mode = (retrieval_mode or "semantic").lower()
         self._retrieval_candidates = max(8, int(retrieval_candidates or 64))
         self._lazy_graph = bool(lazy_graph)
@@ -668,20 +693,91 @@ class NeuralMemory:
                 self._gpu = None
 
         self._graph_nodes: dict[int, dict] = {}
+        # Counter set by _load_from_store; surfaced via stats() so operators
+        # can spot a corrupt-on-arrival DB (mixed-dim memories from a prior
+        # backend swap) without grepping logs.
+        self._quarantined_dim: int = 0
         if not self._lazy_graph:
             self._load_from_store()
+
+    # -- one-model invariant -------------------------------------------------
+
+    def _compute_embed_fingerprint(self) -> str:
+        """Identity string for the active embedding backend.
+
+        Combines class name, declared dim, and (when available) the model
+        name. Stable across processes for the same backend selection.
+        """
+        backend = getattr(self.embedder, "backend", self.embedder)
+        cls = type(backend).__name__
+        model = getattr(backend, "model_name", None) or getattr(backend, "name", "")
+        return f"{cls}::{self.dim}::{model}"
+
+    def _enforce_dim_lock(self) -> tuple[bool, str]:
+        """Compare the active backend against the DB's stored fingerprint.
+
+        First write to a fresh DB pins the fingerprint. Subsequent opens
+        with a different-dim backend produce a soft-fail: the DB stays
+        readable, mismatched-dim memories are quarantined out of the
+        in-memory graph, and remember() rejects new writes that don't
+        match the locked dim. Same-dim swaps (different model, same
+        vector size) are allowed because the existing memories remain
+        comparable.
+        """
+        if not hasattr(self.store, "get_meta"):
+            # MSSQLStore doesn't expose db_meta; treat as unlocked.
+            return False, ""
+        stored = self.store.get_meta("embed_fingerprint")
+        if stored is None:
+            # Fresh DB — pin to current backend on first construction. The
+            # fingerprint is also persisted lazily on first remember(), but
+            # writing it here makes stats() informative even before a write.
+            self.store.set_meta("embed_fingerprint", self._embed_fingerprint)
+            stored_dim = self.store.get_meta("embed_dim")
+            if stored_dim is None:
+                self.store.set_meta("embed_dim", str(self.dim))
+            return True, ""
+        try:
+            stored_dim = int(self.store.get_meta("embed_dim") or "0")
+        except ValueError:
+            stored_dim = 0
+        if stored_dim and stored_dim != self.dim:
+            reason = (
+                f"DB was pinned at dim={stored_dim} ({stored}); "
+                f"current backend is dim={self.dim} ({self._embed_fingerprint}). "
+                f"New writes will be rejected; old memories quarantined from "
+                f"similarity until re-embedded."
+            )
+            import logging
+            logging.getLogger(__name__).warning("[neural] dim mismatch — %s", reason)
+            return False, reason
+        # Same dim, possibly different model. Update the fingerprint so the
+        # next open gets the precise identity, but keep the lock active.
+        if stored != self._embed_fingerprint:
+            self.store.set_meta("embed_fingerprint", self._embed_fingerprint)
+        return True, ""
 
     # -- graph/index hydration ------------------------------------------------
 
     def _load_from_store(self):
         all_mems = self.store.get_all()
+        quarantined = 0
         for mem in all_mems:
+            emb = mem.get("embedding") or []
+            # Quarantine: don't load embeddings whose dim disagrees with the
+            # active backend. Keeping the row in DB preserves the user's
+            # data; excluding it from _graph_nodes prevents zip-truncation
+            # (already guarded by iter 11) and keeps hot-path code simple.
+            if emb and len(emb) != self.dim:
+                quarantined += 1
+                emb = []
             self._graph_nodes[mem["id"]] = {
-                "embedding": mem["embedding"],
+                "embedding": emb,
                 "label": mem["label"],
                 "content": mem.get("content", ""),
                 "connections": {},
             }
+        self._quarantined_dim = quarantined
         for mem in all_mems:
             self._refresh_connections(mem["id"])
         if self._cpp:
@@ -753,6 +849,19 @@ class NeuralMemory:
 
     def remember(self, text: str, label: str = "", detect_conflicts: bool = True, auto_connect: bool = True) -> int:
         embedding = self.embedder.embed(text)
+        # Hard guard: refuse to write a vector whose dim disagrees with the
+        # DB's pinned dim. The alternative (writing it anyway) corrupts every
+        # subsequent recall against this row.
+        if not self._dim_locked:
+            raise RuntimeError(
+                f"refusing to write: {self._dim_mismatch_reason} "
+                "Re-open with the original embedding backend, or drop the DB."
+            )
+        if len(embedding) != self.dim:
+            raise RuntimeError(
+                f"embedder produced dim={len(embedding)}, expected {self.dim} "
+                f"({self._embed_fingerprint})"
+            )
         label = label or text[:60]
 
         if detect_conflicts and label:
@@ -1252,6 +1361,10 @@ class NeuralMemory:
             "revisions": graph.get("revisions", 0),
             "embedding_dim": self.dim,
             "embedding_backend": self.embedder.backend.__class__.__name__,
+            "embed_fingerprint": self._embed_fingerprint,
+            "dim_locked": self._dim_locked,
+            "dim_mismatch_reason": self._dim_mismatch_reason or None,
+            "quarantined_dim": self._quarantined_dim,
             "retrieval_mode": self._retrieval_mode,
             "lazy_graph": self._lazy_graph,
             "hnsw_enabled": self._hnsw_enabled,
