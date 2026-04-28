@@ -397,21 +397,35 @@ class Memory:
         if chunk_size is None:
             chunk_size = self._default_chunk_size
         
-        chunks = self.chunk_text(text, chunk_size, overlap)
-        
+        chunks = [c for c in self.chunk_text(text, chunk_size, overlap) if c and c.strip()]
+        if not chunks:
+            return []
+
         if len(chunks) == 1:
-            return [self.remember(chunks[0], label, auto_chunk=False)]
-        
+            mid = self.remember(chunks[0], label, auto_chunk=False)
+            return [mid] if mid != -1 else []
+
         ids = []
         for i, chunk in enumerate(chunks):
             chunk_label = f"{label} [chunk {i+1}/{len(chunks)}]" if label else f"[chunk {i+1}/{len(chunks)}]"
-            ids.append(self.remember(chunk, chunk_label, auto_chunk=False))
-        
+            mid = self.remember(chunk, chunk_label, auto_chunk=False)
+            if mid != -1:
+                ids.append(mid)
         return ids
     
     def remember(self, text: str, label: str = "", auto_chunk: bool = True,
                  auto_connect: bool = True, detect_conflicts: bool = True) -> int | list[int]:
-        """Store a memory. SQLite primary, MSSQL mirror. Returns memory ID."""
+        """Store a memory. SQLite primary, MSSQL mirror. Returns memory ID.
+
+        Refuses empty-after-strip text. Without this guard, chunk_text('')
+        returned [''] and remember_chunked happily stored an empty-content
+        memory, polluting the DB with junk rows that auto_connect would
+        then try to similarity-match against (HashBackend embeds an empty
+        string to a high-similarity zero vector, dragging unrelated rows
+        into the connection graph).
+        """
+        if not text or not text.strip():
+            return -1
         if auto_chunk and len(text) > self._default_chunk_size * 2:
             return self.remember_chunked(text, label)
 
@@ -428,7 +442,7 @@ class Memory:
         # We must mirror what SQLite ACTUALLY wrote, not what we passed in:
         # NeuralMemory.remember may have run conflict-fusion and rewritten
         # the row's content as \"[CANONICAL] new\\n[PREVIOUSLY] old\". Passing
-        # the bare \`text\` would diverge the mirror from SQLite's
+        # the bare `text` would diverge the mirror from SQLite's
         # post-fusion content. Read the canonical row back and mirror that.
         if self._mssql_store:
             try:
@@ -448,7 +462,7 @@ class Memory:
                 # Mirror any connections SQLite's auto_connect just attached
                 # to this memory. Without this, MSSQL has the memory rows but
                 # no edges between them — so recall_multihop's MSSQL graph
-                # expansion (\`get_connections(id)\`) returns [] even though
+                # expansion (`get_connections(id)`) returns [] even though
                 # SQLite knows the edges. With ID alignment from iter 48
                 # both sides agree on which row each edge points at.
                 self._mirror_connections_for(int(mem_id))
@@ -495,7 +509,7 @@ class Memory:
     def _ensure_mssql_memory(self, mem_id: int) -> None:
         """Make sure memory `mem_id` exists in MSSQL; mirror it from SQLite if not.
 
-        Cheap fast-path: a single-row \`SELECT 1 FROM memories WHERE id=?\`
+        Cheap fast-path: a single-row `SELECT 1 FROM memories WHERE id=?`
         decides whether the lazy backfill is needed. The expensive case
         (read SQLite + MSSQL upsert) only fires for memories pre-dating
         MSSQL configuration. Previously this called the full get(id), which

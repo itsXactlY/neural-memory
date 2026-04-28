@@ -1039,7 +1039,7 @@ class NeuralMemory:
                 other_emb = other.get("embedding") or []
                 # Fail closed: missing or dim-mismatched neighbour embedding
                 # means we cannot verify similarity, so we MUST NOT fuse —
-                # the previous \`if other_emb and cos(...) < 0.85: continue\`
+                # the previous `if other_emb and cos(...) < 0.85: continue`
                 # short-circuited on empty embeddings and let the destructive
                 # fusion path run unchecked. _cosine_similarity already
                 # returns 0.0 on dim mismatch (iter 11); explicit empty-list
@@ -1055,7 +1055,7 @@ class NeuralMemory:
                     self.store.add_revision(int(other["id"]), old_content, text, "conflict_fusion")
                     self.store.update_memory(int(other["id"]), fused, embedding, label=label)
                     # Cache MUST mirror what was actually written to DB.
-                    # Was setting content=text here while DB held \`fused\`,
+                    # Was setting content=text here while DB held `fused`,
                     # so recall via _graph_nodes saw the raw new content but
                     # recall via store.get_many saw the [CANONICAL]/[PREVIOUSLY]
                     # marker — same memory, two contents, depending on path.

@@ -189,7 +189,7 @@ class AccessLogger:
         """
         with self._file_lock:
             # collections.deque does not support negative-index slicing —
-            # \`self._buffer[-max_seq:]\` raises TypeError. Use itertools.islice
+            # `self._buffer[-max_seq:]` raises TypeError. Use itertools.islice
             # to take the last `max_seq` items in O(n) but never crash.
             start = max(0, len(self._buffer) - max_seq)
             events = list(itertools.islice(self._buffer, start, None))

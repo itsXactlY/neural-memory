@@ -459,7 +459,7 @@ class SentenceTransformerBackend:
     _last_used = 0.0
     _eject_timer = None
     # Initialised at class-body time. Previously lazy via
-    # \`if _lock is None: _lock = Lock()\`, which has the same lock-init
+    # `if _lock is None: _lock = Lock()`, which has the same lock-init
     # race fixed in FastEmbedBackend (see iter 40 commit message). Eager
     # init eliminates the race; the cost is negligible (one Lock object
     # per backend class at module load).
@@ -510,7 +510,7 @@ class SentenceTransformerBackend:
         import time as time_module
 
         # Lock is now class-level (initialised at class-body time, see iter
-        # 40). The previous \`if _lock is None: _lock = Lock()\` lazy-init was
+        # 40). The previous `if _lock is None: _lock = Lock()` lazy-init was
         # itself racy — two threads could install distinct Lock objects.
 
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -992,7 +992,7 @@ class FastEmbedBackend:
     _shared_dim = None
     # Initialised at class-body time so the double-checked-locking idiom in
     # __init__ is actually safe. Previously the lock itself was lazy-inited
-    # under \`if _lock is None: _lock = Lock()\`, which is not atomic — two
+    # under `if _lock is None: _lock = Lock()`, which is not atomic — two
     # threads racing through the first construction could each install a
     # different Lock object, defeating the singleton-load guarantee and
     # producing two ONNX model copies (the exact failure the singleton was
