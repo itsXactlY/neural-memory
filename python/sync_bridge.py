@@ -141,6 +141,12 @@ class SyncBridge:
         self._running = False
         self._interval = DEFAULT_INTERVAL
         self._mssql_conn = None
+        # Stop event for the continuous loop. Replaces the prior
+        # "for _ in range(N): time.sleep(1)" + "time.sleep(N*3)" pair that
+        # made stop() block for up to (N*3) seconds during a backoff window
+        # — at the default 5-minute interval, a 15-minute uncancellable
+        # sleep. With Event.wait(timeout), stop() wakes the loop instantly.
+        self._stop_event = threading.Event()
 
     def _get_mssql_conn(self):
         """Get or create MSSQL connection. Returns None if unavailable."""
@@ -270,38 +276,47 @@ class SyncBridge:
         mssql.commit()
 
         synced, errors = 0, 0
-        for row in rows:
-            id_, label, content, blob, salience, created, accessed, acc = row
-            if blob:
-                elem_count = len(blob) // 4
-                emb_blob = struct.pack(f"{elem_count}f", *struct.unpack(f"{elem_count}f", blob))
-                emb_dim = elem_count
-            else:
-                emb_blob = None
-                emb_dim = 1024
+        # IDENTITY_INSERT is per-session; if the per-row INSERT loop raises
+        # (e.g. MSSQL connection drops mid-batch), the OFF must still run or
+        # this connection is left in a state where every future autoincrement
+        # INSERT fails. Wrap in try/finally — and best-effort the OFF since
+        # the caller might already be torn down by a connection error.
+        try:
+            for row in rows:
+                id_, label, content, blob, salience, created, accessed, acc = row
+                if blob:
+                    elem_count = len(blob) // 4
+                    emb_blob = struct.pack(f"{elem_count}f", *struct.unpack(f"{elem_count}f", blob))
+                    emb_dim = elem_count
+                else:
+                    emb_blob = None
+                    emb_dim = 1024
 
-            def _ts(ts):
-                if not ts:
-                    return "1970-01-01 00:00:00.0000000"
-                return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+                def _ts(ts):
+                    if not ts:
+                        return "1970-01-01 00:00:00.0000000"
+                    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
+                try:
+                    mc.execute(
+                        "INSERT INTO memories (id, label, content, embedding, vector_dim, "
+                        "salience, created_at, last_accessed, access_count) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        id_, label, content, emb_blob, emb_dim,
+                        salience or 1.0, _ts(created), _ts(accessed), acc or 0,
+                    )
+                    synced += 1
+                except Exception as e:
+                    errors += 1
+                    if errors <= 2:
+                        logger.warning(f"Error syncing memory {id_}: {e}")
+            mssql.commit()
+        finally:
             try:
-                mc.execute(
-                    "INSERT INTO memories (id, label, content, embedding, vector_dim, "
-                    "salience, created_at, last_accessed, access_count) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    id_, label, content, emb_blob, emb_dim,
-                    salience or 1.0, _ts(created), _ts(accessed), acc or 0,
-                )
-                synced += 1
-            except Exception as e:
-                errors += 1
-                if errors <= 2:
-                    logger.warning(f"Error syncing memory {id_}: {e}")
-
-        mssql.commit()
-        mc.execute("SET IDENTITY_INSERT memories OFF")
-        mssql.commit()
+                mc.execute("SET IDENTITY_INSERT memories OFF")
+                mssql.commit()
+            except Exception:
+                pass
 
         return synced, errors, skipped
 
@@ -328,38 +343,52 @@ class SyncBridge:
         mssql.commit()
 
         synced, errors = 0, 0
-        batch = 500
-        for i in range(0, len(missing), batch):
-            chunk = missing[i:i + batch]
-            data = [
-                (next_id + j, s, t, round(w, 6), "similar")
-                for j, (s, t, w) in enumerate(chunk)
-            ]
-            try:
-                mc.fast_executemany = True
-                mc.executemany(
-                    "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
-                    "VALUES (?,?,?,?,?)", data,
-                )
-                mssql.commit()
-                synced += len(chunk)
-                next_id += len(chunk)
-            except Exception:
-                for row in data:
-                    try:
-                        mc.execute(
-                            "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
-                            "VALUES (?,?,?,?,?)", *row,
-                        )
-                        synced += 1
-                        next_id += 1
-                    except Exception:
-                        errors += 1
-                mssql.commit()
-
-        mc.execute("SET IDENTITY_INSERT connections OFF")
-        mc.execute("ALTER TABLE connections WITH CHECK CHECK CONSTRAINT ALL")
-        mssql.commit()
+        # As with _sync_new_memories: the IDENTITY_INSERT toggle and the
+        # NOCHECK constraint disable MUST be paired with their counterparts
+        # in finally, otherwise a mid-loop MSSQL disconnect leaves the
+        # connection wedged with IDENTITY_INSERT ON and FK checks disabled.
+        # Both are session-scoped, but a session that survives the failure
+        # (e.g. a connection-pooler) carries the broken state to the next
+        # caller and breaks unrelated work.
+        try:
+            batch = 500
+            for i in range(0, len(missing), batch):
+                chunk = missing[i:i + batch]
+                data = [
+                    (next_id + j, s, t, round(w, 6), "similar")
+                    for j, (s, t, w) in enumerate(chunk)
+                ]
+                try:
+                    mc.fast_executemany = True
+                    mc.executemany(
+                        "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
+                        "VALUES (?,?,?,?,?)", data,
+                    )
+                    mssql.commit()
+                    synced += len(chunk)
+                    next_id += len(chunk)
+                except Exception:
+                    for row in data:
+                        try:
+                            mc.execute(
+                                "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
+                                "VALUES (?,?,?,?,?)", *row,
+                            )
+                            synced += 1
+                            next_id += 1
+                        except Exception:
+                            errors += 1
+                    mssql.commit()
+        finally:
+            for cleanup_sql in (
+                "SET IDENTITY_INSERT connections OFF",
+                "ALTER TABLE connections WITH CHECK CHECK CONSTRAINT ALL",
+            ):
+                try:
+                    mc.execute(cleanup_sql)
+                    mssql.commit()
+                except Exception:
+                    pass
 
         return synced, errors
 
@@ -405,36 +434,43 @@ class SyncBridge:
             mc.execute("SET IDENTITY_INSERT memories ON")
             mssql.commit()
 
-            for row in rows:
-                id_, label, content, blob, salience, created, accessed, acc = row
-                if blob:
-                    elem_count = len(blob) // 4
-                    emb_blob = struct.pack(f"{elem_count}f", *struct.unpack(f"{elem_count}f", blob))
-                    emb_dim = elem_count
-                else:
-                    emb_blob = None
-                    emb_dim = 1024
+            try:
+                for row in rows:
+                    id_, label, content, blob, salience, created, accessed, acc = row
+                    if blob:
+                        elem_count = len(blob) // 4
+                        emb_blob = struct.pack(f"{elem_count}f", *struct.unpack(f"{elem_count}f", blob))
+                        emb_dim = elem_count
+                    else:
+                        emb_blob = None
+                        emb_dim = 1024
 
-                def _ts(ts):
-                    if not ts:
-                        return "1970-01-01 00:00:00.0000000"
-                    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+                    def _ts(ts):
+                        if not ts:
+                            return "1970-01-01 00:00:00.0000000"
+                        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
+                    try:
+                        mc.execute(
+                            "INSERT INTO memories (id, label, content, embedding, vector_dim, "
+                            "salience, created_at, last_accessed, access_count) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            id_, label, content, emb_blob, emb_dim,
+                            salience or 1.0, _ts(created), _ts(accessed), acc or 0,
+                        )
+                        result["memories"] += 1
+                    except Exception:
+                        result["errors"] += 1
+                mssql.commit()
+            finally:
+                # Always clear IDENTITY_INSERT so a mid-batch failure doesn't
+                # leave the connection in a state that breaks every future
+                # autoincrement INSERT (see _sync_new_memories for the same fix).
                 try:
-                    mc.execute(
-                        "INSERT INTO memories (id, label, content, embedding, vector_dim, "
-                        "salience, created_at, last_accessed, access_count) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        id_, label, content, emb_blob, emb_dim,
-                        salience or 1.0, _ts(created), _ts(accessed), acc or 0,
-                    )
-                    result["memories"] += 1
+                    mc.execute("SET IDENTITY_INSERT memories OFF")
+                    mssql.commit()
                 except Exception:
-                    result["errors"] += 1
-
-            mssql.commit()
-            mc.execute("SET IDENTITY_INSERT memories OFF")
-            mssql.commit()
+                    pass
 
             # Sync connections
             sc.execute("SELECT source_id, target_id, weight FROM connections ORDER BY id")
@@ -444,39 +480,46 @@ class SyncBridge:
             mc.execute("SET IDENTITY_INSERT connections ON")
             mssql.commit()
 
-            next_id = 1
-            batch = 1000
-            for i in range(0, len(conn_rows), batch):
-                chunk = conn_rows[i:i + batch]
-                data = [
-                    (next_id + j, s, t, round(w, 6), "similar")
-                    for j, (s, t, w) in enumerate(chunk)
-                ]
-                try:
-                    mc.fast_executemany = True
-                    mc.executemany(
-                        "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
-                        "VALUES (?,?,?,?,?)", data,
-                    )
-                    mssql.commit()
-                    result["connections"] += len(chunk)
-                    next_id += len(chunk)
-                except Exception:
-                    for row in data:
-                        try:
-                            mc.execute(
-                                "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
-                                "VALUES (?,?,?,?,?)", *row,
-                            )
-                            result["connections"] += 1
-                            next_id += 1
-                        except Exception:
-                            result["errors"] += 1
-                    mssql.commit()
-
-            mc.execute("SET IDENTITY_INSERT connections OFF")
-            mc.execute("ALTER TABLE connections WITH CHECK CHECK CONSTRAINT ALL")
-            mssql.commit()
+            try:
+                next_id = 1
+                batch = 1000
+                for i in range(0, len(conn_rows), batch):
+                    chunk = conn_rows[i:i + batch]
+                    data = [
+                        (next_id + j, s, t, round(w, 6), "similar")
+                        for j, (s, t, w) in enumerate(chunk)
+                    ]
+                    try:
+                        mc.fast_executemany = True
+                        mc.executemany(
+                            "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
+                            "VALUES (?,?,?,?,?)", data,
+                        )
+                        mssql.commit()
+                        result["connections"] += len(chunk)
+                        next_id += len(chunk)
+                    except Exception:
+                        for row in data:
+                            try:
+                                mc.execute(
+                                    "INSERT INTO connections (id, source_id, target_id, weight, edge_type) "
+                                    "VALUES (?,?,?,?,?)", *row,
+                                )
+                                result["connections"] += 1
+                                next_id += 1
+                            except Exception:
+                                result["errors"] += 1
+                        mssql.commit()
+            finally:
+                for cleanup_sql in (
+                    "SET IDENTITY_INSERT connections OFF",
+                    "ALTER TABLE connections WITH CHECK CHECK CONSTRAINT ALL",
+                ):
+                    try:
+                        mc.execute(cleanup_sql)
+                        mssql.commit()
+                    except Exception:
+                        pass
 
             result["skipped"] = skipped
             self.state.record_success(result["memories"], result["connections"])
@@ -492,7 +535,7 @@ class SyncBridge:
     def _continuous_loop(self):
         """Background sync loop."""
         logger.info(f"Continuous sync started (interval={self._interval}s)")
-        while self._running:
+        while not self._stop_event.is_set():
             try:
                 result = self.sync_incremental(filter_garbage=True)
                 if result["errors"] and self.state.consecutive_failures > 5:
@@ -500,16 +543,18 @@ class SyncBridge:
                         f"{self.state.consecutive_failures} consecutive failures, "
                         "backing off..."
                     )
-                    time.sleep(self._interval * 3)
+                    # Cancellable backoff. Event.wait returns True if set,
+                    # which means stop() was called — exit the loop instead
+                    # of starting another sync after the backoff window.
+                    if self._stop_event.wait(self._interval * 3):
+                        break
                     continue
             except Exception as e:
                 logger.error(f"Sync loop error: {e}")
 
-            # Wait for next interval or until stopped
-            for _ in range(int(self._interval)):
-                if not self._running:
-                    break
-                time.sleep(1)
+            # Cancellable inter-cycle wait — stop() unblocks immediately.
+            if self._stop_event.wait(self._interval):
+                break
 
         logger.info("Continuous sync stopped")
 
@@ -521,12 +566,14 @@ class SyncBridge:
 
         self._interval = interval
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._continuous_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """Stop continuous sync."""
+        """Stop continuous sync. Wakes the loop immediately via stop_event."""
         self._running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
             self._thread = None
