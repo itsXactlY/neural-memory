@@ -376,6 +376,17 @@ class SharedEmbedClient:
                 resp = self._send({"cmd": "ping"})
                 self._dim = resp.get("dim", 1024)
                 return  # success
+            except (FileNotFoundError, ConnectionRefusedError) as e:
+                # Hard \"server not there\" signals — no server is listening on
+                # the socket path or the socket file is missing entirely.
+                # Retrying just adds startup latency (the previous code spent
+                # ~6s of backoff before giving up on a clearly-dead server).
+                # Fail fast so _auto_detect falls through to a direct load.
+                if self._sock:
+                    try: self._sock.close()
+                    except Exception: pass
+                    self._sock = None
+                raise e
             except (socket.timeout, socket.error, OSError) as e:
                 last_err = e
                 if self._sock:
