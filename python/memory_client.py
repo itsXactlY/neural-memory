@@ -1271,9 +1271,16 @@ class NeuralMemory:
         )
         deleted = cur.rowcount
         self.store.conn.commit()
-        # Invalidate in-memory graph cache so subsequent recalls re-read.
-        for nid in list(self._graph_nodes.keys()):
-            self._graph_nodes[nid]["connections"] = {}
+        # Mirror the DELETE in the in-memory graph cache. Filter out sub-threshold
+        # edges per node — DO NOT clear the whole connections dict, or every
+        # surviving edge (weight >= threshold) disappears from recall/think
+        # traversals until the cache is reloaded.
+        thr = float(threshold)
+        for node in self._graph_nodes.values():
+            conns = node.get("connections")
+            if not conns:
+                continue
+            node["connections"] = {nid: w for nid, w in conns.items() if w >= thr}
         self._hnsw_dirty = True
         return int(deleted)
 
