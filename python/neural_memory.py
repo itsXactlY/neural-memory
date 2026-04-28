@@ -697,50 +697,55 @@ class Memory:
         return s
     
     def close(self):
-        """Clean shutdown. Saves LSTM weights, closes stores."""
-        # Save LSTM weights for next session
+        """Clean shutdown. Saves LSTM weights, flushes logger, closes stores.
+
+        Each subsystem is closed exactly ONCE — the previous body had
+        symmetric duplicate calls (sqlite/mssql close at the top AND at
+        the bottom, knn close + None + close again). pyodbc tolerates
+        double-close as a no-op, but it's still misleading. Order: save
+        learned state first (LSTM weights, access logs), then tear down
+        engines (knn, lstm), then close stores last so any in-flight
+        save can still talk to the underlying file/socket.
+        """
+        # 1. Save LSTM weights for next session
         if self._lstm_knn_ready and self._lstm:
             try:
                 lstm_weights_path = str(Path.home() / ".neural_memory" / "lstm_weights.bin")
                 self._lstm.save(lstm_weights_path)
             except Exception:
                 pass
-        # Close kNN engine
+        # 2. Flush access logger to disk before tearing down store
+        if self._access_logger:
+            try:
+                self._access_logger.save()
+            except Exception:
+                pass
+        # 3. Close LSTM + kNN engines (compute side, no on-disk state)
         if self._knn:
             try:
                 self._knn.close()
             except Exception:
                 pass
-        # Close stores (SQLite first, then MSSQL mirror)
-        try:
-            self._sqlite_memory.close()
-        except Exception:
-            pass
-        if self._mssql_store:
-            try:
-                self._mssql_store.close()
-            except Exception:
-                pass
-        self._knn = None
-        # Close LSTM
+            self._knn = None
         if self._lstm:
             try:
                 self._lstm.close()
             except Exception:
                 pass
             self._lstm = None
-        # Flush access logger
-        if self._access_logger:
+        # 4. Close stores (SQLite first, then MSSQL mirror) — single close.
+        if self._sqlite_memory:
             try:
-                self._access_logger.save()
+                self._sqlite_memory.close()
             except Exception:
                 pass
-        if self._mssql_store:
-            self._mssql_store.close()
-            self._mssql_store = None
-        if self._sqlite_memory:
-            self._sqlite_memory.close()
             self._sqlite_memory = None
+        if self._mssql_store:
+            try:
+                self._mssql_store.close()
+            except Exception:
+                pass
+            self._mssql_store = None
     
     @property
     def dim(self) -> int:
