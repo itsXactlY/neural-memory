@@ -1479,15 +1479,19 @@ class NeuralMemory:
         total_seed = sum(max(0.0, float(v)) for v in seeds.values()) or 1.0
         personalization = {n: max(0.0, float(seeds.get(n, 0.0))) / total_seed for n in nodes}
         p = dict(personalization)
+        # Adjacency weights do not change between iterations; precompute the
+        # outgoing-weight denominator once instead of summing on every visit
+        # inside the inner loop. Tiny constant-factor win, but PPR is on the
+        # recall hot path.
+        denoms = {u: (sum(nbrs.values()) or 1.0) for u, nbrs in adj.items()}
         for _ in range(max(1, iters)):
             newp = {n: alpha * personalization.get(n, 0.0) for n in nodes}
             for u, nbrs in adj.items():
                 if not nbrs:
                     continue
-                denom = sum(nbrs.values()) or 1.0
-                share = (1.0 - alpha) * p.get(u, 0.0)
+                share_per_unit = (1.0 - alpha) * p.get(u, 0.0) / denoms[u]
                 for v, w in nbrs.items():
-                    newp[v] = newp.get(v, 0.0) + share * (w / denom)
+                    newp[v] = newp.get(v, 0.0) + share_per_unit * w
             s = sum(newp.values()) or 1.0
             p = {n: v / s for n, v in newp.items()}
         max_score = max(p.values()) if p else 1.0
