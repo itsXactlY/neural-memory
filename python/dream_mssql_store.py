@@ -300,14 +300,26 @@ class DreamMSSQLStore:
 
     def add_bridge(self, source_id: int, target_id: int,
                     weight: float = 0.3) -> None:
-        """Add a new bridge connection."""
-        # Check if exists
+        """Add a new bridge connection.
+
+        Canonicalises source<target so the row matches the invariant the
+        Python side enforces in SQLiteStore.add_connection. Without this
+        canonicalisation, the MSSQL connections table accumulated mixed-
+        orientation rows: an edge added by the application's auto_connect
+        path was always (min, max), but a bridge from REM could be
+        (max, min). Downstream queries that assume canonical form would
+        miss the bridge half the time. See iter 23 for the SQLite-side
+        twin of this fix.
+        """
+        if source_id == target_id:
+            return
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
+        # Check if exists — only one orientation now, so the OR clause is gone.
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id FROM connections "
-            "WHERE (source_id = ? AND target_id = ?) "
-            "OR (source_id = ? AND target_id = ?)",
-            source_id, target_id, target_id, source_id
+            "SELECT id FROM connections WHERE source_id = ? AND target_id = ?",
+            source_id, target_id,
         )
         if cursor.fetchone():
             return
