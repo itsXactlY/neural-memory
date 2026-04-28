@@ -877,32 +877,45 @@ memory?") call `neural_graph` to summarise.
                 logger.debug("Turn archive failed: %s", e)
 
     def _on_pre_llm_call(self, session_id: str, user_message: str, **kwargs) -> None:
-        """Internal: activity signal from pre_llm_call hook.
-        
-        Registered as a plugin hook (pre_llm_call) to get notified on every turn.
-        This is the PRIMARY activity signal — fires once per turn, before any tool
-        calls or LLM processing.
-        
-        Pause/resume pattern:
-        - pre_llm_call: record if dreaming, then pause, touch idle timer
-        - post_llm_call: resume if it was running and still idle
+        """Internal: fires once per turn, before LLM processing.
+
+        Two responsibilities:
+
+          1. Dream-engine pause/resume bookkeeping (existing).
+          2. Auto-recall for THIS turn's user_message and stash the result
+             in self._prefetch_result so the next prefetch() call returns
+             memories relevant to the current query — not the previous
+             turn's.
+
+        Why eager-recall here:
+        Even with the iter-72 system-prompt push, weak models (minimax/
+        wonderland-tier) often forget to call neural_recall. Auto-firing
+        a recall and INJECTING the hits into the prefetch context means
+        the relevant memories are RIGHT THERE in the prompt, whether the
+        model bothered to call the tool or not. The model still has the
+        option to call neural_recall for a tighter query — but it can't
+        accidentally answer from its weights when the answer is sitting
+        in front of it.
         """
-        if self._dream is None:
-            return
-        
-        # Record whether the dream engine was running when this turn started
-        self._dream_was_running_before_turn = (
-            hasattr(self._dream, '_thread') 
-            and self._dream._thread is not None 
-            and self._dream._thread.is_alive()
-        )
-        
-        # Stop the dream engine for the duration of this turn
-        if self._dream_was_running_before_turn:
-            self._dream.stop()
-        
-        # Always reset the idle timer on activity
-        self._dream.touch()
+        # 1. Dream pause/resume
+        if self._dream is not None:
+            self._dream_was_running_before_turn = (
+                hasattr(self._dream, '_thread')
+                and self._dream._thread is not None
+                and self._dream._thread.is_alive()
+            )
+            if self._dream_was_running_before_turn:
+                self._dream.stop()
+            self._dream.touch()
+
+        # 2. Auto-recall for this turn (fire-and-forget — same generation
+        # guard as queue_prefetch, so concurrent turns don't race).
+        # Skip for empty/very-short messages where recall is noise.
+        if user_message and len(user_message.strip()) >= 4:
+            try:
+                self.queue_prefetch(user_message, session_id=session_id)
+            except Exception as e:
+                logger.debug("Auto-recall queue failed: %s", e)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return ALL_TOOL_SCHEMAS
