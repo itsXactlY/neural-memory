@@ -54,6 +54,9 @@ ALL_SUITES = [
     "graph", "concurrent", "conflict", "mssql", "agentic", "qa",
     # v2 suites — added for the "truly unique" pass:
     "diversity", "lstm_knn", "continuity", "conflict_quality", "baseline",
+    # v3 suites — codex audit 2026-04-28 follow-ups:
+    "graph_reasoning", "channel_ablation", "hnsw_exactness",
+    "dream_derived_fact", "continuity_controls",
 ]
 
 
@@ -248,6 +251,57 @@ def _run_baseline(cfg, memories, queries):
     return bm.run()
 
 
+def _run_graph_reasoning(cfg, memories, queries):
+    from suites.graph_reasoning import GraphReasoningBenchmark
+    return GraphReasoningBenchmark(
+        db_path=_new_db(),
+        output_dir=cfg.paths.results_dir,
+        n_chains=30,
+        seed=cfg.dataset.seed,
+    ).run()
+
+
+def _run_channel_ablation(cfg, memories, queries):
+    from suites.channel_ablation import ChannelAblationBenchmark
+    return ChannelAblationBenchmark(
+        db_path=_new_db(),
+        memories=memories,
+        queries=queries,
+        output_dir=cfg.paths.results_dir,
+    ).run()
+
+
+def _run_hnsw_exactness(cfg, memories, queries):
+    from suites.hnsw_exactness import HNSWExactnessBenchmark
+    return HNSWExactnessBenchmark(
+        memories=memories,
+        queries=queries,
+        output_dir=cfg.paths.results_dir,
+        tiers=[1_000, 10_000],
+    ).run()
+
+
+def _run_dream_derived_fact(cfg, memories, queries):
+    from suites.dream_derived_fact import DreamDerivedFactBenchmark
+    return DreamDerivedFactBenchmark(
+        db_path=_new_db(),
+        output_dir=cfg.paths.results_dir,
+        n_premises=25,
+        seed=cfg.dataset.seed,
+    ).run()
+
+
+def _run_continuity_controls(cfg, memories, queries):
+    from suites.continuity_controls import ContinuityControlsBenchmark
+    return ContinuityControlsBenchmark(
+        db_path=_new_db(),
+        output_dir=cfg.paths.results_dir,
+        target_facts=50,
+        noise_tiers=[0, 200, 1000, 5000],
+        seed=cfg.dataset.seed,
+    ).run()
+
+
 SUITE_RUNNERS = {
     "retrieval":   _run_retrieval,
     "dream":       _run_dream,
@@ -265,6 +319,12 @@ SUITE_RUNNERS = {
     "continuity":         _run_continuity,
     "conflict_quality":   _run_conflict_quality,
     "baseline":           _run_baseline,
+    # v3 suites — codex 2026-04-28
+    "graph_reasoning":    _run_graph_reasoning,
+    "channel_ablation":   _run_channel_ablation,
+    "hnsw_exactness":     _run_hnsw_exactness,
+    "dream_derived_fact": _run_dream_derived_fact,
+    "continuity_controls": _run_continuity_controls,
 }
 
 

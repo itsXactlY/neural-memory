@@ -129,6 +129,17 @@ class BaselineComparisonBenchmark:
         # retrieval, not encoding.
         embedder = EmbeddingProvider(backend="auto")
 
+        # Codex audit 2026-04-28 flagged that raw cosine ran first and warmed
+        # the shared embedding cache, biasing setup_s toward neural-memory.
+        # Warm both sides equally before measurement: embed every memory text
+        # AND every query once through the shared embedder, so cache misses
+        # are paid up-front before either side reports timing.
+        print("  [warmup] priming shared embedder cache...")
+        for m in self.memories:
+            embedder.embed(m["text"])
+        for q in self.queries:
+            embedder.embed(q["query"])
+
         print("  [baseline] building raw cosine index...")
         raw = _RawCosineIndex(embedder)
         raw_setup_s = raw.add_batch(self.memories)
@@ -148,7 +159,10 @@ class BaselineComparisonBenchmark:
         nm_perf = _measure(lambda q, k=5: nm.recall(q, k=k), self.queries, self.k)
         nm_perf["setup_s"] = round(nm_setup_s, 2)
 
-        # Skynet mode reuses the same DB + index.
+        # Skynet mode reuses the same DB + index. Note: this means skynet's
+        # latency benefits from a hot cache populated by the prior semantic
+        # measurement. We're explicit about the asymmetry so a reader
+        # knows skynet's p50 is best-case warm.
         nm._retrieval_mode = "skynet"
         nm_skynet = _measure(lambda q, k=5: nm.recall(q, k=k), self.queries, self.k)
 

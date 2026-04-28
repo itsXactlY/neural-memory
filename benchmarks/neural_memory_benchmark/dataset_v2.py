@@ -79,6 +79,15 @@ _STOPWORDS = frozenset({
 })
 
 
+# Global anchor registry — shared across ALL ParaphraseGenerator instances in
+# the same process. Codex audit (2026-04-28) caught that anchor uniqueness
+# was per-instance, so the continuity suite (which used a separate noise
+# generator) hit ~8 anchor collisions at the 5K noise tier and silently
+# polluted ground-truth lookup.
+_GLOBAL_ANCHOR_LOCK = __import__("threading").Lock()
+_GLOBAL_ANCHORS: set[str] = set()
+
+
 # ---------------------------------------------------------------------------
 # Templates
 # ---------------------------------------------------------------------------
@@ -91,13 +100,18 @@ _STOPWORDS = frozenset({
 # Ground truth: the statement is the one and only correct hit.
 
 _TOPIC_BANK: List[Dict[str, Any]] = [
+    # Codex audit 2026-04-28 found that query templates leaked topic tokens
+    # (team / incident / latency / production / backend / maintenance) that
+    # also appeared in the matching statement. Rewrote queries so they share
+    # only the anchor with the statement — context words diverge.
     {
         "topic": "ownership",
-        "statement": "Component {anchor} is maintained by team {answer} as of {extra}.",
+        "statement": "Component {anchor} is stewarded by squad {answer} as of {extra}.",
         "queries": [
-            "Who owns {anchor}?",
-            "Which team is responsible for {anchor}?",
-            "{anchor} maintainer.",
+            # NB: no "team", "stewarded", "squad" — different verb / noun
+            "Who runs {anchor}?",
+            "Pointer for {anchor}.",
+            "{anchor} owner.",
         ],
         "answer_pool": [
             "platform-core", "ingest-pipeline", "graph-runtime", "edge-cache",
@@ -110,11 +124,13 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
     },
     {
         "topic": "incident",
-        "statement": "Incident on {anchor} was triggered by {answer} during the rollout window.",
+        # Statement uses "outage was triggered by"; query never says "outage"
+        # or "incident" — forces semantic match on anchor + cause.
+        "statement": "An outage of {anchor} was triggered by {answer} during the rollout window.",
         "queries": [
-            "What caused the {anchor} outage?",
-            "Why did {anchor} fail?",
-            "{anchor} incident root cause.",
+            "Root cause for {anchor}?",
+            "Why did {anchor} break?",
+            "{anchor} cause analysis.",
         ],
         "answer_pool": [
             "a misconfigured retry budget", "an expired TLS bundle",
@@ -127,9 +143,9 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
         "topic": "deprecation",
         "statement": "The {anchor} interface is being replaced with {answer} starting next quarter.",
         "queries": [
-            "What will replace {anchor}?",
-            "{anchor} successor.",
-            "Migration target for {anchor}.",
+            "What will follow {anchor}?",
+            "{anchor} migration target.",
+            "Successor of {anchor}.",
         ],
         "answer_pool": [
             "a streaming consumer", "a typed SDK shim", "a sidecar gateway",
@@ -140,11 +156,13 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
     },
     {
         "topic": "metric",
+        # Statement: "bounded by ... under steady state"; queries drop "steady"
+        # / "state" — only the anchor + the question intent are shared.
         "statement": "Latency of {anchor} is bounded by {answer} under steady state.",
         "queries": [
             "How fast is {anchor}?",
-            "{anchor} latency budget.",
-            "Performance ceiling of {anchor}.",
+            "Performance ceiling for {anchor}?",
+            "{anchor} response speed.",
         ],
         "answer_pool": [
             "12 ms p95", "47 ms p99", "180 microseconds", "7 ms median",
@@ -154,11 +172,13 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
     },
     {
         "topic": "config",
+        # Statement: "defaults to ... on the production tier"; queries use
+        # "shipped value" / "factory setting" instead of "production default".
         "statement": "Configuration knob {anchor} defaults to {answer} on the production tier.",
         "queries": [
-            "Default value of {anchor}?",
-            "{anchor} production default.",
-            "Out-of-the-box setting for {anchor}.",
+            "Shipped value of {anchor}?",
+            "Factory setting for {anchor}.",
+            "{anchor} fallback value.",
         ],
         "answer_pool": [
             "0.85", "true", "false", "120", "auto", "exponential",
@@ -168,11 +188,13 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
     },
     {
         "topic": "decision",
+        # Statement: "persistence backend ... after the spike"; queries avoid
+        # "store" / "tier" / "backend" — different surface form entirely.
         "statement": "We chose {answer} as the persistence backend for {anchor} after the spike.",
         "queries": [
-            "Which backend is {anchor} on?",
-            "Storage choice for {anchor}.",
-            "What persists {anchor}?",
+            "Where does {anchor} live on disk?",
+            "Picked datastore for {anchor}.",
+            "{anchor} durable layer.",
         ],
         "answer_pool": [
             "an embedded KV store", "a columnar DB", "the existing relational tier",
@@ -185,9 +207,9 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
         "topic": "person",
         "statement": "Approval authority for {anchor} sits with {answer}.",
         "queries": [
-            "Who signs off on {anchor}?",
-            "{anchor} approver.",
-            "Who do I escalate {anchor} to?",
+            "Who greenlights {anchor}?",
+            "{anchor} sponsor.",
+            "Escalation path for {anchor}.",
         ],
         "answer_pool": [
             "the deputy director", "the on-call principal",
@@ -198,11 +220,13 @@ _TOPIC_BANK: List[Dict[str, Any]] = [
     },
     {
         "topic": "schedule",
+        # Statement: "Maintenance ... during the quiet window"; queries drop
+        # "window" — share only the anchor.
         "statement": "Maintenance for {anchor} runs every {answer} during the quiet window.",
         "queries": [
-            "When is {anchor} maintained?",
-            "{anchor} maintenance cadence.",
-            "How often is {anchor} serviced?",
+            "Service slot for {anchor}?",
+            "When is {anchor} patched?",
+            "{anchor} downtime cadence.",
         ],
         "answer_pool": [
             "second Tuesday", "third weekend", "last Friday of the month",
@@ -226,18 +250,33 @@ class ParaphraseGenerator:
     one statement, so the only "right" hit for a query is that statement.
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, use_global_registry: bool = True):
         self._rng = random.Random(seed)
+        self._use_global = use_global_registry
+        # Local mirror so a single instance can opt out of the global registry
+        # for unit tests; production benchmark runs always use the global one.
         self._used_anchors: set[str] = set()
 
     def _fresh_anchor(self) -> str:
-        for _ in range(100):
+        # Cross-instance uniqueness: every anchor goes through _GLOBAL_ANCHORS
+        # under a lock so two generators (continuity suite has 2+ at once)
+        # cannot mint the same token. Codex 2026-04-28 verified this is needed.
+        for _ in range(200):
             tok = _coined_word(self._rng)
-            if tok not in self._used_anchors:
+            if self._use_global:
+                with _GLOBAL_ANCHOR_LOCK:
+                    if tok not in _GLOBAL_ANCHORS and tok not in self._used_anchors:
+                        _GLOBAL_ANCHORS.add(tok)
+                        self._used_anchors.add(tok)
+                        return tok
+            elif tok not in self._used_anchors:
                 self._used_anchors.add(tok)
                 return tok
-        # Pathological fallback — append entropy
-        tok = _coined_word(self._rng) + "".join(self._rng.choices(string.ascii_lowercase, k=4))
+        # Pathological fallback — append entropy.
+        tok = _coined_word(self._rng) + "".join(self._rng.choices(string.ascii_lowercase, k=6))
+        if self._use_global:
+            with _GLOBAL_ANCHOR_LOCK:
+                _GLOBAL_ANCHORS.add(tok)
         self._used_anchors.add(tok)
         return tok
 

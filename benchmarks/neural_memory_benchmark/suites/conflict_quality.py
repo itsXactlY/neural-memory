@@ -68,15 +68,71 @@ class ConflictQualityBenchmark:
         print("\n=== Conflict Resolution Quality Benchmark ===")
         pairs = generate_conflict_pairs(seed=self.seed, count=self.n_pairs)
 
-        nm = NeuralMemory(db_path=self.db_path, embedding_backend="auto")
+        # Codex audit 2026-04-28: without a detect_conflicts=False control we
+        # can't tell whether the winner-rate is supersession working or just
+        # recency / vector similarity. Run the same scenario twice, once with
+        # supersession enabled (default) and once with it forced off.
+        results_per_arm: Dict[str, Dict[str, Any]] = {}
 
-        # Step 1: store originals.
-        for p in pairs:
-            nm.remember(p["original"], label=f"conflict:{p['topic']}", auto_connect=True)
-        # Step 2: store replacements (these should supersede or fuse).
-        for p in pairs:
-            nm.remember(p["replacement"], label=f"conflict:{p['topic']}", auto_connect=True)
+        for arm_label, dc_flag, db_path in (
+            ("with_supersession", True, self.db_path),
+            ("control_no_supersession", False, self.db_path + ".ctrl"),
+        ):
+            nm = NeuralMemory(db_path=db_path, embedding_backend="auto")
+            # NeuralMemory.remember has a detect_conflicts kwarg; the control
+            # arm forces it False so any winner-rate lift comes from
+            # mechanisms other than supersession (recency boost, MERGE policy
+            # in add_connection, etc.). Step 1: store originals. Step 2:
+            # store replacements. Same insertion order both arms.
+            for p in pairs:
+                nm.remember(
+                    p["original"], label=f"conflict:{p['topic']}",
+                    auto_connect=True, detect_conflicts=dc_flag,
+                )
+            for p in pairs:
+                nm.remember(
+                    p["replacement"], label=f"conflict:{p['topic']}",
+                    auto_connect=True, detect_conflicts=dc_flag,
+                )
+            results_per_arm[arm_label] = self._measure_one_arm(nm, pairs)
+            print(f"  [{arm_label}]  winner@1={results_per_arm[arm_label]['winner_rank_1_rate']}  "
+                  f"loser>winner={results_per_arm[arm_label]['loser_above_winner_rate']}")
 
+        # Aggregate across arms — the "supersession lift" is the delta in
+        # winner_rank_1_rate from control_no_supersession to with_supersession.
+        ws = results_per_arm["with_supersession"]
+        ctrl = results_per_arm["control_no_supersession"]
+        out_results: Dict[str, Any] = {
+            "with_supersession": ws,
+            "control_no_supersession": ctrl,
+            "supersession_lift": {
+                "winner_rank_1": round(ws["winner_rank_1_rate"] - ctrl["winner_rank_1_rate"], 4),
+                "loser_above_winner_drop": round(
+                    ctrl["loser_above_winner_rate"] - ws["loser_above_winner_rate"], 4
+                ),
+            },
+            "interpretation": {
+                "supersession_lift.winner_rank_1": (
+                    "Positive = supersession is responsible for getting the "
+                    "winner to top-1. ~0 = the lift comes from recency / vector "
+                    "similarity, not from the supersession algorithm itself."
+                ),
+                "supersession_lift.loser_above_winner_drop": (
+                    "Positive = supersession suppresses the stale fact. ~0 = "
+                    "the stale fact is just as likely to outrank the new one "
+                    "either way."
+                ),
+            },
+        }
+        print(f"  supersession_lift: winner_rank_1={out_results['supersession_lift']['winner_rank_1']:+.4f}  "
+              f"loser_drop={out_results['supersession_lift']['loser_above_winner_drop']:+.4f}")
+
+        out = self.output_dir / "conflict_quality_results.json"
+        out.write_text(json.dumps(out_results, indent=2))
+        print(f"  [saved] {out}")
+        return out_results
+
+    def _measure_one_arm(self, nm: NeuralMemory, pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
         winner_top1 = 0
         winner_top3 = 0
         winner_anywhere = 0
@@ -85,11 +141,6 @@ class ConflictQualityBenchmark:
 
         for p in pairs:
             results = nm.recall(p["query"], k=self.k)
-            # Use a token unique to each side. The replacement and original
-            # share the anchor, so distinguish by the unique answer token —
-            # e.g. "round-robin" vs "exponential" or "12 ms" vs "50 ms".
-            # Strip the anchor + leading "Component {a} is" boilerplate and
-            # take the words that differ.
             winner_marker = self._unique_token(p["replacement"], p["original"])
             loser_marker = self._unique_token(p["original"], p["replacement"])
 
@@ -108,7 +159,7 @@ class ConflictQualityBenchmark:
             per_topic.setdefault(p["topic"], []).append(wrank)
 
         n = len(pairs)
-        results: Dict[str, Any] = {
+        return {
             "n_conflict_pairs": n,
             "winner_rank_1_rate": round(winner_top1 / n, 4) if n else 0.0,
             "winner_in_top_3_rate": round(winner_top3 / n, 4) if n else 0.0,
@@ -118,19 +169,7 @@ class ConflictQualityBenchmark:
                 t: round(statistics.mean([r for r in ranks if r > 0]), 2) if any(r > 0 for r in ranks) else None
                 for t, ranks in per_topic.items()
             },
-            "interpretation": {
-                "winner_rank_1_rate": "Fraction of conflicts where the latest write is the top-1 hit. Higher is better; 1.0 = perfect.",
-                "loser_above_winner_rate": "Fraction where the original (stale) fact outranks the replacement. Lower is better; should approach 0 if supersession works.",
-            },
         }
-        print(f"  winner@1={results['winner_rank_1_rate']}  "
-              f"winner@3={results['winner_in_top_3_rate']}  "
-              f"loser>winner={results['loser_above_winner_rate']}")
-
-        out = self.output_dir / "conflict_quality_results.json"
-        out.write_text(json.dumps(results, indent=2))
-        print(f"  [saved] {out}")
-        return results
 
     @staticmethod
     def _unique_token(target: str, other: str) -> str:

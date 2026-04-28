@@ -1,29 +1,31 @@
 """
 LSTM+kNN Auto-Enhancement Ablation
 ===================================
-NeuralMemory wraps base recall results with an LSTMPredictor +
-multi-signal kNN re-ranker (`_enhance_recall`) when libneural_memory.so
-is available. The auto-enhancement is invisible in the public API: it
-either fires or it doesn't depending on whether the C++ library loads.
-
-This suite measures the lift it produces — vs the same query set with
-the enhancement disabled — on the paraphrase ground-truth set.
+NeuralMemory (`memory_client.NeuralMemory`) is the SQL/graph store.
+The LSTM + multi-signal kNN re-ranker (`_enhance_recall`) lives on the
+PUBLIC wrapper `neural_memory.Memory`, not on `NeuralMemory`. Codex
+audit 2026-04-28 caught the prior version of this suite imported the
+wrong class and never actually toggled the feature — it always
+reported "not loaded".
 
 Two configurations:
 
-  * baseline  — _lstm_knn_ready forced False, no LSTM, no kNN re-rank
-  * enhanced — left at its natural state (active iff .so loaded)
+  * baseline  — Memory()._lstm_knn_ready forced False (skips both the
+    AccessLogger write AND the kNN re-rank in Memory._enhance_recall)
+  * enhanced  — left at its natural state (active iff libneural_memory.so
+    + lstm_knn_bridge import successfully)
 
-Each is compared on:
-  - recall@k
-  - MRR
-  - per-query latency (the enhancement is on the hot path, the cost is
-    real and worth quantifying)
+We also seed the AccessLogger with a sequence of related queries before
+the measurement, so the LSTM has temporal context to predict from. The
+prior version fired the queries in a single pass with no warmup — even
+if the C++ library had loaded, the LSTM had a 1-element history and
+predicted noise.
 
-If the C++ library is not available, the suite reports that explicitly
-rather than silently skipping — a "lift = 0" because the library
-didn't load is very different from "lift = 0" because the algorithm
-didn't help.
+Reports recall@k, MRR, p50/p95 latency for each, and the per-knob
+delta. Cleanly skips with a warning if the C++ library isn't built —
+"lift = 0 because the library didn't load" is very different from
+"lift = 0 because the algorithm didn't help" and the report makes that
+distinction explicit.
 """
 from __future__ import annotations
 
@@ -36,16 +38,16 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "python"))
 
-from memory_client import NeuralMemory
+from neural_memory import Memory
 
 
-def _measure(nm: NeuralMemory, queries: List[Dict[str, Any]], k: int = 5) -> Dict[str, Any]:
+def _measure(mem: Memory, queries: List[Dict[str, Any]], k: int = 5) -> Dict[str, Any]:
     hits = 0
     rrs: List[float] = []
     latencies_ms: List[float] = []
     for q in queries:
         t0 = time.perf_counter()
-        results = nm.recall(q["query"], k=k)
+        results = mem.recall(q["query"], k=k)
         latencies_ms.append((time.perf_counter() - t0) * 1000)
         anchor = q.get("anchor", "")
         rank = 0
@@ -74,48 +76,66 @@ class LSTMKnnBenchmark:
         queries: List[Dict[str, Any]],
         output_dir: Optional[Path] = None,
         k: int = 5,
+        warmup_passes: int = 3,
     ):
         self.db_path = db_path
         self.memories = memories
         self.queries = queries
         self.k = k
+        self.warmup_passes = warmup_passes
         self.output_dir = output_dir or Path.home() / ".neural_memory_benchmark" / "results"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def run(self) -> Dict[str, Any]:
         print("\n=== LSTM+kNN Ablation Benchmark ===")
-        nm = NeuralMemory(db_path=self.db_path, embedding_backend="auto")
+        # Use the PUBLIC Memory wrapper — that's where _lstm_knn_ready and
+        # _enhance_recall actually live.  The prior suite imported
+        # NeuralMemory and looked for _lstm_knn_ready, which always returned
+        # False because that attribute doesn't exist there.
+        mem = Memory(db_path=self.db_path, embedding_backend="auto")
         for m in self.memories:
-            nm.remember(m["text"], label=m["label"], auto_connect=True)
+            mem.remember(m["text"], label=m["label"], auto_connect=True)
 
-        cpp_loaded = bool(getattr(nm, "_lstm_knn_ready", False))
-        results: Dict[str, Any] = {"cpp_loaded": cpp_loaded}
+        cpp_loaded = bool(getattr(mem, "_lstm_knn_ready", False))
+        results: Dict[str, Any] = {
+            "cpp_loaded": cpp_loaded,
+            "warmup_passes": self.warmup_passes,
+        }
 
         if not cpp_loaded:
-            print("  [warning] libneural_memory.so not loaded — only baseline path runs.")
-            results["baseline"] = _measure(nm, self.queries, self.k)
+            print("  [warning] libneural_memory.so not loaded — LSTM+kNN inactive.")
+            print("            Reporting baseline only; lift cannot be measured.")
+            results["baseline"] = _measure(mem, self.queries, self.k)
             results["enhanced"] = None
             results["delta"] = None
+            results["note"] = (
+                "lift==0 here means the C++ extension is not built, NOT that "
+                "the algorithm has no effect. Build with `cd build && cmake "
+                "--build . -j` and re-run."
+            )
             self._save(results)
             return results
 
-        # Warm up so JIT/lazy init doesn't bias the first batch.
-        for q in self.queries[:3]:
-            nm.recall(q["query"], k=self.k)
+        # Seed the AccessLogger with prior-turn context so the LSTM has a
+        # non-trivial sequence to predict from. Repeats every query
+        # `warmup_passes` times to build a non-IID access pattern.
+        print(f"  [warmup] {self.warmup_passes}x pass to seed AccessLogger...")
+        for _ in range(self.warmup_passes):
+            for q in self.queries:
+                mem.recall(q["query"], k=self.k)
 
-        print("  [enhanced] running with LSTM+kNN active...")
-        results["enhanced"] = _measure(nm, self.queries, self.k)
-
-        # Toggle off and re-measure on the same NeuralMemory instance and DB.
-        prior = nm._lstm_knn_ready
+        # Toggle off and re-measure on the same Memory instance + DB so the
+        # only changing variable is _enhance_recall firing or not.
+        prior = mem._lstm_knn_ready
         try:
-            nm._lstm_knn_ready = False
-            for q in self.queries[:3]:
-                nm.recall(q["query"], k=self.k)
-            print("  [baseline] running with LSTM+kNN forced OFF...")
-            results["baseline"] = _measure(nm, self.queries, self.k)
+            mem._lstm_knn_ready = False
+            print("  [baseline] LSTM+kNN forced OFF...")
+            results["baseline"] = _measure(mem, self.queries, self.k)
         finally:
-            nm._lstm_knn_ready = prior
+            mem._lstm_knn_ready = prior
+
+        print("  [enhanced] LSTM+kNN active...")
+        results["enhanced"] = _measure(mem, self.queries, self.k)
 
         results["delta"] = {
             "recall_at_k": round(
