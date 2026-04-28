@@ -618,6 +618,8 @@ class NeuralMemory:
         ppr_alpha: float = 0.15,
         ppr_iters: int = 20,
         ppr_hops: int = 2,
+        mmr_lambda: float = 0.0,
+        recall_score_floor: float = 0.0,
     ):
         if embedder is not None:
             self.embedder = embedder
@@ -652,6 +654,14 @@ class NeuralMemory:
         self._ppr_alpha = float(ppr_alpha or 0.15)
         self._ppr_iters = int(ppr_iters or 20)
         self._ppr_hops = int(ppr_hops or 2)
+        # Maximal Marginal Relevance: trade pure relevance for diversity in
+        # the returned top-k. lambda=1.0 = pure relevance (default off);
+        # lambda=0.0 = pure diversity. Typical sweet spot is 0.6-0.8.
+        self._mmr_lambda = max(0.0, min(1.0, float(mmr_lambda or 0.0)))
+        # Hard noise floor: drop any result whose final relevance lands below
+        # this. Off by default; set to e.g. 0.15 to refuse to surface garbage
+        # when nothing relevant exists, instead of returning weak top-k.
+        self._recall_score_floor = max(0.0, float(recall_score_floor or 0.0))
         self._channel_weights = {
             "semantic": 1.0,
             "bm25": 0.9,
@@ -1129,6 +1139,8 @@ class NeuralMemory:
         hybrid: Optional[bool] = None,
         rerank: Optional[bool] = None,
         at_time: Optional[float] = None,
+        mmr_lambda: Optional[float] = None,
+        score_floor: Optional[float] = None,
     ) -> list[dict]:
         if k <= 0:
             return []
@@ -1201,6 +1213,22 @@ class NeuralMemory:
         use_rerank = self._rerank if rerank is None else bool(rerank)
         if use_rerank:
             results = self._rerank_results(query, results, k)
+
+        # Hard noise floor — drop sub-floor results before MMR/truncation so
+        # garbage queries return [] instead of weak top-k that operators
+        # mistake for signal.
+        floor = self._recall_score_floor if score_floor is None else float(score_floor or 0.0)
+        if floor > 0.0:
+            results = [r for r in results if r.get("relevance", 0.0) >= floor]
+
+        # MMR diversification: trade marginal relevance for non-redundancy in
+        # the returned set. Greedy O(k * |candidates|), bounded by k * limit.
+        # Skipped when mmr_lambda is at its default 0.0 (pure relevance) or
+        # the candidate pool already has <2 items.
+        eff_lambda = self._mmr_lambda if mmr_lambda is None else max(0.0, min(1.0, float(mmr_lambda or 0.0)))
+        if eff_lambda > 0.0 and len(results) > 1 and k > 1:
+            results = self._mmr_rerank(results, mems, eff_lambda, k)
+
         final = results[:k]
         if touch:
             for r in final:
@@ -1209,6 +1237,65 @@ class NeuralMemory:
                 except Exception:
                     pass
         return final
+
+    def _mmr_rerank(
+        self,
+        ranked: list[dict],
+        mems: dict[int, dict],
+        lam: float,
+        k: int,
+    ) -> list[dict]:
+        """Greedy Maximal Marginal Relevance reordering.
+
+        MMR(d) = lam * relevance(d) - (1-lam) * max_{d' in selected} sim(d, d')
+
+        - relevance: the precomputed combined score (already in [0,1]-ish range)
+        - sim: cosine between memory embeddings (0 if either embedding is
+          missing or dim-mismatched, see _cosine_similarity)
+
+        We walk the ranked list, picking the candidate that maximises MMR
+        against the already-selected set. Greedy is the standard MMR
+        formulation (Carbonell & Goldstein 1998); exact MMR is NP-hard.
+        """
+        if lam >= 1.0:
+            return ranked
+        # Normalise relevance to [0,1] so the diversity term is comparable.
+        max_rel = max((r.get("relevance", 0.0) for r in ranked), default=1.0) or 1.0
+        pool = list(ranked)
+        selected: list[dict] = []
+        # Always seed with the top-relevance pick — MMR's first iteration is
+        # equivalent to argmax(relevance) since selected is empty.
+        first = pool.pop(0)
+        selected.append(first)
+        # Cache embeddings keyed by memory id to avoid repeated dict lookups.
+        embed_of = {mid: m.get("embedding") or [] for mid, m in mems.items()}
+        while pool and len(selected) < k:
+            best_idx = -1
+            best_score = -float("inf")
+            for i, cand in enumerate(pool):
+                rel = cand.get("relevance", 0.0) / max_rel
+                cand_emb = embed_of.get(cand["id"], [])
+                if not cand_emb:
+                    # Missing/mismatched embedding -> diversity term is zero;
+                    # rank it on relevance only.
+                    div = 0.0
+                else:
+                    div = max(
+                        (self._cosine_similarity(cand_emb, embed_of.get(s["id"], []))
+                         for s in selected),
+                        default=0.0,
+                    )
+                score = lam * rel - (1.0 - lam) * div
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+            if best_idx < 0:
+                break
+            selected.append(pool.pop(best_idx))
+        # Append leftovers (preserving original ranking) so consumers asking
+        # for k > pool_size or downstream code that walks past k still gets
+        # the full ordering rather than a truncated tail.
+        return selected + pool
 
     # -- thinking / graph -----------------------------------------------------
 
