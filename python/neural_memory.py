@@ -288,12 +288,18 @@ class Memory:
                     '_knn_graph': round(kr.graph_score, 4),
                 })
             
-            # 6. Train LSTM in background (fire-and-forget)
+            # 6. Train LSTM in background (fire-and-forget).
+            # The sequence MUST exclude the just-logged event whose
+            # query_embedding is the training target — including it
+            # leaks the target into the input and the LSTM degenerates
+            # to a copy-last-input identity. Use \`recent[:-1][-10:]\` to
+            # take the 10 events BEFORE the current one.
             try:
-                if len(recent) >= 2 and lstm_context is not None:
-                    # Training pair: sequence → actual query embedding
-                    seq_embs = [e["query_emb"] for e in recent[-10:]]
-                    self._lstm.train_on_pair(seq_embs, query_embedding, lr=0.0005)
+                if len(recent) >= 3 and lstm_context is not None:
+                    prior = recent[:-1]  # drop the just-logged target event
+                    seq_embs = [e["query_emb"] for e in prior[-10:]]
+                    if len(seq_embs) >= 2:
+                        self._lstm.train_on_pair(seq_embs, query_embedding, lr=0.0005)
             except Exception:
                 pass
             
