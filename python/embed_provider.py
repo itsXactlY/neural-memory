@@ -26,7 +26,19 @@ import socket
 import struct
 import time
 import threading
+import warnings
 from pathlib import Path
+
+# fastembed >= 0.7 emits a cosmetic UserWarning when the
+# intfloat/multilingual-e5-large model switched from CLS to mean pooling.
+# Mean pooling is the model's documented aggregation; the prior CLS path
+# was a fastembed bug. We want the new (correct) behaviour, so silence
+# the noise rather than pin to 0.5.1.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*now uses mean pooling instead of CLS embedding.*",
+    category=UserWarning,
+)
 
 CACHE_DIR = Path.home() / ".neural_memory"
 CACHE_FILE = CACHE_DIR / "embed_cache.pkl"
@@ -127,7 +139,13 @@ class SharedEmbedServer:
         
         # If target is CUDA, wait for sufficient GPU memory (no silent fallback)
         if device == 'cuda':
-            self._wait_for_gpu_memory(min_free_mb=2000, timeout=120, poll_interval=5)
+            # Cap the waiter at 30s: 120s was too long — if the GPU is full
+            # for that long, it's not coming back during this session, and
+            # the user is paying multi-minute startup latency before the
+            # first prompt. EMBED_GPU_WAIT_S overrides for ops who want a
+            # longer hold.
+            gpu_wait_s = float(os.environ.get("EMBED_GPU_WAIT_S", "30"))
+            self._wait_for_gpu_memory(min_free_mb=2000, timeout=gpu_wait_s, poll_interval=2)
         
         self.model = SentenceTransformer(model_path, device=device)
         self.dim = self.model.get_sentence_embedding_dimension()
@@ -548,9 +566,12 @@ class SentenceTransformerBackend:
         if model_path is None:
             raise FileNotFoundError(f"No cached model: {self.MODEL_NAME}")
         
-        # GPU-FIRST: if CUDA was chosen, wait for memory (no silent fallback)
+        # GPU-FIRST: if CUDA was chosen, wait for memory (no silent fallback).
+        # Capped at EMBED_GPU_WAIT_S (default 30s) — see SharedEmbedServer
+        # comment above for rationale.
         if device == 'cuda':
-            _wait_for_gpu(self, min_free_mb=2000, timeout=120, poll_interval=5)
+            gpu_wait_s = float(os.environ.get("EMBED_GPU_WAIT_S", "30"))
+            _wait_for_gpu(self, min_free_mb=2000, timeout=gpu_wait_s, poll_interval=2)
         
         print(f"[embed] Loading {model_path} directly on {device}...")
         self.model = SentenceTransformer(model_path, device=device)

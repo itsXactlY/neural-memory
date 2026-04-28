@@ -234,8 +234,21 @@ class NeuralMemoryProvider(MemoryProvider):
                 ppr_hops=int(self._config.get("ppr_hops", 2) or 2),
             )
 
-            # Load initial context from memory
-            self._initial_context = self._load_initial_context()
+            # Load initial context from memory — DEFERRED to a daemon thread.
+            # Calling _load_initial_context() synchronously here was the main
+            # contributor to the >3min hermes-startup latency: it fires two
+            # recall() calls, each of which lazily loads the embed model and
+            # builds the HNSW index on first call. Backgrounding it lets
+            # init return immediately; the first turn's system_prompt_block
+            # consumes _initial_context if it has landed by then, otherwise
+            # it gracefully starts blank.
+            self._initial_context = ""
+            self._initial_context_thread = threading.Thread(
+                target=self._load_initial_context_async,
+                daemon=True,
+                name="neural-initial-ctx",
+            )
+            self._initial_context_thread.start()
 
             # Start dream engine
             self._start_dream_engine()
@@ -400,6 +413,22 @@ class NeuralMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Failed to load initial context: %s", e)
             return ""
+
+    def _load_initial_context_async(self) -> None:
+        """Background entrypoint — populates self._initial_context off the
+        critical path. Used by initialize() so the provider returns fast
+        even when the first recall has to lazy-load the embed model and
+        build the HNSW index. Errors are swallowed silently — the
+        consumer (system_prompt_block / prefetch fallback) treats an
+        unset initial context as 'no recent activity'.
+        """
+        try:
+            ctx = self._load_initial_context()
+        except Exception:
+            ctx = ""
+        with self._lock:
+            self._initial_context = ctx or ""
+        logger.debug("Neural initial context loaded (%d chars)", len(self._initial_context))
 
     def system_prompt_block(self) -> str:
         if not self._memory:

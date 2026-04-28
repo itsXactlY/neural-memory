@@ -118,6 +118,16 @@ class Memory:
             ppr_iters=ppr_iters,
             ppr_hops=ppr_hops,
         )
+        # Public attributes for __repr__, logs, and external probes.
+        # Without these, Memory.__repr__ raised AttributeError on self.backend
+        # / self.dim, and the plugin init's \"backend=%s, mssql=%s\" log line
+        # fell through hasattr() to 'unknown'/False — confusing output like
+        # \"backend=mssql, mssql=False\". Now: \"hybrid\" / \"sqlite\" string,
+        # and the actual mssql-active flag.
+        self.backend = "hybrid" if use_mssql else "sqlite"
+        self.dim = self._dim
+        self._use_mssql = bool(use_mssql)
+
         if not use_mssql:
             print(f"[neural] SQLite backend: {self._embedder.backend.__class__.__name__} ({self._dim}d)")
         else:
