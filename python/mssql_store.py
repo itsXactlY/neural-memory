@@ -370,6 +370,33 @@ class MSSQLStore:
         cursor.execute("SELECT 1 FROM memories WHERE id = ?", id_)
         return cursor.fetchone() is not None
 
+    def exists_many(self, ids: "list[int] | set[int]") -> set[int]:
+        """Batch existence check — single round-trip for all ids.
+
+        Returns the subset of `ids` that are present in MSSQL. Used by
+        the FK-backfill loop in Memory._mirror_connections_for so a
+        write that produces N edges does ONE query instead of N.
+
+        Empty input -> empty set without touching the DB.
+        """
+        if not ids:
+            return set()
+        ids = [int(i) for i in ids]
+        # Chunk to stay under SQL Server's parameter cap (default 2100).
+        # 1000 per chunk leaves headroom and keeps each query fast.
+        present: set[int] = set()
+        cursor = self.conn.cursor()
+        for i in range(0, len(ids), 1000):
+            chunk = ids[i:i + 1000]
+            placeholders = ",".join("?" * len(chunk))
+            cursor.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders})",
+                *chunk,
+            )
+            for row in cursor.fetchall():
+                present.add(int(row[0]))
+        return present
+
     def touch(self, id_: int):
         cursor = self.conn.cursor()
         cursor.execute(

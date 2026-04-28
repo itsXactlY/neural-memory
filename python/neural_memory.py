@@ -508,33 +508,87 @@ class Memory:
         the same memory keeps the MSSQL connections table consistent
         with SQLite without producing duplicates.
 
-        Backfills the OTHER endpoint when needed: the MSSQL connections
-        table has FK constraints to memories(id); if auto_connect attached
-        an edge to an older memory whose row was never mirrored (e.g.
-        memories pre-dating the MSSQL configuration, or written when
-        MSSQL was unreachable), the INSERT would fail FK validation and
-        the edge would be silently dropped. Lazy-backfill the missing
-        memory from SQLite before the edge insert so this is no longer
-        a silent corruption path.
+        Two-phase: (1) gather all distinct OTHER endpoints across the
+        edges, batch-check existence in MSSQL via a single IN-query, and
+        backfill any missing rows; (2) emit add_connection for each edge.
+        The previous per-edge _ensure_mssql_memory loop fired one
+        exists() round-trip per neighbour — for a memory with 8 new
+        auto_connect edges that's 8 sequential SQL calls, dominating
+        the mirror latency on a remote MSSQL server.
         """
         if not self._mssql_store:
             return
         store = self._sqlite_memory.store
         try:
-            for c in store.get_connections(mem_id):
+            edges = list(store.get_connections(mem_id))
+            if not edges:
+                return
+            # Phase 1: collect distinct neighbours and batch-check existence.
+            others = set()
+            for c in edges:
+                src = int(c.get("source"))
+                tgt = int(c.get("target"))
+                other = tgt if src == mem_id else src
+                if other != mem_id:
+                    others.add(other)
+            if others:
+                self._ensure_mssql_memories(others)
+            # Phase 2: emit edge inserts.
+            for c in edges:
                 src = int(c.get("source"))
                 tgt = int(c.get("target"))
                 weight = float(c.get("weight") or 0.0)
                 edge_type = c.get("edge_type") or c.get("type") or "similar"
-                # Backfill whichever endpoint isn't `mem_id` (the one we
-                # just mirrored). This pulls a single SQLite get + a
-                # single MSSQL upsert per missing memory.
-                other = tgt if src == mem_id else src
-                if other != mem_id:
-                    self._ensure_mssql_memory(other)
                 self._mssql_store.add_connection(src, tgt, weight, edge_type)
         except Exception:
             pass
+
+    def _ensure_mssql_memories(self, ids: "set[int] | list[int]") -> None:
+        """Batch-version of _ensure_mssql_memory.
+
+        One MSSQL `WHERE id IN (...)` discovers which ids are already
+        present; the remaining ids are backfilled one at a time (the
+        backfill itself can't easily batch since each row's embedding
+        is a per-row blob, and MSSQL's IDENTITY_INSERT path is per-
+        statement). For typical write bursts of 3-10 edges, this drops
+        the existence-check round-trips from N to 1.
+        """
+        if not self._mssql_store or not ids:
+            return
+        ids = [int(i) for i in ids]
+        try:
+            present = self._mssql_store.exists_many(ids)
+        except Exception:
+            # Fallback: per-row exists() if exists_many isn't available
+            # on this MSSQLStore version.
+            present = set()
+            for i in ids:
+                try:
+                    if self._mssql_store.exists(i):
+                        present.add(i)
+                except Exception:
+                    pass
+        missing = [i for i in ids if i not in present]
+        if not missing:
+            return
+        # Backfill missing ids — one MSSQL upsert each, but at least we
+        # avoided N existence checks.
+        for mid in missing:
+            try:
+                mem = self._sqlite_memory.store.get(int(mid), include_embedding=True)
+            except Exception:
+                continue
+            if mem is None:
+                continue
+            try:
+                self._mssql_store.store(
+                    mem.get("label") or "",
+                    mem.get("content") or "",
+                    mem.get("embedding") or [],
+                    id_=int(mid),
+                )
+            except Exception:
+                pass
 
     def _ensure_mssql_memory(self, mem_id: int) -> None:
         """Make sure memory `mem_id` exists in MSSQL; mirror it from SQLite if not.
