@@ -28,6 +28,10 @@ class GpuRecallEngine:
     def __init__(self):
         self._device = None
         self._emb_tensor = None  # (N, dim) float32 on GPU
+        # Cached row-normalised view of _emb_tensor. Built lazily the first
+        # time recall() encounters a non-unit query (so we don't pay the
+        # normalisation cost on already-normalised models like e5-large).
+        self._emb_tensor_normed = None
         self._ids = []
         self._labels = []
         self._contents = []
@@ -68,6 +72,9 @@ class GpuRecallEngine:
 
         # Move to GPU
         self._emb_tensor = torch.tensor(emb_array, device=self._device, dtype=torch.float32)
+        # Invalidate any prior normalised cache — a reload (e.g. after the
+        # source DB grew) means the row layout changed.
+        self._emb_tensor_normed = None
 
         # Store embed function
         self._embed_fn = embed_fn
@@ -105,13 +112,23 @@ class GpuRecallEngine:
             return []
         q = torch.tensor(query_vec, device=self._device, dtype=torch.float32)
 
-        # Normalize if needed (check magnitude)
+        # Normalize if needed (check magnitude). For models that already
+        # emit unit-norm vectors (FastEmbed e5-large, sentence-transformers
+        # with normalize_embeddings=True), this branch is skipped and we
+        # use the cached tensor directly.
         mag = torch.norm(q)
         if mag > 2.0:  # Raw embedding, needs normalization
             q = q / mag
-            # Also normalize stored embeddings
-            norms = torch.norm(self._emb_tensor, dim=1, keepdim=True)
-            emb_normed = self._emb_tensor / norms
+            # Cache the row-normalised tensor across calls so subsequent
+            # raw-embedding queries don't re-norm the entire (N, dim) matrix
+            # on every recall. Built once lazily; survives until the engine
+            # reloads (which clears it via clear_cache()).
+            if self._emb_tensor_normed is None:
+                norms = torch.norm(self._emb_tensor, dim=1, keepdim=True)
+                # Avoid divide-by-zero on any zero-row pathology.
+                norms = torch.clamp(norms, min=1e-12)
+                self._emb_tensor_normed = self._emb_tensor / norms
+            emb_normed = self._emb_tensor_normed
         else:
             emb_normed = self._emb_tensor
 
@@ -147,6 +164,9 @@ class GpuRecallEngine:
         if self._emb_tensor is not None:
             del self._emb_tensor
             self._emb_tensor = None
+        if self._emb_tensor_normed is not None:
+            del self._emb_tensor_normed
+            self._emb_tensor_normed = None
         if self._device and self._device.type == "cuda":
             import torch
             torch.cuda.empty_cache()
