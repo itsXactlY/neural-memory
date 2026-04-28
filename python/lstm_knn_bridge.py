@@ -240,14 +240,31 @@ class LSTMPredictor:
         self._handle = new_handle
 
     def close(self):
-        """Destroy the LSTM predictor."""
+        """Destroy the LSTM predictor.
+
+        Tolerates a torn-down `self._lib` and a None `nm_lstm_destroy` —
+        during interpreter shutdown Python may have already nulled module
+        globals on ctypes objects we hold a reference to, so the destroy
+        call can vanish under our feet. Swallow that here so __del__
+        doesn't surface AttributeError noise during normal exit. The C++
+        side leak is irrelevant: the OS reclaims process memory.
+        """
         if getattr(self, '_handle', None):
-            self._lib.nm_lstm_destroy(self._handle)
+            lib = getattr(self, '_lib', None)
+            destroy = getattr(lib, 'nm_lstm_destroy', None) if lib else None
+            if destroy is not None:
+                try:
+                    destroy(self._handle)
+                except Exception:
+                    pass
             self._handle = None
 
     def __del__(self):
-        if getattr(self, '_handle', None):
-            self.close()
+        try:
+            if getattr(self, '_handle', None):
+                self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -429,13 +446,30 @@ class KNNEngine:
         self._lib.nm_knn_adjust_weights(self._handle, ctx_ptr)
 
     def close(self):
-        """Destroy the kNN engine."""
-        if self._handle:
-            self._lib.nm_knn_destroy(self._handle)
+        """Destroy the kNN engine.
+
+        Same shutdown-safety as LSTMPredictor.close(): tolerate a torn-down
+        ctypes lib without surfacing AttributeError. Previously this called
+        self._lib.nm_knn_destroy unguarded and __del__ ran unconditionally,
+        so a stray reference held until exit could spam tracebacks during
+        interpreter teardown.
+        """
+        if getattr(self, '_handle', None):
+            lib = getattr(self, '_lib', None)
+            destroy = getattr(lib, 'nm_knn_destroy', None) if lib else None
+            if destroy is not None:
+                try:
+                    destroy(self._handle)
+                except Exception:
+                    pass
             self._handle = None
 
     def __del__(self):
-        self.close()
+        try:
+            if getattr(self, '_handle', None):
+                self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self

@@ -336,8 +336,8 @@ class DreamMSSQLStore:
         return cursor.rowcount
 
     def add_bridge(self, source_id: int, target_id: int,
-                    weight: float = 0.3) -> None:
-        """Add a new bridge connection.
+                    weight: float = 0.3) -> bool:
+        """Add a new bridge connection. Returns True if newly inserted.
 
         Canonicalises source<target so the row matches the invariant the
         Python side enforces in SQLiteStore.add_connection. Without this
@@ -347,9 +347,12 @@ class DreamMSSQLStore:
         (max, min). Downstream queries that assume canonical form would
         miss the bridge half the time. See iter 23 for the SQLite-side
         twin of this fix.
+
+        Returns False on self-loop or pre-existing edge so the REM caller
+        can skip the misleading "0.0 → w" connection_history row.
         """
         if source_id == target_id:
-            return
+            return False
         if source_id > target_id:
             source_id, target_id = target_id, source_id
         # Check if exists — only one orientation now, so the OR clause is gone.
@@ -359,7 +362,7 @@ class DreamMSSQLStore:
             source_id, target_id,
         )
         if cursor.fetchone():
-            return
+            return False
         self.conn.execute(
             "MERGE connections AS target "
             "USING (VALUES (?, ?, ?)) AS source (source_id, target_id, weight) "
@@ -372,6 +375,7 @@ class DreamMSSQLStore:
             source_id, target_id, weight
         )
         self.conn.commit()
+        return True
 
     def prune_weak(self, threshold: float = 0.05) -> int:
         """Delete connections below threshold. Returns count deleted."""

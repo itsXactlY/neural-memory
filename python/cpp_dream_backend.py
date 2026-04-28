@@ -335,8 +335,10 @@ class CppDreamBackend(DreamBackend):
             return 0
 
     def add_bridge(self, source_id: int, target_id: int,
-                    weight: float = 0.3) -> None:
+                    weight: float = 0.3) -> bool:
         """Add bridge edge to connections table via MSSQL (UPSERT).
+        Returns True if newly inserted, False if skipped (self-loop, no
+        connection, MERGE matched existing row, or MSSQL error).
 
         Canonicalises source<target so the row matches the invariant the
         application-side SQLiteStore.add_connection enforces. Without
@@ -346,13 +348,13 @@ class CppDreamBackend(DreamBackend):
         SQLite and dream_mssql_store fixes.
         """
         if not self._mssql_conn:
-            return
+            return False
         if source_id == target_id:
-            return
+            return False
         if source_id > target_id:
             source_id, target_id = target_id, source_id
         try:
-            self._mssql_conn.execute(
+            cursor = self._mssql_conn.execute(
                 "MERGE connections AS target "
                 "USING (VALUES (?, ?)) AS src(source_id, target_id) "
                 "ON target.source_id = src.source_id AND target.target_id = src.target_id "
@@ -361,8 +363,12 @@ class CppDreamBackend(DreamBackend):
                 source_id, target_id,     # USING
                 source_id, target_id, weight  # INSERT
             )
+            # rowcount > 0 only when WHEN NOT MATCHED fired (no WHEN MATCHED here).
+            rc = getattr(cursor, "rowcount", 0) or 0
+            return rc > 0
         except Exception as e:
             logger.debug("add_bridge failed: %s", e)
+            return False
 
     def prune_weak(self, threshold: float = 0.05) -> int:
         """Prune weak connections from connections table via MSSQL."""

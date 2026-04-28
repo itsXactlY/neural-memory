@@ -128,7 +128,12 @@ class DreamBackend:
         raise NotImplementedError
 
     def add_bridge(self, source_id: int, target_id: int,
-                    weight: float = 0.3) -> None:
+                    weight: float = 0.3) -> bool:
+        """Insert a bridge edge. Returns True if newly inserted, False if skipped
+        (e.g. edge already exists or self-loop). Backends must canonicalise
+        source<target before INSERT so connection_history and the connections
+        table stay aligned. Callers should only log_connection_change on True.
+        """
         raise NotImplementedError
 
     def prune_weak(self, threshold: float = 0.05) -> int:
@@ -487,8 +492,8 @@ class SQLiteDreamBackend(DreamBackend):
             conn.close()
 
     def add_bridge(self, source_id: int, target_id: int,
-                    weight: float = 0.3) -> None:
-        """Insert a REM-discovered bridge edge.
+                    weight: float = 0.3) -> bool:
+        """Insert a REM-discovered bridge edge. Returns True if newly inserted.
 
         Canonicalises source<target to match add_connection's invariant.
         Without this, the connections table held mixed-orientation rows:
@@ -496,9 +501,13 @@ class SQLiteDreamBackend(DreamBackend):
         but a bridge from REM could be (max,min). Any downstream code that
         assumed canonical form (\"WHERE source=? AND target=?\") would miss
         the bridge edge half the time.
+
+        Returns False on self-loop or pre-existing edge so the caller can
+        avoid writing a misleading connection_history row claiming the
+        weight changed from 0.0.
         """
         if source_id == target_id:
-            return
+            return False
         if source_id > target_id:
             source_id, target_id = target_id, source_id
         conn = self._connect()
@@ -507,13 +516,15 @@ class SQLiteDreamBackend(DreamBackend):
                 "SELECT id FROM connections WHERE source_id = ? AND target_id = ?",
                 (source_id, target_id),
             ).fetchone()
-            if not existing:
-                conn.execute(
-                    "INSERT INTO connections (source_id, target_id, weight, edge_type, created_at) "
-                    "VALUES (?, ?, ?, 'bridge', ?)",
-                    (source_id, target_id, weight, time.time())
-                )
-                conn.commit()
+            if existing:
+                return False
+            conn.execute(
+                "INSERT INTO connections (source_id, target_id, weight, edge_type, created_at) "
+                "VALUES (?, ?, ?, 'bridge', ?)",
+                (source_id, target_id, weight, time.time())
+            )
+            conn.commit()
+            return True
         finally:
             conn.close()
 
@@ -920,11 +931,17 @@ class DreamEngine:
                             continue
 
                         bridge_weight = round(sim_score * 0.3, 3)
-                        self._backend.add_bridge(mid, sim_id, bridge_weight)
-                        self._backend.log_connection_change(
-                            mid, sim_id, 0.0, bridge_weight, "rem_bridge"
-                        )
-                        stats["bridges"] += 1
+                        # Only count + log when add_bridge actually inserted.
+                        # Pre-existing edges return False; logging a "0.0 → w"
+                        # change on those would falsify connection_history.
+                        # Canonicalise the (src, tgt) for the history row to
+                        # match the connections row's canonical orientation.
+                        if self._backend.add_bridge(mid, sim_id, bridge_weight):
+                            src, tgt = (mid, sim_id) if mid < sim_id else (sim_id, mid)
+                            self._backend.log_connection_change(
+                                src, tgt, 0.0, bridge_weight, "rem_bridge"
+                            )
+                            stats["bridges"] += 1
 
                 except Exception:
                     pass
