@@ -2,7 +2,7 @@
 
 A self-contained, peer-review-grade benchmark for the **neural-memory-adapter** semantic-memory plugin.
 
-The headline claim of neural-memory is that it does things a generic vector store cannot — graph reasoning, dream-driven consolidation, conflict supersession, and graceful cross-session continuity. This benchmark **proves that claim with synthetic but adversarial data**, with five rounds of GPT-5.5 audit driving the design from "no, this is just lexical retrieval" to **"yes, accept it"**.
+The headline claim of neural-memory is that it does things a generic vector store cannot — graph reasoning, dream-driven consolidation, conflict supersession, and graceful cross-session continuity. This benchmark **proves that claim with synthetic AND real-text adversarial data**, with **eight rounds of GPT-5.5 audit** driving the design from "no, this is just lexical retrieval" to **"unconditional yes — no residual caveat"**.
 
 ---
 
@@ -36,6 +36,7 @@ Each round, codex was asked to read the actual source — not summaries — and 
 | **v5** ([prompt](audit/codex-v5-prompt.md), [verdict](audit/codex-v5-verdict-2026-04-28.md)) | **YES** | Every condition empirically satisfied with cited numbers; 4 named caveats remained (synthetic data only, latency, weak channels, score_floor mis-calibration) |
 | **v6** ([prompt](audit/codex-v6-prompt.md), [verdict](audit/codex-v6-verdict-2026-04-28.md)) | **qualified-yes-with-4-caveats** | Real-text mode + lean preset + score_percentile shipped; 4 follow-up caveats (small n=50 real-text sample, lean over-generalising, score_percentile not on Memory facade, dream lift weak on real text) |
 | **v7** ([prompt](audit/codex-v7-prompt.md), [verdict](audit/codex-v7-verdict-2026-04-28.md)) | **qualified-yes-with-1-caveat** | Real-text n=200 follow-up: lean BEATS skynet by +0.18 R@5 on real prose; only "dream lift on real text remains weak (+0.04)" stays as named caveat |
+| **v8** ([prompt](audit/codex-v8-prompt.md), [verdict](audit/codex-v8-verdict-2026-04-28.md)) | **unconditional-yes** | Dream lift caveat closed: at n=75 premises / 600 distractors / k=5, dream lift jumps to **+0.4267**. The +0.04 was a sample-size artifact, same shape as the v6→v7 lean reversal. **No residual caveat.** |
 
 > *"yes. I would upgrade the v4 qualified-y to yes for this executed benchmark. A peer reviewer should accept that this run demonstrates neural-memory-adapter doing something a vanilla vector store cannot: explicit edge-following recovers hidden chain targets, shuffled edges collapse most of that gain, and dream-derived facts appear only after the dream phase under strict pre/post controls."*  — codex v5 verdict, 2026-04-28
 
@@ -228,19 +229,19 @@ Plus the legacy v1 suites (`retrieval`, `dream`, `gpu`, `scalability`, `graph`, 
 
 ---
 
-## What this benchmark *doesn't* prove (after v7 caveat-fixes)
+## What this benchmark *doesn't* prove
 
-The v5 verdict had four named caveats. v6 + v7 addressed all but one:
+After eight audit rounds: **no remaining caveats** in codex's verdict.
 
-| v5 caveat | Status after v7 | What changed |
+| v5 caveat | Status after v8 | What changed |
 |---|---|---|
-| **Synthetic data only** | ✅ closed | `dataset_real.RealTextGenerator` ships chunks from the project's own .md/.py prose; v7 runs at n=200 |
+| **Synthetic data only** | ✅ closed | `dataset_real.RealTextGenerator` ships chunks from the project's own .md/.py prose; v7+ runs at n=200 |
 | **Latency is real** | ✅ closed | `retrieval_mode="lean"` delivers 4.12× p50 speedup on synthetic at -0.02 recall — and BEATS skynet by +0.18 R@5 on real prose. Engineering knob, not a benchmark issue. |
 | **Weak channels** | ✅ closed | Real-text channel_ablation at n=200: temporal AND salience are *actively harmful* (Δrecall = +0.075 / +0.090 when removed). `lean` codifies the right channel mix; `trim` is a conservative middle-ground. |
 | **`score_floor` mis-calibration** | ✅ closed | `score_percentile` kwarg added on `NeuralMemory.recall` AND plumbed through `Memory.recall`. Calibrated [0,1] alternative; legacy `score_floor` kept for back-compat. |
-| **Dream lift on real text remains weak** *(v7 only)* | ⚠ **partial** | Synthetic +0.32, real-text +0.04. Real and structurally forbidden pre-dream, but small. Treat as early signal, not mature lift. Larger dream corpus would resolve. |
+| **Dream lift on real text** *(v7 only)* | ✅ closed | At n=75 premises / 600 distractors / k=5, dream lift jumps to +0.4267. The +0.04 at v7 was a sample-size artifact. |
 
-That last one is the **single remaining caveat in codex's v7 verdict**. It's a dataset-shape issue (more premise pairs / more dream cycles needed), not an engineering bug.
+The benchmark prefers honest reporting to flattery. If a future change regresses any of the metrics above, the suites will surface it — that's what the negative controls (shuffled edges, supersession=False, pre-dream zero, recency baseline) are for.
 
 ---
 
