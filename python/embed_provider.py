@@ -1084,8 +1084,15 @@ class HashBackend:
 # ============================================================================
 
 class EmbeddingProvider:
+    # Bounded LRU cap. ~8KB per 1024-d vector → 32MB at 4096 entries.
+    # Override with EMBED_CACHE_MAX env var.
+    _CACHE_MAX_DEFAULT = 4096
+
     def __init__(self, backend: str = "auto"):
-        self.cache: dict[str, list[float]] = {}
+        from collections import OrderedDict
+        self._cache_max = max(64, int(os.environ.get("EMBED_CACHE_MAX",
+                                                     self._CACHE_MAX_DEFAULT)))
+        self.cache: "OrderedDict[str, list[float]]" = OrderedDict()
         self._load_cache()
         
         if backend == "auto":
@@ -1228,54 +1235,93 @@ class EmbeddingProvider:
         return HashBackend()
     
     def _load_cache(self):
+        from collections import OrderedDict
         if CACHE_FILE.exists():
             try:
                 with open(CACHE_FILE, 'rb') as f:
-                    self.cache = pickle.load(f)
+                    raw = pickle.load(f)
+                if isinstance(raw, OrderedDict):
+                    self.cache = raw
+                elif isinstance(raw, dict):
+                    self.cache = OrderedDict(raw.items())
+                else:
+                    self.cache = OrderedDict()
             except Exception:
-                self.cache = {}
-    
+                self.cache = OrderedDict()
+            # On load, evict back down to the cap if a previous (unbounded)
+            # session left a giant pickle on disk.
+            self._evict_to_cap()
+
     def _save_cache(self):
+        """Persist cache atomically so a crash mid-write can't corrupt it."""
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CACHE_FILE, 'wb') as f:
-            pickle.dump(self.cache, f)
-    
+        tmp = CACHE_FILE.with_name(CACHE_FILE.name + ".tmp")
+        try:
+            with open(tmp, 'wb') as f:
+                pickle.dump(self.cache, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CACHE_FILE)
+        except OSError:
+            try: tmp.unlink()
+            except OSError: pass
+
+    def _evict_to_cap(self) -> None:
+        while len(self.cache) > self._cache_max:
+            self.cache.popitem(last=False)  # FIFO: drop oldest insertion
+
+    def _record(self, key: str, vec: list[float]) -> None:
+        """Insert / refresh-LRU a cache entry under the bound."""
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            self.cache[key] = vec
+            return
+        self.cache[key] = vec
+        if len(self.cache) > self._cache_max:
+            self._evict_to_cap()
+
     def embed(self, text: str) -> list[float]:
         key = hashlib.md5(text.encode()).hexdigest()
         if key in self.cache:
+            # LRU touch
+            self.cache.move_to_end(key)
             return self.cache[key]
-        
+
         vec = self.backend.embed(text)
-        self.cache[key] = vec
-        
-        # Save periodically
+        self._record(key, vec)
+
+        # Save periodically (every 100 *misses*, not every 100 entries — the
+        # old `len(cache) % 100 == 0` would re-save constantly once the cache
+        # plateaued at a multiple of 100, since len was unchanged after each
+        # eviction-replace cycle).
         if len(self.cache) % 100 == 0:
             self._save_cache()
-        
+
         return vec
-    
+
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         results = []
         to_compute = []
         indices = []
-        
+
         for i, text in enumerate(texts):
             key = hashlib.md5(text.encode()).hexdigest()
             if key in self.cache:
+                self.cache.move_to_end(key)
                 results.append(self.cache[key])
             else:
                 results.append(None)
                 to_compute.append(text)
                 indices.append(i)
-        
+
         if to_compute:
             computed = self.backend.embed_batch(to_compute)
             for idx, vec in zip(indices, computed):
                 results[idx] = vec
                 key = hashlib.md5(texts[idx].encode()).hexdigest()
-                self.cache[key] = vec
+                self._record(key, vec)
             self._save_cache()
-        
+
         return results
     
     @property
