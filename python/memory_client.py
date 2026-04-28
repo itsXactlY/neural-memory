@@ -873,6 +873,21 @@ class NeuralMemory:
                 self._graph_nodes[other] = {"embedding": [], "label": f"memory:{other}", "content": "", "connections": {}}
 
     def _ensure_node(self, mem_id: int, at_time: Optional[float] = None) -> bool:
+        """Make sure a graph node exists in the cache; populate from store on miss.
+
+        Fast path: if the node is already cached AND has a non-placeholder label
+        AND we're not doing a time-travel read (at_time is None), return immediately.
+        This is critical for the BFS / PPR think paths, which call _ensure_node
+        once per visited node — previously every call paid 2 SQL queries
+        (store.get + _refresh_connections) regardless of cache state.
+        """
+        cached = self._graph_nodes.get(mem_id)
+        if (
+            at_time is None
+            and cached is not None
+            and not cached.get("label", "").startswith("memory:")  # placeholder marker
+        ):
+            return True
         mem = self.store.get(mem_id)
         if not mem:
             return False
@@ -880,7 +895,7 @@ class NeuralMemory:
             "embedding": mem.get("embedding", []),
             "label": mem.get("label", ""),
             "content": mem.get("content", ""),
-            "connections": self._graph_nodes.get(mem_id, {}).get("connections", {}),
+            "connections": (cached or {}).get("connections", {}),
         }
         self._refresh_connections(mem_id, at_time=at_time)
         return True
