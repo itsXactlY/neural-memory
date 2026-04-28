@@ -88,6 +88,10 @@ class CppDreamBackend(DreamBackend):
                 confidence REAL DEFAULT 0.0,
                 created_at REAL NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_dream_sessions_started_at
+                ON dream_sessions(started_at);
+            CREATE INDEX IF NOT EXISTS idx_dream_insights_session
+                ON dream_insights(session_id);
         """)
         conn.commit()
         conn.close()

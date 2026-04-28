@@ -107,6 +107,9 @@ CREATE INDEX idx_dream_conn_history ON connection_history(source_id, target_id);
 
 IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_dream_conn_history_changed_at')
 CREATE INDEX idx_dream_conn_history_changed_at ON connection_history(changed_at);
+
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'idx_dream_sessions_started_at')
+CREATE INDEX idx_dream_sessions_started_at ON dream_sessions(started_at);
 """
 
 
