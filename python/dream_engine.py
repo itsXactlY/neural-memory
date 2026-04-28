@@ -953,13 +953,15 @@ class DreamEngine:
                 if self._write_derived_cluster_memory(comm, content, confidence) is not None:
                     stats["derived_facts"] += 1
 
-            # Create bridge insights
+            # Create bridge insights — use the adjacency map we already built
+            # (one O(E) construction up front) instead of rescanning the
+            # entire edge list per bridge node. The previous loop was
+            # O(|bridges| * |edges|), which on a 10K-edge / 500-bridge graph
+            # meant 5M iterations every Insight phase.
             for bnode in bridge_nodes:
                 bridging_communities = set()
-                for e in edges:
-                    if e["source_id"] == bnode or e["target_id"] == bnode:
-                        other = e["target_id"] if e["source_id"] == bnode else e["source_id"]
-                        bridging_communities.add(node_to_comm.get(other, -1))
+                for neighbor, _w in adj.get(bnode, ()):
+                    bridging_communities.add(node_to_comm.get(neighbor, -1))
                 bridging_communities.discard(-1)
 
                 if len(bridging_communities) >= 2:
