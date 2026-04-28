@@ -69,21 +69,27 @@ class AccessLogger:
                    result_scores: list[float], timestamp: Optional[float] = None):
         """Record a single recall event.
 
-        Args:
-            query_embedding: The query vector (stored sparsely/truncated for log).
-            result_ids: Memory IDs returned by the recall.
-            result_scores: Similarity scores for each result.
-            timestamp: Event time (epoch seconds). Defaults to now.
+        Two storage tiers for the query embedding:
+
+          - in-memory event 'query_emb' keeps the FULL vector. This is what
+            consumers like _enhance_recall and the LSTM read via get_sequence;
+            they need the full dim to feed the LSTMPredictor that was sized
+            against the model's full embedding dim. Previously this was
+            truncated to 64 dims at log time to keep logs compact, which
+            silently broke the LSTM path with a ValueError that the
+            recall-side try/except swallowed — the LSTM enhancement never
+            actually ran.
+          - on-disk JSONL line keeps only the truncated 64-d sample, so log
+            files stay compact (the truncation happens inside _flush_buffer
+            via __log_event_for_disk). The disk log is for forensic /
+            ML-training use, not the live LSTM context.
         """
         if timestamp is None:
             timestamp = time.time()
 
-        # Store truncated embedding (first 64 dims) to keep logs manageable
-        emb_sample = query_embedding[:64] if len(query_embedding) > 64 else query_embedding
-
         event = {
             "ts": timestamp,
-            "query_emb": emb_sample,
+            "query_emb": list(query_embedding),  # full-dim, in-memory only
             "result_ids": result_ids[:20],  # cap at 20 results
             "result_scores": [round(s, 4) for s in result_scores[:20]],
             "n_results": len(result_ids),
@@ -293,6 +299,19 @@ class AccessLogger:
             except OSError:
                 pass
 
+    @staticmethod
+    def _event_for_disk(event: dict) -> dict:
+        """Truncate query_emb to 64 dims for the on-disk JSONL form.
+
+        Disk records are for forensic / training use and don't need the
+        full embedding; truncating keeps file size sane. The in-memory
+        deque retains the full vector for live LSTM consumption.
+        """
+        emb = event.get("query_emb") or []
+        if len(emb) > 64:
+            return {**event, "query_emb": list(emb[:64])}
+        return event
+
     def _flush_buffer(self):
         """Write buffered events to JSONL file (internal, assumes lock held)."""
         if not self._buffer:
@@ -317,7 +336,7 @@ class AccessLogger:
 
             with open(self._log_file, "a") as f:
                 for event in events_to_flush:
-                    f.write(json.dumps(event, separators=(",", ":")) + "\n")
+                    f.write(json.dumps(self._event_for_disk(event), separators=(",", ":")) + "\n")
             self._ops_since_flush = 0
         except IOError as e:
             print(f"[AccessLogger] Flush error: {e}")
