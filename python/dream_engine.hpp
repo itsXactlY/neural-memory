@@ -1262,7 +1262,13 @@ private:
 // ============================================================================
 namespace py = pybind11;
 
-PYBIND11_MODULE(dream_engine, m) {
+// Module name is intentionally `dream_engine_native` rather than `dream_engine`:
+// the Python module `dream_engine.py` is the public import surface, and a
+// pybind module of the same name would shadow it whenever the .so happens to
+// be on the path (Python prefers extension modules over .py at the same name).
+// Consumers that want the C++ side do `import dream_engine_native` once the
+// CMake target lands; everyone else continues to `import dream_engine`.
+PYBIND11_MODULE(dream_engine_native, m) {
     m.doc() = "Dream Engine C++26+ - Neural memory consolidation library";
 
     // Register MemoryArena
