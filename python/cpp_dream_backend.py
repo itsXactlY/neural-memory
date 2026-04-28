@@ -294,17 +294,19 @@ class CppDreamBackend(DreamBackend):
                 logger.debug("batch_weaken (bulk) failed: %s", e)
                 return 0
         
-        # Explicit mode: list of tuples
+        # Explicit mode: list of tuples — single executemany instead of N
+        # individual UPDATE statements. Each separate execute() pays a fresh
+        # round-trip + statement-prepare cost; with a few hundred edges
+        # per cycle that latency dominated MSSQL dream operations.
         if not updates:
             return 0
         try:
             cursor = self._mssql_conn.cursor()
-            for new_w, src, tgt in updates:
-                cursor.execute(
-                    "UPDATE connections SET weight = ? "
-                    "WHERE source_id = ? AND target_id = ?",
-                    new_w, src, tgt
-                )
+            cursor.executemany(
+                "UPDATE connections SET weight = ? "
+                "WHERE source_id = ? AND target_id = ?",
+                list(updates),
+            )
             return len(updates)
         except Exception as e:
             logger.debug("batch_weaken failed: %s", e)
@@ -312,9 +314,21 @@ class CppDreamBackend(DreamBackend):
 
     def add_bridge(self, source_id: int, target_id: int,
                     weight: float = 0.3) -> None:
-        """Add bridge edge to connections table via MSSQL (UPSERT)."""
+        """Add bridge edge to connections table via MSSQL (UPSERT).
+
+        Canonicalises source<target so the row matches the invariant the
+        application-side SQLiteStore.add_connection enforces. Without
+        canonicalisation, the connections table accumulated mixed-orientation
+        rows (auto_connect produced (min, max), REM bridges via this method
+        could produce (max, min)). See iters 23 and 36 for the matching
+        SQLite and dream_mssql_store fixes.
+        """
         if not self._mssql_conn:
             return
+        if source_id == target_id:
+            return
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
         try:
             self._mssql_conn.execute(
                 "MERGE connections AS target "
