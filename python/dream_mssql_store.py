@@ -248,9 +248,28 @@ class DreamMSSQLStore:
                 break
         return results
 
+    @staticmethod
+    def _canon_pair(source_id: int, target_id: int):
+        """Canonicalise (source<target) and reject self-edges.
+
+        All MSSQL connection rows satisfy source<target (iter 36 add_bridge,
+        iter 50 add_connection, iter 61 migration). Strict-WHERE updates
+        without canonicalisation silently match nothing on (max, min)
+        input — same hazard fixed for dream_engine.py in iter 79.
+        """
+        if source_id == target_id:
+            return None
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
+        return source_id, target_id
+
     def strengthen_connection(self, source_id: int, target_id: int,
                                delta: float = 0.05) -> None:
         """Strengthen a connection by delta (capped at 1.0)."""
+        pair = self._canon_pair(source_id, target_id)
+        if pair is None:
+            return
+        source_id, target_id = pair
         self.conn.execute(
             "UPDATE connections SET weight = CASE "
             "WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
@@ -262,6 +281,10 @@ class DreamMSSQLStore:
     def weaken_connection(self, source_id: int, target_id: int,
                            delta: float = 0.01) -> None:
         """Weaken a connection by delta (floored at 0.0)."""
+        pair = self._canon_pair(source_id, target_id)
+        if pair is None:
+            return
+        source_id, target_id = pair
         self.conn.execute(
             "UPDATE connections SET weight = CASE "
             "WHEN weight - ? < 0.0 THEN 0.0 ELSE weight - ? END "
@@ -275,15 +298,23 @@ class DreamMSSQLStore:
         """Bulk strengthen connections. Returns count updated."""
         if not edges:
             return 0
+        canon = []
+        for src, tgt in edges:
+            pair = self._canon_pair(int(src), int(tgt))
+            if pair is None:
+                continue
+            canon.append((delta, delta, pair[0], pair[1]))
+        if not canon:
+            return 0
         cursor = self.conn.cursor()
         cursor.executemany(
             "UPDATE connections SET weight = CASE "
             "WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
             "WHERE source_id = ? AND target_id = ?",
-            [(delta, delta, src, tgt) for src, tgt in edges]
+            canon,
         )
         self.conn.commit()
-        return len(edges)
+        return len(canon)
 
     def batch_weaken_connections(self, threshold: float = 0.05,
                                   delta: float = 0.01) -> int:

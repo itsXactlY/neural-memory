@@ -204,9 +204,19 @@ class CppDreamBackend(DreamBackend):
 
     def strengthen_connection(self, source_id: int, target_id: int,
                                delta: float = 0.05) -> None:
-        """Strengthen edge in connections table via MSSQL."""
+        """Strengthen edge in connections table via MSSQL.
+
+        Canonicalises (source < target) so the strict WHERE matches the
+        rows produced by every canonicalising writer (iter 36 add_bridge,
+        iter 50 add_connection, iter 61 migration). Without the swap,
+        callers passing (max, min) silently update zero rows.
+        """
         if not self._mssql_conn:
             return
+        if source_id == target_id:
+            return
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
         try:
             self._mssql_conn.execute(
                 "UPDATE connections SET weight = CASE WHEN weight + ? > 1.0 THEN 1.0 ELSE weight + ? END "
@@ -221,6 +231,7 @@ class CppDreamBackend(DreamBackend):
 
         Accepts 2-tuples (source_id, target_id) — fetches current weight and adds delta.
         Also accepts 3-tuples (new_weight, source_id, target_id) for direct weight set.
+        Both forms get source<target canonicalisation before the SELECT/UPDATE.
         """
         if not edges or not self._mssql_conn:
             return 0
@@ -233,6 +244,13 @@ class CppDreamBackend(DreamBackend):
                 except ValueError:
                     # 2-tuple: (source_id, target_id) — fetch weight then add delta
                     src, tgt = item
+                    new_w = None
+                src, tgt = int(src), int(tgt)
+                if src == tgt:
+                    continue
+                if src > tgt:
+                    src, tgt = tgt, src
+                if new_w is None:
                     try:
                         cursor.execute(
                             "SELECT weight FROM connections WHERE source_id = ? AND target_id = ?",
