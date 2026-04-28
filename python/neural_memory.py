@@ -495,16 +495,16 @@ class Memory:
     def _ensure_mssql_memory(self, mem_id: int) -> None:
         """Make sure memory `mem_id` exists in MSSQL; mirror it from SQLite if not.
 
-        Cheap fast-path: if MSSQLStore already has the row, MSSQLStore.store's
-        MERGE is a no-op update of identical content. The expensive case
-        (lazy backfill) only fires for memories pre-dating MSSQL
-        configuration, which is exactly when it's needed.
+        Cheap fast-path: a single-row \`SELECT 1 FROM memories WHERE id=?\`
+        decides whether the lazy backfill is needed. The expensive case
+        (read SQLite + MSSQL upsert) only fires for memories pre-dating
+        MSSQL configuration. Previously this called the full get(id), which
+        pulled the embedding blob over the wire just to test existence.
         """
         if not self._mssql_store:
             return
         try:
-            existing = self._mssql_store.get(int(mem_id))
-            if existing is not None:
+            if self._mssql_store.exists(int(mem_id)):
                 return
         except Exception:
             return

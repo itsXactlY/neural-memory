@@ -300,6 +300,12 @@ class MSSQLStore:
             "access_count": access,
         }
     
+    def exists(self, id_: int) -> bool:
+        """Cheap existence check — single-row count, no embedding pull."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT 1 FROM memories WHERE id = ?", id_)
+        return cursor.fetchone() is not None
+
     def touch(self, id_: int):
         cursor = self.conn.cursor()
         cursor.execute(
