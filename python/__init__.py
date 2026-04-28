@@ -134,6 +134,11 @@ class NeuralMemoryProvider(MemoryProvider):
         self._lock = threading.Lock()
         self._prefetch_result: Optional[str] = None
         self._prefetch_thread: Optional[threading.Thread] = None
+        # Monotonic sequence number for prefetch generations. Only the
+        # newest prefetch is allowed to publish into _prefetch_result —
+        # an in-flight slow one whose generation has been superseded
+        # silently drops its result instead of clobbering a fresher one.
+        self._prefetch_gen: int = 0
         self._initial_context: str = ""
         self._consolidation_thread: Optional[threading.Thread] = None
         self._consolidation_stop = threading.Event()  # set = stop requested
@@ -443,10 +448,21 @@ class NeuralMemoryProvider(MemoryProvider):
         return f"## Neural Memory Context\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Fire a background recall for the next turn."""
+        """Fire a background recall for the next turn.
+
+        If an earlier prefetch is still in flight, this call bumps the
+        generation counter so the older thread's result is dropped on
+        completion (see `_prefetch_gen` check below). That prevents a slow
+        prefetch from clobbering a fresher one with stale data, and makes
+        the most-recent queue_prefetch the source of truth.
+        """
         if not self._memory or not query:
             return
         limit = min(self._config.get("prefetch_limit", 3), 3) if self._config else 3
+
+        with self._lock:
+            self._prefetch_gen += 1
+            my_gen = self._prefetch_gen
 
         def _run():
             try:
@@ -472,7 +488,11 @@ class NeuralMemoryProvider(MemoryProvider):
                         break
                 if lines:
                     with self._lock:
-                        self._prefetch_result = "\n".join(lines)
+                        # Drop our result if a newer prefetch has been queued
+                        # in the meantime — its result is the one the next
+                        # turn should see, not ours.
+                        if my_gen == self._prefetch_gen:
+                            self._prefetch_result = "\n".join(lines)
             except Exception as e:
                 logger.debug("Neural prefetch failed: %s", e)
 
