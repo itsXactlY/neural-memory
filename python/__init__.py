@@ -908,14 +908,59 @@ memory?") call `neural_graph` to summarise.
                 self._dream.stop()
             self._dream.touch()
 
-        # 2. Auto-recall for this turn (fire-and-forget — same generation
-        # guard as queue_prefetch, so concurrent turns don't race).
-        # Skip for empty/very-short messages where recall is noise.
+        # 2. Auto-recall for this turn — SYNCHRONOUS so the result is in
+        # _prefetch_result by the time prefetch() reads it. queue_prefetch
+        # was async via a background thread, which lost a 50-200ms race
+        # against the harness's subsequent prefetch() call: the result
+        # would land AFTER the prompt was built, so the model never saw
+        # it. Synchronous recall costs ~100ms per turn (HNSW ANN path)
+        # which is negligible against a multi-second LLM call.
+        # Falls back to queue_prefetch if the sync path raises so we
+        # still have SOMETHING for the next turn.
         if user_message and len(user_message.strip()) >= 4:
             try:
-                self.queue_prefetch(user_message, session_id=session_id)
+                self._run_sync_prefetch(user_message)
             except Exception as e:
-                logger.debug("Auto-recall queue failed: %s", e)
+                logger.debug("Auto-recall sync failed, falling back to async: %s", e)
+                try:
+                    self.queue_prefetch(user_message, session_id=session_id)
+                except Exception:
+                    pass
+
+    def _run_sync_prefetch(self, query: str) -> None:
+        """Synchronous version of queue_prefetch — runs the recall inline
+        so prefetch() reads a current result. Same scoring/filter as the
+        async path (cf. queue_prefetch._run); keeping the two implementations
+        in sync is the small cost we pay for the latency win.
+        """
+        if not self._memory or not query:
+            return
+        limit = min(self._config.get("prefetch_limit", 3), 3) if self._config else 3
+        results = self._memory.recall(query, k=limit * 2)
+        if not results:
+            return
+        lines = []
+        for r in results:
+            sim = r.get("similarity", 0)
+            if sim < 0.5:
+                continue
+            content = r.get("content", "")
+            content_lower = content.lower()
+            if any(skip in content_lower for skip in (
+                "neural memory", "tool_result", "test_suite", "mssql",
+                "config.yaml", "odbc", "embedding", "connection string",
+                "archive:session",
+            )):
+                continue
+            lines.append(f"- [{sim:.2f}] {content[:150]}")
+            if len(lines) >= limit:
+                break
+        if lines:
+            with self._lock:
+                # Bump generation — any in-flight async fetch from a previous
+                # turn must drop its result rather than stomp ours.
+                self._prefetch_gen += 1
+                self._prefetch_result = "\n".join(lines)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return ALL_TOOL_SCHEMAS
