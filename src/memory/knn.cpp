@@ -148,19 +148,20 @@ std::vector<ScoredResult> KNNEngine::search(
     std::vector<ScoredResult> scored;
     scored.reserve(n);
 
-    // Use batch_cosine_similarity for the embedding component
+    // Use batch_cosine_dispatch for the embedding component (best ISA available).
+    // V3.1: thread_local scratch buffer eliminates per-call allocation
+    // (was ~40MB heap churn at 10K candidates × 1024-dim BGE-M3).
     std::vector<float> cos_sims(n);
     {
-        // Flatten candidate embeddings into contiguous buffer for batch op.
-        // NOTE: candidates may point to non-contiguous memory. We must copy.
-        std::vector<float> flat_embeddings(n * embed_dim_);
+        thread_local std::vector<float> flat_embeddings;
+        flat_embeddings.resize(n * embed_dim_);
         for (size_t i = 0; i < n; ++i) {
             std::copy(candidates[i].embedding,
                       candidates[i].embedding + embed_dim_,
                       flat_embeddings.data() + i * embed_dim_);
         }
-        simd::batch_cosine_similarity(query_embed, flat_embeddings.data(),
-                                       n, embed_dim_, cos_sims.data());
+        simd::batch_cosine_dispatch(query_embed, flat_embeddings.data(),
+                                    n, embed_dim_, cos_sims.data());
     }
 
     // Compute remaining signals and combine

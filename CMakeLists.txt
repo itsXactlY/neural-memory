@@ -1,19 +1,44 @@
 # CMakeLists.txt - Neural Memory Adapter
 # Production: cmake .. -DCMAKE_BUILD_TYPE=Release
 # Sandbox:    cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-march=x86-64"
+# C++26:      cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_CXX26=ON
 cmake_minimum_required(VERSION 3.20)
-project(neural-memory-adapter VERSION 1.0.0 LANGUAGES CXX)
+project(neural-memory-adapter VERSION 1.1.0 LANGUAGES CXX)
 
 option(USE_MSSQL "Build with MSSQL/ODBC support (requires unixodbc-dev)" ON)
+option(USE_CXX26 "Try C++26 (auto-fallback to C++23 if unsupported)" ON)
+option(USE_NATIVE_ARCH "Compile with -march=native (4-5x speedup on AVX2/AVX-512 hosts; off=portable)" OFF)
 
-set(CMAKE_CXX_STANDARD 23)
+# ─── C++ standard auto-detect ────────────────────────────────────────────────
+# Goal: pick the highest standard the compiler can compile, defaulting to C++26.
+include(CheckCXXCompilerFlag)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(OPT_FLAGS -O3 -DNDEBUG -march=x86-64 -flto)
+if(USE_CXX26)
+    check_cxx_compiler_flag("-std=c++26" HAS_CXX26)
+    if(NOT HAS_CXX26)
+        check_cxx_compiler_flag("-std=c++2c" HAS_CXX2C)
+    endif()
+endif()
+
+if(USE_CXX26 AND (HAS_CXX26 OR HAS_CXX2C))
+    set(CMAKE_CXX_STANDARD 26)
+    message(STATUS "C++ standard: C++26 (auto-detected)")
+else()
+    set(CMAKE_CXX_STANDARD 23)
+    message(STATUS "C++ standard: C++23 (C++26 not supported by this compiler or disabled)")
+endif()
+
+if(USE_NATIVE_ARCH)
+    set(OPT_FLAGS -O3 -DNDEBUG -march=native -flto)
+    message(STATUS "Architecture: -march=native (host-specific build)")
+else()
+    set(OPT_FLAGS -O3 -DNDEBUG -march=x86-64 -flto)
+    message(STATUS "Architecture: -march=x86-64 (portable build; pass -DUSE_NATIVE_ARCH=ON for SIMD speedup)")
+endif()
 set(WARN_FLAGS -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
-include(CheckCXXCompilerFlag)
 set(HAS_AVX2 FALSE)
 # AVX-512: disabled by default (Ryzen 7 3800X doesn't have it)
 set(HAS_AVX512 FALSE)

@@ -4,24 +4,31 @@
 #include "neural/simd.h"
 #include <vector>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <new>
 #include <stdexcept>
 #include <iostream>
 #include <memory>
+#include <utility>
 
 namespace neural {
 
 // ============================================================================
 // Aligned allocation helpers
 // ============================================================================
+// V3.1: alignment bumped from 32 → 64 so AVX-512 paths can use aligned loads
+// safely on hardware that has them. AVX2 / NEON paths are unaffected (the
+// stricter alignment is a superset of the previous 32-byte requirement).
 
 template<typename T>
 T* aligned_alloc_t(size_t count) {
+    if (count == 0) return nullptr;
     void* ptr = nullptr;
-    if (posix_memalign(&ptr, 32, count * sizeof(T)) != 0) {
-        return nullptr;
+    if (posix_memalign(&ptr, simd::ALIGN_512, count * sizeof(T)) != 0) {
+        throw std::bad_alloc();
     }
     return static_cast<T*>(ptr);
 }
@@ -34,36 +41,42 @@ void aligned_free_t(T* ptr) {
 // ============================================================================
 // Vector32f - Float32 vector with SIMD operations
 // ============================================================================
+// V3.1 extensions:
+//  - Adds move constructor + move assignment (rule of 5). Previously every
+//    "return Vector32f" through `operator+` etc. did a full malloc+memcpy;
+//    moves now steal the buffer. Pure perf win, no observable behavior change.
+//  - Underlying storage is 64-byte aligned (was 32) → AVX-512 ready.
+//  - aligned_alloc_t throws std::bad_alloc on failure, no more silent nullptr.
 
 class Vector32f {
 public:
-    Vector32f() : data_(nullptr), dim_(0), owns_(false) {}
+    Vector32f() noexcept : data_(nullptr), dim_(0), owns_(false) {}
 
     explicit Vector32f(size_t dim) : dim_(dim), owns_(true) {
         data_ = aligned_alloc_t<float>(dim);
-        std::memset(data_, 0, dim * sizeof(float));
+        if (data_) std::memset(data_, 0, dim * sizeof(float));
     }
 
     Vector32f(size_t dim, float fill) : dim_(dim), owns_(true) {
         data_ = aligned_alloc_t<float>(dim);
-        std::fill_n(data_, dim, fill);
+        if (data_) std::fill_n(data_, dim, fill);
     }
 
     Vector32f(std::initializer_list<float> init) : dim_(init.size()), owns_(true) {
         data_ = aligned_alloc_t<float>(dim_);
-        std::copy(init.begin(), init.end(), data_);
+        if (data_) std::copy(init.begin(), init.end(), data_);
     }
 
     Vector32f(const float* src, size_t dim) : dim_(dim), owns_(true) {
         data_ = aligned_alloc_t<float>(dim);
-        std::memcpy(data_, src, dim * sizeof(float));
+        if (data_) std::memcpy(data_, src, dim * sizeof(float));
     }
 
     ~Vector32f() { if (owns_ && data_) aligned_free_t(data_); }
 
     Vector32f(const Vector32f& o) : dim_(o.dim_), owns_(true) {
         data_ = aligned_alloc_t<float>(dim_);
-        std::memcpy(data_, o.data_, dim_ * sizeof(float));
+        if (data_ && o.data_) std::memcpy(data_, o.data_, dim_ * sizeof(float));
     }
 
     Vector32f& operator=(const Vector32f& o) {
@@ -72,7 +85,28 @@ public:
             dim_ = o.dim_;
             owns_ = true;
             data_ = aligned_alloc_t<float>(dim_);
-            std::memcpy(data_, o.data_, dim_ * sizeof(float));
+            if (data_ && o.data_) std::memcpy(data_, o.data_, dim_ * sizeof(float));
+        }
+        return *this;
+    }
+
+    // V3.1: move semantics — eliminates malloc+memcpy on returned-by-value.
+    Vector32f(Vector32f&& o) noexcept
+        : data_(o.data_), dim_(o.dim_), owns_(o.owns_) {
+        o.data_ = nullptr;
+        o.dim_  = 0;
+        o.owns_ = false;
+    }
+
+    Vector32f& operator=(Vector32f&& o) noexcept {
+        if (this != &o) {
+            if (owns_ && data_) aligned_free_t(data_);
+            data_ = o.data_;
+            dim_  = o.dim_;
+            owns_ = o.owns_;
+            o.data_ = nullptr;
+            o.dim_  = 0;
+            o.owns_ = false;
         }
         return *this;
     }
