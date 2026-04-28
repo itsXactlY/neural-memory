@@ -387,9 +387,17 @@ class CppDreamBackend(DreamBackend):
     def log_connection_change(self, source_id: int, target_id: int,
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
-        """Log connection change to connection_history table (UPSERT)."""
+        """Log connection change to connection_history table (UPSERT).
+
+        Canonicalises source<target so the MERGE upsert key matches the
+        canonical orientation of connections rows (see iters 23, 36, 61).
+        Without this guard a caller passing (high, low) creates a separate
+        non-canonical history row for the same edge.
+        """
         if not self._mssql_conn:
             return
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
         try:
             self._mssql_conn.execute(
                 "MERGE connection_history AS target "

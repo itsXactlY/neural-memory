@@ -391,7 +391,17 @@ class DreamMSSQLStore:
     def log_connection_change(self, source_id: int, target_id: int,
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
-        """Log a connection weight change."""
+        """Log a connection weight change.
+
+        Canonicalises source<target so the MERGE upsert key matches the
+        connections-table invariant. Without this guard a caller passing
+        (high, low) would create a separate non-canonical history row
+        for what is logically the same edge — connection_history could
+        hold both orientations for the same edge and joins on
+        (source_id, target_id) would lose half.
+        """
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
         now = datetime.fromtimestamp(time.time())
         self.conn.execute(
             "MERGE connection_history AS target "

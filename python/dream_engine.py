@@ -543,6 +543,13 @@ class SQLiteDreamBackend(DreamBackend):
     def log_connection_change(self, source_id: int, target_id: int,
                                old_weight: float, new_weight: float,
                                reason: str) -> None:
+        # Defensive canonicalisation: every connections row is canonical
+        # (source<target), so log rows must match or any join on
+        # (source_id, target_id) loses half the history. Callers fixed in
+        # iter-M already canonicalise; this guard makes the contract
+        # function-level so a future caller can't silently regress.
+        if source_id > target_id:
+            source_id, target_id = target_id, source_id
         conn = self._connect()
         try:
             conn.execute(
