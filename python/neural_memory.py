@@ -655,7 +655,21 @@ class Memory:
 
             if memory_text.strip():
                 full_label = f"archive:{session_tag}:{label}" if session_tag else f"archive:{label}"
-                self.remember(memory_text, label=full_label)
+                # Archive writes are lossless preservation, not curated
+                # learning: each archived turn is stored verbatim, NOT fused
+                # with similar prior turns and NOT auto-connected. Reasons:
+                #   1. Conflict-fusion mutates user message text (wraps it in
+                #      [CANONICAL]/[PREVIOUSLY] markup), which destroys the
+                #      \"archive\" property.
+                #   2. auto_connect against an N-archive corpus produces
+                #      O(turns^2) edges of near-duplicate sibling turns,
+                #      flooding the graph with no semantic value.
+                self.remember(
+                    memory_text,
+                    label=full_label,
+                    detect_conflicts=False,
+                    auto_connect=False,
+                )
                 archived += 1
 
         return {"archived": archived}
