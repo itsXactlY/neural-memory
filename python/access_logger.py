@@ -55,6 +55,11 @@ class AccessLogger:
         self._flush_threshold = 100
         self._ops_since_flush = 0
         self._file_lock = threading.Lock()
+        # Throttle directory-scanning cleanup so it doesn't run on every flush
+        # (every 100 events). Stat'ing the dir + iterating files is wasted I/O
+        # at burst rates; an hour between sweeps is plenty for a 30-day cap.
+        self._last_cleanup_at = 0.0
+        self._cleanup_interval_s = 3600
 
         # Auto-create log directory
         self._log_dir.mkdir(parents=True, exist_ok=True)
@@ -256,17 +261,37 @@ class AccessLogger:
         self._log_file.rename(dst)
 
     def _clean_old_logs(self, keep_days: int = 30):
-        """Delete rotated log files older than keep_days."""
+        """Delete rotated log files older than keep_days.
+
+        Only ROTATED files (access_log.<N>.jsonl with numeric suffix) are
+        considered — the active access_log.jsonl is excluded to prevent the
+        active inode from being unlinked underneath the writer when a process
+        has been alive but quiet for 30+ days. Active mtime updates on every
+        write, so in practice it would survive anyway, but matching the
+        pattern was a latent foot-gun.
+        """
         if not self._log_dir.exists():
             return
         cutoff = time.time() - (keep_days * 86400)
+        active_name = self._log_file.name
         for f in self._log_dir.iterdir():
-            if f.is_file() and f.name.startswith("access_log.") and f.suffix == ".jsonl":
+            if not f.is_file():
+                continue
+            if f.name == active_name:
+                continue  # never touch the live log
+            if f.suffix != ".jsonl" or not f.name.startswith("access_log."):
+                continue
+            # Require an integer rotation index between the prefix and the
+            # extension (access_log.<int>.jsonl). Anything else (e.g. a
+            # third-party file that happens to share the prefix) is left alone.
+            stem_parts = f.name[len("access_log."):-len(".jsonl")]
+            if not stem_parts.isdigit():
+                continue
+            try:
                 if f.stat().st_mtime < cutoff:
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+                    f.unlink()
+            except OSError:
+                pass
 
     def _flush_buffer(self):
         """Write buffered events to JSONL file (internal, assumes lock held)."""
@@ -278,8 +303,12 @@ class AccessLogger:
             if self._should_rotate():
                 self._rotate_log()
 
-            # Clean old rotated logs on every flush (removes logs older than 30 days)
-            self._clean_old_logs(keep_days=30)
+            # Clean old rotated logs at most once per hour (cheap on its own
+            # but we'd otherwise iterdir+stat every 100 recalls).
+            now = time.time()
+            if now - self._last_cleanup_at >= self._cleanup_interval_s:
+                self._clean_old_logs(keep_days=30)
+                self._last_cleanup_at = now
 
             # Get events since last flush (deque: convert slice to list of recent items)
             import itertools
