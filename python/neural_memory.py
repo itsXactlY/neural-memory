@@ -53,7 +53,7 @@ class Memory:
     - KNNEngine: multi-signal re-ranking (embedding + temporal + frequency + graph)
     """
     
-    def __init__(self, 
+    def __init__(self,
                  db_path: Optional[str] = None,
                  embedding_backend: str = "auto",
                  use_cpp: bool = True,
@@ -70,7 +70,9 @@ class Memory:
                  salience_decay_k: float = 0.03,
                  ppr_alpha: float = 0.15,
                  ppr_iters: int = 20,
-                 ppr_hops: int = 2):
+                 ppr_hops: int = 2,
+                 mmr_lambda: float = 0.0,
+                 recall_score_floor: float = 0.0):
         
         Path.home().joinpath(".neural_memory").mkdir(parents=True, exist_ok=True)
         
@@ -117,7 +119,14 @@ class Memory:
             ppr_alpha=ppr_alpha,
             ppr_iters=ppr_iters,
             ppr_hops=ppr_hops,
+            mmr_lambda=mmr_lambda,
+            recall_score_floor=recall_score_floor,
         )
+        # Cache the configured defaults so Memory.recall() can pass an
+        # explicit override per-call. NeuralMemory.recall() falls back to
+        # its own stored defaults when these are None.
+        self._mmr_lambda_default = float(mmr_lambda or 0.0)
+        self._recall_score_floor_default = float(recall_score_floor or 0.0)
         # _use_mssql for external probes (the plugin init's \"mssql=%s\" log
         # line and dashboards). \`backend\` and \`dim\` are exposed as @property
         # below — those compute from runtime state so they reflect post-init
@@ -662,12 +671,24 @@ class Memory:
                 pass
         return mem_id
     
-    def recall(self, query: str, k: int = 5) -> list[dict]:
-        """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall (MSSQLStore has no recall)."""
+    def recall(self, query: str, k: int = 5,
+               mmr_lambda: Optional[float] = None,
+               score_floor: Optional[float] = None) -> list[dict]:
+        """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall (MSSQLStore has no recall).
+
+        mmr_lambda and score_floor allow per-call override of the defaults
+        configured at construction. None means "use the constructor default".
+        Without this, the iter-13 MMR / score-floor knobs were configurable
+        on the internal NeuralMemory but unreachable through the public
+        Memory API that hermes uses (audit finding J).
+        """
         embedding = self._embedder.embed(query)
 
         # Always use SQLite for semantic recall — MSSQL is graph-only
-        base_results = self._sqlite_memory.recall(query, k * 3, query_vec=embedding)
+        base_results = self._sqlite_memory.recall(
+            query, k * 3, query_vec=embedding,
+            mmr_lambda=mmr_lambda, score_floor=score_floor,
+        )
         enhanced = self._enhance_recall(embedding, base_results, k)
         for r in enhanced:
             r.pop('embedding', None)
