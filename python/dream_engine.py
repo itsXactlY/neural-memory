@@ -529,22 +529,23 @@ class SQLiteDreamBackend(DreamBackend):
             conn.close()
 
     def prune_old_dream_sessions(self, keep_days: int = 30) -> int:
-        """Delete dream sessions older than keep_days and their associated insights."""
+        """Delete dream sessions older than keep_days and their associated insights.
+
+        Uses correlated DELETE+subquery (no per-id parameter binding) so first-run
+        cleanup of a large backlog can't trip SQLITE_MAX_VARIABLE_NUMBER. The
+        previous implementation built `IN (?,?,?,...)` with one placeholder per
+        old session — fine for the steady-state (3/cycle), broken if the user
+        enabled cleanup after months of accumulation.
+        """
         conn = self._connect()
         try:
             cutoff = time.time() - (keep_days * 86400)
-            # Delete insights for old sessions first (no FK cascade on SQLite)
-            old_sessions = conn.execute(
-                "SELECT id FROM dream_sessions WHERE started_at < ?",
+            # Insights first — SQLite has no FK cascade in default schemas.
+            conn.execute(
+                "DELETE FROM dream_insights "
+                "WHERE session_id IN (SELECT id FROM dream_sessions WHERE started_at < ?)",
                 (cutoff,)
-            ).fetchall()
-            old_ids = [s[0] for s in old_sessions]
-            if old_ids:
-                placeholders = ",".join("?" * len(old_ids))
-                conn.execute(
-                    f"DELETE FROM dream_insights WHERE session_id IN ({placeholders})",
-                    old_ids
-                )
+            )
             count = conn.execute(
                 "DELETE FROM dream_sessions WHERE started_at < ?",
                 (cutoff,)
