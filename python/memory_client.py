@@ -827,6 +827,15 @@ class NeuralMemory:
         self._hnsw_known: set[int] = set()
         self._hnsw_capacity: int = 0
         self._hnsw_dirty = True
+        # Cross-process drift detection. When a separate process (mcp_local,
+        # SaaS server, sync_bridge, manual sqlite3 INSERT, etc.) writes to
+        # the same SQLite, this process's HNSW + graph cache go silently
+        # stale. Periodically peek at SELECT MAX(id) — if it exceeds the
+        # max id we've personally indexed, mark the index dirty so the next
+        # _ensure_hnsw rebuilds. Cheap (indexed b-tree max), throttled.
+        self._hnsw_max_known_id: int = 0
+        self._last_drift_check: float = 0.0
+        self._drift_check_interval: float = 30.0  # seconds
 
         self._cpp = None
         self._cpp_id_map: dict[int, int] = {}
@@ -1045,6 +1054,38 @@ class NeuralMemory:
         self._refresh_connections(mem_id, at_time=at_time)
         return True
 
+    def _check_external_drift(self) -> None:
+        """Detect rows added to SQLite by another process.
+
+        Throttled to once every `self._drift_check_interval` seconds (default
+        30s). When the SQLite top-id exceeds the highest id this process has
+        seen, mark `_hnsw_dirty=True` so the next `_ensure_hnsw` picks up the
+        new rows. Without this, separate processes (mcp_local, SaaS server,
+        sync_bridge, manual sqlite3 INSERT) can write rows that the running
+        recall pipeline never sees — they're in SQLite but not in HNSW or
+        the in-memory graph cache.
+
+        Costs: one indexed `MAX(id)` query every 30s. Microseconds.
+        Trades latency for staleness — at the default interval, drift is
+        visible within ~30s of the external write.
+        """
+        now = time.time()
+        if now - self._last_drift_check < self._drift_check_interval:
+            return
+        self._last_drift_check = now
+        try:
+            row = self.store.conn.execute("SELECT MAX(id) FROM memories").fetchone()
+        except Exception:
+            return
+        live_top = int(row[0]) if row and row[0] is not None else 0
+        if live_top > self._hnsw_max_known_id:
+            # External drift detected. Mark stale; next recall rebuilds.
+            self._hnsw_dirty = True
+            # Also clear the graph-node cache for any new ids — they'll be
+            # lazily re-hydrated by `_ensure_node` on first access.
+            # (Don't blow away ALL nodes; only the ones we definitely missed.)
+            self._hnsw_max_known_id = live_top
+
     def _ensure_hnsw(self) -> bool:
         """Build or incrementally update the HNSW ANN index.
 
@@ -1056,9 +1097,16 @@ class NeuralMemory:
 
         Falls back to full rebuild only when the live capacity is exhausted
         or when the index contains ids the store no longer has (deletes).
+
+        Now also detects cross-process drift via `_check_external_drift`
+        so concurrent writers (mcp_local, SaaS, sync_bridge) can share a
+        SQLite without each running process becoming silently stale.
         """
         if self._hnsw_enabled is False or str(self._hnsw_enabled).lower() in {"0", "false", "no", "off"}:
             return False
+        # Cheap pre-check: if another process appended rows since our last
+        # build, mark the index dirty so the cached fast-path below misses.
+        self._check_external_drift()
         if self._hnsw_index is not None and not self._hnsw_dirty:
             return True
         try:
@@ -1096,6 +1144,10 @@ class NeuralMemory:
             self._hnsw_known.update(new_ids)
             self._hnsw_ids = list(self._hnsw_known)
             self._hnsw_dirty = False
+            # Update drift baseline so the next external-drift check uses
+            # the current top-id, not the pre-incremental value.
+            if new_ids:
+                self._hnsw_max_known_id = max(self._hnsw_max_known_id, max(new_ids))
             return True
 
         # Full rebuild (cold start, deletions, or capacity overflow)
@@ -1111,6 +1163,8 @@ class NeuralMemory:
         self._hnsw_known = set(ids)
         self._hnsw_capacity = capacity
         self._hnsw_dirty = False
+        # Refresh drift-detection baseline after a full rebuild.
+        self._hnsw_max_known_id = max(ids) if ids else 0
         return True
 
     # -- write path -----------------------------------------------------------

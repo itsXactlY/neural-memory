@@ -22,6 +22,7 @@ Usage:
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -130,6 +131,17 @@ class Memory:
         self._mmr_lambda_default = float(mmr_lambda or 0.0)
         self._recall_score_floor_default = float(recall_score_floor or 0.0)
         self._recall_score_percentile_default = float(recall_score_percentile or 0.0)
+        # Cross-process MSSQL drift detection. When a separate writer
+        # appends rows to the SQLite source-of-truth without going through
+        # this Memory instance (e.g. another process in the same pool, or
+        # SQLite-only callers like mcp_local.py), MSSQL can fall behind.
+        # Periodically scan SQLite for ids missing from MSSQL and back-fill.
+        # Costs: one MSSQL exists_many round-trip every interval, only when
+        # MSSQL is configured. Fail-open: any error sets the next_check
+        # back so we don't hammer a dead MSSQL.
+        self._last_mssql_drift_check: float = 0.0
+        self._mssql_drift_check_interval: float = 60.0  # seconds
+        self._mssql_drift_check_failed_until: float = 0.0  # back-off on errors
         # _use_mssql for external probes (the plugin init's \"mssql=%s\" log
         # line and dashboards). \`backend\` and \`dim\` are exposed as @property
         # below — those compute from runtime state so they reflect post-init
@@ -555,6 +567,89 @@ class Memory:
         except Exception:
             pass
 
+    def _check_mssql_drift(self) -> None:
+        """Detect rows present in SQLite but missing from MSSQL.
+
+        Throttled to once every `self._mssql_drift_check_interval` seconds
+        (default 60s). When MSSQL is configured but currently unreachable,
+        the failed-until back-off skips the check for 5 minutes so we
+        don't hammer a dead server.
+
+        Compares the SQLite `MAX(id)` to the MSSQL `MAX(id)`. If SQLite
+        has higher ids, scans the gap and backfills via the existing
+        `_ensure_mssql_memories` upsert path — same canonicalisation rules,
+        same IDENTITY_INSERT machinery, same exists_many short-circuit.
+
+        Costs: 2 MAX(id) queries per check (one SQLite, one MSSQL). Both
+        are O(1) on indexed primary keys. When no drift exists, we exit
+        after the comparison; no per-row work.
+
+        Fail-open: any MSSQL error puts the check on a 5-minute back-off
+        and is logged at debug level. Recall + remember continue to work
+        through SQLite even with MSSQL down (the documented architecture).
+        """
+        if not self._mssql_store:
+            return
+        now = time.time()
+        if now < self._mssql_drift_check_failed_until:
+            return  # MSSQL recently failed; back off
+        if now - self._last_mssql_drift_check < self._mssql_drift_check_interval:
+            return
+        self._last_mssql_drift_check = now
+        try:
+            # Cheap top-id queries on both sides.
+            sql_row = self._sqlite_memory.store.conn.execute(
+                "SELECT MAX(id) FROM memories"
+            ).fetchone()
+            sql_top = int(sql_row[0]) if sql_row and sql_row[0] is not None else 0
+            if sql_top == 0:
+                return
+            cursor = self._mssql_store.conn.cursor()
+            cursor.execute("SELECT ISNULL(MAX(id), 0) FROM memories")
+            mssql_top = int(cursor.fetchone()[0] or 0)
+        except Exception as e:
+            # MSSQL unreachable / offline. Document case: user said
+            # "make sure everything is also always sync with mssql (dont
+            # running rn, spare ram for smoke-testing)" — back off and
+            # try again in 5min so a transient outage doesn't waste cycles.
+            self._mssql_drift_check_failed_until = now + 300.0
+            try:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "MSSQL drift check failed (%s); backing off 300s", e
+                )
+            except Exception:
+                pass
+            return
+
+        if sql_top <= mssql_top:
+            return  # MSSQL is current — nothing to backfill
+
+        # SQLite has rows MSSQL doesn't. Scan the gap. Cap at 1000 ids per
+        # cycle so a wide gap (e.g. MSSQL was offline for hours and SQLite
+        # gained 50K rows) doesn't stall the recall hot path. Subsequent
+        # cycles handle the next 1000.
+        try:
+            rows = self._sqlite_memory.store.conn.execute(
+                "SELECT id FROM memories WHERE id > ? ORDER BY id LIMIT 1000",
+                (mssql_top,),
+            ).fetchall()
+        except Exception:
+            return
+        missing_ids = [int(r[0]) for r in rows]
+        if not missing_ids:
+            return
+        try:
+            self._ensure_mssql_memories(missing_ids)
+        except Exception as e:
+            try:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "MSSQL backfill failed for %d ids: %s", len(missing_ids), e
+                )
+            except Exception:
+                pass
+
     def _ensure_mssql_memories(self, ids: "set[int] | list[int]") -> None:
         """Batch-version of _ensure_mssql_memory.
 
@@ -678,6 +773,12 @@ class Memory:
                mmr_lambda: Optional[float] = None,
                score_floor: Optional[float] = None,
                score_percentile: Optional[float] = None) -> list[dict]:
+        # Periodic cross-process drift check — opportunistic, throttled,
+        # fail-open. Detects rows another process appended to the shared
+        # SQLite (mcp_local, SaaS server, sync_bridge) and backfills MSSQL
+        # if configured. The HNSW drift check inside NeuralMemory.recall
+        # handles the in-memory index side; this handles MSSQL replication.
+        self._check_mssql_drift()
         """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall (MSSQLStore has no recall).
 
         mmr_lambda, score_floor, and score_percentile allow per-call override
