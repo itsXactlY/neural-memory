@@ -1,40 +1,100 @@
-# Neural Memory Adapter for Hermes Agent
+# Neural Memory Adapter for Hermes Agents and any MCP-compatible system
 
-> **A semantic memory system that does what a vector database literally cannot.**
-> Eight rounds of independent GPT-5.5 audit drove a purpose-built benchmark from "no, this is just lexical retrieval" to **"unconditional yes — accept it as evidence."**
-
-Knowledge graph + spreading activation + embedding recall + autonomous *dream* consolidation + conflict supersession + GPU-accelerated cosine — wired as a Hermes-Agent plugin, a stand-alone Python library, and an MCP-compatible SaaS.
-
-> **[🌐 Live Website](https://itsxactly.github.io/neural-memory/)** • **[📊 Benchmark report](benchmarks/README.md)** • **[🔍 Audit transcripts](benchmarks/audit/)**
+> **Give your AI a memory that actually sticks.**
+> One install, and your assistant remembers across sessions — not just what you said, but how the pieces fit together.
 
 ![Neural Brain Hero](assets/neural_brain_hero.png)
 
 ---
 
-## Why this exists
+## In one minute
 
-A generic vector store gives you nearest-neighbour search. Real agent memory needs *more*: it has to follow chains of reasoning across documents, consolidate related facts during downtime, suppress stale information when it gets superseded, and survive across sessions when distractor noise piles up. None of those behaviours are testable with cosine-similarity benchmarks — so the benchmark didn't exist either.
+You know how AI assistants forget everything between chats? This fixes that.
 
-This repo ships **both pieces**: the system, and the benchmark that proves what's specific to the system rather than what a 50-line numpy script could do.
+Plug it in, and your assistant gets a brain that:
 
-## What it does that a vector store cannot
+- 📌 **Remembers what you tell it** — preferences, decisions, fixes, the path of that file you mentioned three weeks ago.
+- 🧠 **Connects related ideas** — like a real notebook with cross-references, not a search box.
+- 😴 **Reflects while you sleep** — overnight, it strengthens what matters and notices new connections.
+- ✏️ **Updates itself when you change your mind** — old facts get superseded, not duplicated.
 
-| Capability                                                          | Vanilla cosine    | Neural-Memory       | Lift          |
-|---------------------------------------------------------------------|-------------------|---------------------|---------------|
-| **Hop-2 graph reasoning** (answer reachable only via A→B→C edges)  | **0.00** R@10     | **1.00** R@10       | **+1.00**     |
-| **Real edges vs shuffled control** (proves traversal, not embed)   | n/a               | 1.00 → 0.27         | **+0.73 collapse** |
-| **Post-dream synthesis** (facts inferable only after consolidation)| structurally **0.00**| **0.43** at scale| **+0.43 lift** |
-| **Conflict supersession** (winner@1 with `detect_conflicts=False`) | 0.03 control      | **0.33**            | **+0.30**     |
-| **Cross-session continuity** under concept-mode distractors        | **0.06**          | **0.62**            | **+0.56**     |
-| **Lean retrieval mode** (real prose, n=200) vs default skynet      | n/a               | **0.60** vs 0.42    | **+0.18 R@5** |
+That's it. The rest of this README goes deeper the further you scroll.
 
-Every cell measured by a suite that *cannot* be solved by token overlap, with negative controls that *must* fail when the relevant mechanism is disabled. Full numbers in [`benchmarks/README.md`](benchmarks/README.md).
+> **🌀 Don't want to install anything?** A managed hosted version is in the works:
+> **[mazemaker.dev](https://mazemaker.dev)** / **[mazemaker.online](https://mazemaker.online)**
+> — *Build the maze. Your agent finds the way.*  Sign up, point your agent at an MCP endpoint, done. (Both domains are placeholders until launch.)
 
-## A purpose-built benchmark
+---
 
-A peer-review-grade benchmark for this kind of system **didn't exist**. Existing semantic-memory evaluations measure either retrieval (BEIR, MS MARCO) or QA (NaturalQuestions) — neither tests graph traversal, dream consolidation, or supersession.
+## Get it running
 
-We built one and had it audited by GPT-5.5 via codex CLI. Eight rounds:
+```bash
+cd ~/projects/neural-memory-adapter
+bash install.sh          # auto-detect hermes-agent
+bash install.sh /path    # explicit path
+```
+
+The installer figures out:
+
+1. Python deps (FastEmbed, torch, numpy)
+2. Whether you have a GPU
+3. Where to deploy the plugin
+4. Database init (SQLite at `~/.neural_memory/memory.db`)
+5. Config setup
+
+Restart hermes after install: `hermes gateway restart`
+
+That's the beginner path. If anything goes wrong, the [Production Lessons](#production-lessons) section near the bottom has every gotcha I've seen on a clean VM.
+
+**Live Dashboard — Knowledge Graph**
+
+[![Dashboard](assets/neural_memory.png)](https://raw.githubusercontent.com/itsXactlY/neural-memory/refs/heads/master/assets/neural_memory.png)
+
+---
+
+## Why it's different from "ChatGPT memory"
+
+Most AI memory systems are search engines: type a query, get back the few documents that contain the same words. That works for simple recall. It falls apart for everything else an agent actually needs.
+
+| Need                                                           | Search-engine memory | This system |
+|----------------------------------------------------------------|----------------------|-------------|
+| Find a fact you told it once                                  | ✅                   | ✅          |
+| Follow a chain of reasoning across multiple memories          | ❌                   | ✅          |
+| Notice that two related facts should be connected             | ❌                   | ✅          |
+| Replace a stale fact when you tell it the new one             | ❌                   | ✅          |
+| Hold its ground when irrelevant noise piles up                 | ❌                   | ✅          |
+| Tell you *why* it surfaced a particular memory                 | ❌                   | ✅          |
+
+The right mental model isn't "vector database." It's **a small brain that lives next to your agent.**
+
+If you want the numbers behind those check marks, keep scrolling. If you don't, the install above is enough — defaults are good.
+
+---
+
+## The numbers
+
+A vector database with cosine similarity will do the first row of that table well and fail every other row. We measured that explicitly.
+
+| Capability                                                          | Vanilla cosine          | Neural-Memory       | Lift               |
+|---------------------------------------------------------------------|-------------------------|---------------------|--------------------|
+| Hop-2 graph reasoning (answer reachable only via A→B→C edges)      | **0.00** R@10           | **1.00** R@10       | **+1.00**          |
+| Real edges vs shuffled control (proves traversal, not embedding)    | n/a                     | 1.00 → 0.27         | **+0.73 collapse** |
+| Post-dream synthesis (facts inferable only after consolidation)     | structurally **0.00**   | **0.43** at scale   | **+0.43 lift**     |
+| Conflict supersession (winner@1 with `detect_conflicts=False`)      | 0.03 control            | **0.33**            | **+0.30**          |
+| Cross-session continuity under concept-mode distractors             | **0.06**                | **0.62**            | **+0.56**          |
+| Lean retrieval mode (real prose, n=200) vs default skynet           | n/a                     | **0.60** vs 0.42    | **+0.18 R@5**      |
+
+R@10 = "the right answer is in the top-10 results", scored 0..1. Higher is better. Every cell measured by a suite that *cannot* be solved by token overlap, with negative controls (shuffled edges, supersession off, pre-dream zero) that *must* fail when the relevant mechanism is disabled.
+
+Full numbers, the JSON dumps, and the suite catalog: [`benchmarks/README.md`](benchmarks/README.md).
+
+---
+
+## How we proved it (the audit story)
+
+A peer-review-grade benchmark for this kind of system **didn't exist**. Existing semantic-memory evaluations measure either retrieval (BEIR, MS MARCO) or QA (NaturalQuestions) — none of them test graph traversal, dream consolidation, or supersession.
+
+So we built one, and had it independently audited by **GPT-5.5** (via [codex CLI](https://openai.com/codex)). It pushed back hard. Eight rounds:
 
 | Round | Verdict                                | Headline reason                                                                  |
 |-------|----------------------------------------|----------------------------------------------------------------------------------|
@@ -46,58 +106,19 @@ We built one and had it audited by GPT-5.5 via codex CLI. Eight rounds:
 | v7    | qualified-y w/ 1 caveat                | n=200 real-prose: lean **beats** default skynet by +0.18 R@5                     |
 | **v8**| **UNCONDITIONAL YES — no residual caveat** | Dream lift +0.43 at scale; the +0.04 at v7 was a sample-size artifact            |
 
-Every prompt and verdict is committed verbatim under [`benchmarks/audit/`](benchmarks/audit/) — open them and see exactly what an honest peer-reviewer-grade audit looks like.
+Every prompt and every verdict, from "no, this is just lexical retrieval" to "unconditional yes — accept it as evidence", is committed verbatim under [`benchmarks/audit/`](benchmarks/audit/). Open `codex-v2-audit-2026-04-28.md` and `codex-v8-verdict-2026-04-28.md` side by side to see the journey end-to-end.
+
+---
 
 ## What the benchmark *gave back* to the production code
 
-Running the benchmark surfaced real engineering wins. Each one is a documented, opt-in option in `~/.hermes/config.yaml`:
+Running the benchmark wasn't just measurement. It surfaced real engineering wins. Each one is now a documented, opt-in option in `~/.hermes/config.yaml`:
 
-- **`retrieval_mode: lean`** — channel_ablation proved BM25/temporal/salience are dead-weight (or actively harmful) on real prose. Lean drops them. Result: **4× faster than skynet on synthetic; +0.18 R@5 better than skynet on real prose**. The benchmark told the production code which channels to remove.
-- **`recall_score_percentile`** — the legacy `score_floor` operates on a badly-scaled RRF score (~0..0.05); a value like 0.2 silently nukes everything. The new percentile knob is calibrated [0,1] by *rank*, not raw score — `0.5` keeps top half, regardless of corpus or model.
+- **`retrieval_mode: lean`** — channel ablation proved that on real prose, BM25 / temporal / salience are dead-weight (or actively *harmful*). Lean drops them. Result: **4× faster than skynet on synthetic; +0.18 R@5 better than skynet on real prose**. The benchmark told the production code which channels to remove.
+- **`recall_score_percentile`** — the legacy `score_floor` operates on a badly-scaled internal score (~0..0.05); a sensible-looking value like 0.2 silently nukes everything. The new percentile knob is calibrated [0,1] by *rank*, so `0.5` keeps top half regardless of corpus or model.
 - **PPR is the load-bearing channel for ranking** (-0.13 MRR if removed); semantic is the load-bearing channel for recall (-0.26 if removed). Surface this in your config tuning.
 
-## Features
-
-- **Semantic memory storage** — auto-embed via FastEmbed ONNX (intfloat/multilingual-e5-large, 1024d). Falls back to sentence-transformers, then TF-IDF, then hash.
-- **Knowledge graph** — auto-connect related memories by cosine threshold, plus explicit `add_connection()` for typed edges. Canonical (source<target) orientation enforced everywhere.
-- **Spreading activation** — BFS or Personalized PageRank for `think(start_id)`. The only path that solves hop-2 retrieval; vanilla cosine literally cannot.
-- **Dream Engine** — three-phase autonomous consolidation: NREM (strengthen activated edges + prune weak), REM (bridge isolated memories), Insight (Louvain communities + materialise `derived:cluster` summary memories).
-- **Conflict detection + supersession** — fuse-or-mark with revision history. `detect_conflicts=False` control arm proves the algorithm is doing real work, not just relying on recency.
-- **Multi-channel retrieval** — semantic + BM25 + entity + temporal + PPR, fused via Reciprocal Rank Fusion. Five presets (`semantic`, `hybrid`, `advanced`, `skynet`, `lean`, `trim`) — pick by latency/quality tradeoff.
-- **GPU recall** — CUDA-accelerated cosine over an in-memory matrix (~100ms for 10k memories). CPU fallback automatic.
-- **SQLite-first** — always works, no external DB needed. WAL mode + bg checkpointing. **MSSQL optional** for shared multi-agent deployments.
-- **Hermes plugin / MCP server / standalone library** — one core, three integration shapes.
-
-## Quick Start
-
-> **🌀 Don't want to self-host?** A managed hosted version is in the works:
-> **[mazemaker.dev](https://mazemaker.dev)** / **[mazemaker.online](https://mazemaker.online)**
-> — *Build the maze. Your agent finds the way.*  Sign up once, point your
-> agent at an MCP endpoint, and skip the install entirely. (Both domains
-> are placeholders until launch.)
-
-```bash
-cd ~/projects/neural-memory-adapter
-bash install.sh          # auto-detect hermes-agent
-bash install.sh /path    # explicit path
-```
-
-The installer handles everything:
-1. Python deps (FastEmbed, torch, numpy)
-2. CUDA detection for GPU recall
-3. Plugin deployment to hermes-agent
-4. Database init (SQLite at ~/.neural_memory/memory.db)
-5. config.yaml setup
-
-Restart hermes after install: `hermes gateway restart`
-
-**Live Dashboard — Knowledge Graph**
-
-[![Dashboard](assets/neural_memory.png)](https://raw.githubusercontent.com/itsXactlY/neural-memory/refs/heads/master/assets/neural_memory.png)
-
-### Run the benchmark yourself
-
-The same suite that produced the eight-round codex verdict ships in this repo. Verify the numbers from the table above on your own machine:
+Run the benchmark yourself:
 
 ```bash
 # Full v8 run on real-text corpus (200 chunks from the project's own docs):
@@ -113,7 +134,23 @@ python -m benchmarks.neural_memory_benchmark.runner \
   --paraphrase --suite graph_reasoning
 ```
 
-A full run takes ~12 minutes on a workstation. Every suite produces a JSON file under `benchmarks/results/<your-dir>/results/`; the negative controls (shuffled-edge graph, `detect_conflicts=False`, pre-dream zero, recency-only) verify the lift is mechanism-driven, not artefact. See [`benchmarks/README.md`](benchmarks/README.md) for the suite catalog and what each one structurally cannot be solved by.
+A full run takes ~12 minutes on a workstation. Every suite produces a JSON file under `benchmarks/results/<your-dir>/results/`.
+
+---
+
+## Features (technical bullets)
+
+If the install + the cheat sheet above is enough for you, you can stop reading here. Below this line everything gets progressively more technical.
+
+- **Semantic memory storage** — auto-embed via FastEmbed ONNX (intfloat/multilingual-e5-large, 1024d). Falls back to sentence-transformers, then TF-IDF, then hash.
+- **Knowledge graph** — auto-connect related memories by cosine threshold, plus explicit `add_connection()` for typed edges. Canonical (source<target) orientation enforced everywhere.
+- **Spreading activation** — BFS or Personalized PageRank for `think(start_id)`. The only path that solves hop-2 retrieval; vanilla cosine literally cannot.
+- **Dream Engine** — three-phase autonomous consolidation: NREM (strengthen activated edges + prune weak), REM (bridge isolated memories), Insight (Louvain communities + materialise `derived:cluster` summary memories).
+- **Conflict detection + supersession** — fuse-or-mark with revision history. `detect_conflicts=False` control arm proves the algorithm is doing real work, not just relying on recency.
+- **Multi-channel retrieval** — semantic + BM25 + entity + temporal + PPR, fused via Reciprocal Rank Fusion. Six presets (`semantic`, `hybrid`, `advanced`, `skynet`, `lean`, `trim`).
+- **GPU recall** — CUDA-accelerated cosine over an in-memory matrix (~100ms for 10k memories). CPU fallback automatic.
+- **SQLite-first** — always works, no external DB needed. WAL mode + bg checkpointing. **MSSQL optional** for shared multi-agent deployments.
+- **Hermes plugin / MCP server / standalone library** — one core, three integration shapes.
 
 ---
 
@@ -205,9 +242,11 @@ idx_connections_source ON connections(source_id)
 idx_connections_target ON connections(target_id)
 ```
 
-## Configuration
+---
 
-All settings in `~/.hermes/config.yaml`:
+## Configuration (every knob)
+
+All settings in `~/.hermes/config.yaml`. The defaults below are the recommended preset based on the v8 benchmark.
 
 ```yaml
 memory:
@@ -266,9 +305,11 @@ memory:
 | **`lean`** | semantic + entity + PPR                    | **Recommended** — drops dead-weight channels |
 | `trim`     | semantic + BM25 + entity + temporal + PPR  | Conservative middle-ground (drops only salience) |
 
-## Tools
+---
 
-When active, these tools are available in Hermes:
+## Tools (LLM-callable surface)
+
+When the plugin is active, these tools appear in Hermes:
 
 | Tool | Description |
 |------|-------------|
@@ -279,9 +320,11 @@ When active, these tools are available in Hermes:
 | `neural_dream` | Force a dream cycle (all/nrem/rem/insight) |
 | `neural_dream_stats` | Dream engine statistics |
 
-## Dream Engine
+---
 
-Autonomous background memory consolidation (biological sleep inspired):
+## Dream Engine (deep dive)
+
+Autonomous background memory consolidation, biological-sleep inspired:
 
 ```mermaid
 flowchart LR
@@ -325,6 +368,8 @@ flowchart LR
 - Automatic: every 50 new memories (configurable)
 - Manual: `neural_dream` tool
 - Standalone: `python python/dream_worker.py --daemon`
+
+---
 
 ## Testing
 
@@ -402,6 +447,8 @@ Tested on a fresh Debian 12 QEMU/KVM VM — hermes-agent + neural memory only, n
 - **Cloud-init delay** — 60–90 s on first boot. Don't assume SSH is ready immediately.
 - **prefetch() returns empty** on fresh DB — expected, no prior memories to pre-load.
 
+---
+
 ## File Structure
 
 ```
@@ -425,8 +472,14 @@ neural-memory-adapter/
 │   ├── memory/lstm.cpp           # LSTM predictor
 │   ├── memory/knn.cpp            # kNN engine
 │   └── memory/hopfield.cpp       # Hopfield network
+├── benchmarks/                   # The eight-round audit story
+│   ├── README.md                 # Suite catalog + headline numbers
+│   ├── audit/                    # codex-v2..v8 prompts + verdicts (verbatim)
+│   └── neural_memory_benchmark/  # Suites + dataset generators
 └── README.md
 ```
+
+---
 
 ## Production Lessons
 
@@ -443,6 +496,14 @@ neural-memory-adapter/
 - **SQLite = Source of Truth** — MSSQL is optional. SQLite always works.
 - **Auto-detect everything** — CUDA, backends, venv paths. Minimize config burden.
 - **4 tool schemas** exposed by NeuralMemoryProvider: `neural_remember`, `neural_recall`, `neural_think`, `neural_graph`. (`neural_dream` / `neural_dream_stats` are standalone Memory class only.)
+
+### Benchmark-driven defaults
+
+- **`retrieval_mode: lean` is the new recommended default** — channel_ablation at n=200 on real prose proved BM25/temporal/salience are dead-weight or actively harmful. Lean drops them. +0.18 R@5 vs skynet.
+- **`recall_score_percentile` over `recall_score_floor`** — the legacy floor lives on a 0..0.05 scale and is silently broken for any reasonable user input. Percentile is calibrated [0,1] by rank.
+- **`think_engine: ppr` over `bfs`** for ranking-quality runs — channel_ablation proved PPR is the biggest MRR contributor (-0.13 if removed).
+
+---
 
 ## License
 
