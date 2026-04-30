@@ -1,13 +1,12 @@
 """
 Dream Postgres Store — dream-specific tables on Postgres backend.
 
-Parallels DreamMSSQLStore for the pgvector deployment topology. Reuses
-the connection-pool pattern from postgres_store.py and shares the same
-DSN env vars (MM_POSTGRES_DSN or MM_POSTGRES_HOST/PORT/DB/USER/PASSWORD).
+Reuses the connection-pool pattern from postgres_store.py and shares the
+same DSN env vars (MM_POSTGRES_DSN or MM_POSTGRES_HOST/PORT/DB/USER/PASSWORD).
 
-Canonical edge ordering and bridge-merge semantics match
-dream_mssql_store.py exactly so anything that toggles between backends
-sees consistent graph state.
+Canonical edge ordering and bridge-merge semantics match the SQLite
+dream store so anything toggling between backends sees consistent
+graph state.
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# .env loader (lightweight, mirrors postgres_store.py / dream_mssql_store.py)
+# .env loader (lightweight, mirrors postgres_store.py)
 # ---------------------------------------------------------------------------
 
 def _load_dotenv(paths: list[str]) -> dict:
@@ -127,8 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_sessions_started_at
 class DreamPostgresStore:
     """Postgres-backed dream store. Creates dream tables on first use.
 
-    Mirrors DreamMSSQLStore's API surface 1:1 — anything that calls into
-    DreamWorker via the configured backend gets the same method set.
+    Provides the dream-store API surface used by DreamWorker.
     """
 
     def __init__(self, dsn: str | None = None, min_size: int = 1, max_size: int = 4):
@@ -248,8 +246,7 @@ class DreamPostgresStore:
 
         All connection rows satisfy source<target (postgres_store.add_connection,
         add_bridge, the dream-side migration). Strict-WHERE updates without
-        canonicalisation silently match nothing on (max, min) input —
-        twin of DreamMSSQLStore._canon_pair.
+        canonicalisation silently match nothing on (max, min) input.
         """
         if source_id == target_id:
             return None
@@ -317,8 +314,9 @@ class DreamPostgresStore:
                    weight: float = 0.3) -> bool:
         """Add a new bridge connection. Returns True if newly inserted.
 
-        Canonicalises source<target — see DreamMSSQLStore.add_bridge for
-        the rationale. Returns False on self-loop or pre-existing edge so
+        Canonicalises source<target so strict-WHERE updates match
+        regardless of caller orientation. Returns False on self-loop or
+        pre-existing edge so
         the REM caller can skip a misleading "0.0 → w" history row.
         """
         if source_id == target_id:

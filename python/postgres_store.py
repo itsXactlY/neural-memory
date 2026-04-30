@@ -2,11 +2,10 @@
 """
 postgres_store.py — PostgreSQL + pgvector storage backend for Mazemaker.
 
-Mirrors the role MSSQLStore plays in the hybrid topology: a graph/cold-storage
-companion to the SQLite source-of-truth. ID alignment, canonical edge
-ordering and MERGE-with-max upsert semantics MUST match mssql_store.py
-so anything in memory_client / mazemaker that reads via this store sees
-the same shape it would over MSSQL.
+Acts as a graph/cold-storage companion to the SQLite source-of-truth.
+ID alignment, canonical edge ordering, and MERGE-with-max upsert
+semantics let memory_client / mazemaker treat this store as a drop-in
+mirror of the SQLite primary.
 
 Credentials resolution order:
   1. Environment variable: MM_POSTGRES_DSN  (preferred)
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# .env loader (lightweight, mirrors mssql_store.py)
+# .env loader (lightweight)
 # ---------------------------------------------------------------------------
 
 def _load_dotenv(paths: list[str]) -> dict:
@@ -96,8 +95,8 @@ def _build_dsn() -> str:
 # index) is added on first write with the observed dim.
 #
 # Canonical edge invariant (source<target) is enforced in add_connection()
-# and the migration block, exactly as MSSQLStore does. Without that the
-# graph traversal in recall_multihop would miss half the bridges.
+# and the migration block. Without that the graph traversal in
+# recall_multihop would miss half the bridges.
 
 _BASE_SCHEMA = """
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -133,7 +132,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON memories
 
 
 class PostgresStore:
-    """Postgres + pgvector store, parallel to MSSQLStore.
+    """Postgres + pgvector store; graph/cold-storage mirror of SQLite.
 
     Connection pooling via psycopg_pool.ConnectionPool keeps short-lived
     cursors fast. The pool is lazily opened on construction and closed
@@ -217,7 +216,7 @@ class PostgresStore:
 
         Idempotent. If the column exists with a different dim, raise — same
         invariant as the SQLite-side dim-lock (one model per DB). Mirrors
-        the MSSQL VARBINARY(MAX) migration but with explicit dim lock.
+        an explicit dim-lock migration.
         """
         with self._lock:
             if self._embedding_dim == dim:
@@ -256,7 +255,7 @@ class PostgresStore:
 
         When `id_` is provided, the row is written with that exact id and
         the BIGSERIAL sequence is bumped past it on collision-free insert.
-        This mirrors MSSQLStore's IDENTITY_INSERT path: keeps Postgres mirror
+        Keeps Postgres mirror
         IDs aligned with SQLite's source-of-truth IDs so recall_multihop
         and graph traversal don't silently miss memories.
         """
@@ -303,9 +302,9 @@ class PostgresStore:
                        edge_type: str = "similar") -> None:
         """Upsert an edge with canonical ordering (source<target).
 
-        ON CONFLICT keeps the larger weight, mirroring MSSQL's MERGE-with-max
+        ON CONFLICT keeps the larger weight (MERGE-with-max semantics).
         and the SQLite-side iter 23 invariant. Mixed-orientation rows would
-        break cross-backend graph traversal — see MSSQLStore.add_connection.
+        break cross-backend graph traversal.
         """
         if source == target:
             return
@@ -336,7 +335,7 @@ class PostgresStore:
     def _row_to_dict(self, row: tuple, with_embedding: bool = True) -> dict:
         """Project a memories row into the standard cross-backend dict.
 
-        Matches MSSQLStore._row_to_dict and SQLiteStore.get exactly so any
+        Matches SQLiteStore.get exactly so any
         consumer reading via either backend sees the same shape.
         """
         if with_embedding:
@@ -368,7 +367,7 @@ class PostgresStore:
     def get(self, id_: int, include_embedding: bool = True) -> Optional[dict]:
         """Fetch one memory.
 
-        Embedding-skip path mirrors MSSQLStore.get(include_embedding=False)
+        Embedding-skip path matches SQLiteStore.get(include_embedding=False)
         and SQLiteStore.get — pulling the vector blob for label-only
         neighbour lookups during recall_multihop is wasteful (4KB+ per
         memory at 1024-d).
@@ -423,7 +422,7 @@ class PostgresStore:
     def get_connections(self, node_id: int) -> list[dict]:
         """Return edges incident to node_id with both 'type' and 'edge_type' keys.
 
-        Matches MSSQLStore.get_connections's dict shape exactly (SQLiteStore's
+        Matches SQLiteStore.get_connections's dict shape exactly (the
         get_connections also exposes both legacy `type` and modern
         `edge_type` so cross-backend dashboards/recall don't lose the
         edge classification).

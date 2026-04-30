@@ -126,19 +126,10 @@ MAZEMAKER_API int mazemaker_read(
 );
 
 // ============================================================================
-// Graph / Edge Operations (MSSQL-backed)
+// Graph / Edge Operations (in-memory graph)
 // ============================================================================
 
-// Store a vector into NeuralMemory table + create GraphNode. Returns node ID.
-MAZEMAKER_API uint64_t mazemaker_store_mssql(
-    MazemakerHandle handle,
-    const float* vec,
-    int dim,
-    const char* label,
-    const char* content
-);
-
-// Add an edge to GraphEdges. Returns 1 on success.
+// Add an edge. Returns 1 on success.
 MAZEMAKER_API int mazemaker_add_edge(
     MazemakerHandle handle,
     uint64_t from_id,
@@ -167,8 +158,8 @@ MAZEMAKER_API int mazemaker_batch_strengthen_edges(
     float delta
 );
 
-// Bulk weaken all edges: UPDATE GraphEdges SET weight = MAX(weight - delta, 0.0) WHERE weight > threshold.
-// Then prunes edges below threshold. Returns number of edges pruned.
+// Bulk weaken all edges by delta and prune those below threshold.
+// Returns number of edges pruned.
 MAZEMAKER_API int mazemaker_bulk_weaken_prune(
     MazemakerHandle handle,
     float delta,
@@ -186,10 +177,10 @@ MAZEMAKER_API int mazemaker_get_edges(
     int max_edges
 );
 
-// Count edges in GraphEdges table.
+// Count edges in the in-memory graph.
 MAZEMAKER_API int64_t mazemaker_count_edges(MazemakerHandle handle);
 
-// Spreading activation via C++ (runs on GraphNodes/GraphEdges from MSSQL).
+// Spreading activation via C++ (runs on the in-memory graph).
 // Returns number of activated nodes. Writes to node_ids[] and activations[].
 MAZEMAKER_API int mazemaker_think_c(
     MazemakerHandle handle,

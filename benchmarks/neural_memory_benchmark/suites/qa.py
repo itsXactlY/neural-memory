@@ -73,8 +73,8 @@ QA_FACTS: List[tuple] = [
      "What is the fallback embedding backend?", "sentence-transformers"),
     ("Salience decays with a factor of 0.95 per day in the default config.",
      "What is the default daily salience decay factor?", "0.95"),
-    ("The MSSQL bridge syncs cold archives one-way from SQLite to MSSQL.",
-     "Which direction does the MSSQL bridge sync?", "sqlite to mssql"),
+    ("The Postgres bridge syncs cold archives one-way from SQLite to Postgres.",
+     "Which direction does the Postgres bridge sync?", "sqlite to postgres"),
     ("The shared embedding server uses a UNIX domain socket at ~/.neural_memory/embed.sock.",
      "Where is the shared embedding server's UNIX socket?", "embed.sock"),
 ]

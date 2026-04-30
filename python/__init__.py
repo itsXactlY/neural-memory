@@ -221,21 +221,7 @@ class NeuralMemoryProvider(MemoryProvider):
             self._config = get_config()
             self._session_id = session_id
 
-            # Set MSSQL env vars from config.yaml — single source of truth.
-            # C++ bridge reads these via std::getenv(), not from config dict.
-            mssql_cfg = self._config.get("dream", {}).get("mssql", {})
-            env_map = {
-                "MSSQL_SERVER": mssql_cfg.get("server", ""),
-                "MSSQL_DATABASE": mssql_cfg.get("database", ""),
-                "MSSQL_USERNAME": mssql_cfg.get("username", ""),
-                "MSSQL_PASSWORD": mssql_cfg.get("password", ""),
-                "MSSQL_DRIVER": mssql_cfg.get("driver", "{ODBC Driver 18 for SQL Server}"),
-            }
-            for key, val in env_map.items():
-                if val:
-                    os.environ[key] = str(val)
-
-            # Use Memory class (auto-detects MSSQL vs SQLite)
+            # Use Memory class (auto-detects Postgres vs SQLite)
             from mazemaker import Memory
             def _cfg_bool(value, default=False):
                 if value is None:
@@ -290,10 +276,9 @@ class NeuralMemoryProvider(MemoryProvider):
 
             backend = self._memory.backend if hasattr(self._memory, 'backend') else 'unknown'
             logger.info(
-                "Neural memory initialized: db=%s, backend=%s, mssql=%s",
+                "Neural memory initialized: db=%s, backend=%s",
                 self._config["db_path"],
                 backend,
-                self._memory._use_mssql if hasattr(self._memory, '_use_mssql') else False,
             )
         except ImportError as e:
             logger.warning("Neural memory dependencies not available: %s", e)
@@ -313,14 +298,13 @@ class NeuralMemoryProvider(MemoryProvider):
         logger.debug("Neural memory session_id updated: %s", session_id)
 
     def _start_dream_engine(self) -> None:
-        """Start dream engine — MSSQL (C++) if available, SQLite fallback.
+        """Start the SQLite-backed dream engine.
 
         Idempotent: if a prior DreamEngine is still running (e.g. caller is
         re-initialising Mazemaker after a session split or model switch),
         stop it first.  Without this each call leaks a daemon thread plus
-        its DB handle and C++ backend state.
+        its DB handle.
         """
-        import os
         from pathlib import Path
 
         if self._dream is not None:
@@ -333,28 +317,6 @@ class NeuralMemoryProvider(MemoryProvider):
         try:
             from dream_engine import DreamEngine
 
-            # Check if MSSQL is configured
-            mssql_server = os.environ.get("MSSQL_SERVER", "")
-            mssql_password = os.environ.get("MSSQL_PASSWORD", "")
-
-            if mssql_server and mssql_password:
-                # MSSQL active → use C++ dream backend
-                try:
-                    from cpp_dream_backend import CppDreamBackend
-                    backend = CppDreamBackend(dim=self._memory.dim if hasattr(self._memory, 'dim') else 1024)
-                    self._dream = DreamEngine(
-                        backend,
-                        neural_memory=self._memory,
-                        idle_threshold=600,
-                        memory_threshold=50,
-                    )
-                    self._dream.start()
-                    logger.info("Dream engine started: C++ → MSSQL")
-                    return
-                except Exception as e:
-                    logger.warning("C++ dream backend failed, falling back: %s", e)
-
-            # SQLite fallback — use memory.db which has all tables (memories, connections, dream_*)
             db_path = self._config.get("db_path", str(Path.home() / ".neural_memory" / "memory.db"))
             self._dream = DreamEngine.sqlite(
                 db_path,
@@ -363,7 +325,7 @@ class NeuralMemoryProvider(MemoryProvider):
                 memory_threshold=50,
             )
             self._dream.start()
-            logger.info("Dream engine started: SQLite fallback")
+            logger.info("Dream engine started: SQLite")
 
         except Exception as e:
             logger.warning("Dream engine failed to start: %s", e)
@@ -633,11 +595,11 @@ memory?") call `neural_graph` to summarise.
         "tool_result",
         "test_suite",
         "config.yaml",
-        "mssql",
         "sqlite",
+        "postgres",
+        "pgvector",
         "embedding",
         "connection string",
-        "odbc",
         # Compaction artifacts — these indicate stale/loop content
         "[SUPERSEDED]",
         "[UPDATED TO]",
@@ -938,8 +900,8 @@ memory?") call `neural_graph` to summarise.
     # Skip list for prefetch result content — drops meta/debug recalls
     # that would feed a self-referential loop in the model's context.
     _PREFETCH_SKIP_PATTERNS = (
-        "mazemaker", "tool_result", "test_suite", "mssql",
-        "config.yaml", "odbc", "embedding", "connection string",
+        "mazemaker", "tool_result", "test_suite",
+        "config.yaml", "embedding", "connection string",
         "archive:session",
     )
 

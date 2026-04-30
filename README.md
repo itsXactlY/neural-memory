@@ -149,7 +149,7 @@ If the install + the cheat sheet above is enough for you, you can stop reading h
 - **Conflict detection + supersession** — fuse-or-mark with revision history. `detect_conflicts=False` control arm proves the algorithm is doing real work, not just relying on recency.
 - **Multi-channel retrieval** — semantic + BM25 + entity + temporal + PPR, fused via Reciprocal Rank Fusion. Six presets (`semantic`, `hybrid`, `advanced`, `skynet`, `lean`, `trim`).
 - **GPU recall** — CUDA-accelerated cosine over an in-memory matrix (~100ms for 10k memories). CPU fallback automatic.
-- **SQLite-first** — always works, no external DB needed. WAL mode + bg checkpointing. **MSSQL optional** for shared multi-agent deployments.
+- **SQLite-first** — always works, no external DB needed. WAL mode + bg checkpointing. **Postgres + pgvector optional** for shared multi-agent / Pro-tier deployments (set `MM_DB_BACKEND=postgres`).
 - **Hermes plugin / MCP server / standalone library** — one core, three integration shapes.
 
 ---
@@ -222,7 +222,7 @@ flowchart TD
 - **Embeddings cache**: `~/.neural_memory/models/` (auto-downloaded, ~2.2 GB)
 - **GPU cache**: `~/.neural_memory/gpu_cache/` (embeddings.npy + metadata.pkl)
 - **Access logs**: `~/.neural_memory/access_logs/` (JSON Lines)
-- **MSSQL (optional)**: 127.0.0.1/Mazemaker — multi-agent mirror
+- **Postgres + pgvector (optional)**: enabled via `MM_DB_BACKEND=postgres` — graph/cold-storage mirror for shared multi-agent deployments
 
 ### SQLite Schema
 
@@ -286,12 +286,8 @@ memory:
       enabled: true
       idle_threshold: 600              # seconds before dream cycle
       memory_threshold: 50             # dream after N new memories
-      mssql:                           # optional — only if using MSSQL
-        server: 127.0.0.1
-        database: Mazemaker
-        username: SA
-        password: 'your_password'
-        driver: '{ODBC Driver 18 for SQL Server}'
+    # To enable the Postgres + pgvector mirror, set MM_DB_BACKEND=postgres
+    # and supply MM_POSTGRES_DSN (or the discrete MM_POSTGRES_* vars).
 ```
 
 ### Retrieval-mode cheat sheet
@@ -493,7 +489,7 @@ mazemaker-adapter/
 
 ### Storage & Architecture
 
-- **SQLite = Source of Truth** — MSSQL is optional. SQLite always works.
+- **SQLite = Source of Truth** — Postgres + pgvector is an optional mirror. SQLite always works.
 - **Auto-detect everything** — CUDA, backends, venv paths. Minimize config burden.
 - **4 tool schemas** exposed by NeuralMemoryProvider: `neural_remember`, `neural_recall`, `neural_think`, `neural_graph`. (`neural_dream` / `neural_dream_stats` are standalone Memory class only.)
 

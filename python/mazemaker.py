@@ -4,14 +4,15 @@ neural_memory.py - THE Unified Mazemaker API
 One import to rule them all.
 
 Architecture:
-  C++ MSSQL (primary) ─── GraphNodes/GraphEdges/Mazemaker tables
-  C++ SQLite (fallback) ── memory.db local cache
-  Python ──────────────── Dream engine, embedding, orchestration
+  Python  ────────────── Embedding, dream engine, orchestration
+  SQLite  ────────────── Hot store + semantic recall (always present)
+  Postgres + pgvector ── Optional graph/cold-storage mirror
+                         (enable with MM_DB_BACKEND=postgres)
 
 Usage:
     from mazemaker import Memory
-    
-    mem = Memory()  # Auto-detects MSSQL vs SQLite
+
+    mem = Memory()  # SQLite by default; honours MM_DB_BACKEND=postgres
     mem.remember("The user has a dog named Lou")
     results = mem.recall("What pet does the user have?")
     mem.think(results[0].id)
@@ -32,33 +33,25 @@ sys.path.insert(0, str(Path(__file__).parent))
 from embed_provider import EmbeddingProvider
 from memory_client import Mazemaker, SQLiteStore
 
-# Try MSSQL, fall back to SQLite
-try:
-    from mssql_store import MSSQLStore
-    HAS_MSSQL = True
-except ImportError:
-    HAS_MSSQL = False
-
 
 class Memory:
     """
     Unified Mazemaker interface with LSTM+kNN enhancement.
-    
+
     Backend priority:
-    1. MSSQL (via pyodbc) — when MSSQL is installed and running
-    2. SQLite (via Python) — fallback when MSSQL unavailable
-    
+    1. Postgres + pgvector — when MM_DB_BACKEND=postgres is set
+    2. SQLite (default) — always available
+
     LSTM+kNN is auto-initialized when libmazemaker.so is available.
     - AccessLogger: records every recall event
     - LSTMPredictor: learns access patterns, predicts next relevant embedding
     - KNNEngine: multi-signal re-ranking (embedding + temporal + frequency + graph)
     """
-    
+
     def __init__(self,
                  db_path: Optional[str] = None,
                  embedding_backend: str = "auto",
                  use_cpp: bool = True,
-                 use_mssql: Optional[bool] = None,
                  default_chunk_size: int = 512,
                  retrieval_mode: str = "semantic",
                  retrieval_candidates: int = 64,
@@ -77,47 +70,31 @@ class Memory:
                  recall_score_percentile: float = 0.0):
         
         Path.home().joinpath(".neural_memory").mkdir(parents=True, exist_ok=True)
-        
+
         self._db_path = db_path or str(Path.home() / ".neural_memory" / "memory.db")
         self._default_chunk_size = default_chunk_size
-        self._mssql_store = None
         self._sqlite_memory = None
-        
+
         # Embedder (shared regardless of backend)
         from embed_provider import EmbeddingProvider
         self._embedder = EmbeddingProvider(backend=embedding_backend)
         self._dim = self._embedder.dim
-        
-        # Auto-detect MSSQL
-        if use_mssql is None:
-            use_mssql = bool(os.environ.get("MSSQL_SERVER") and os.environ.get("MSSQL_PASSWORD"))
 
-        # Postgres dispatch (parallel to MSSQL — additive, not a replacement).
-        # Activated via MM_DB_BACKEND=postgres. The Postgres store plays the
-        # same graph-mirror role MSSQLStore does, so we hold a reference at
-        # _postgres_store and skip the MSSQL bring-up to avoid both running.
+        # Postgres + pgvector dispatch. Activated via MM_DB_BACKEND=postgres.
+        # The Postgres store plays the graph/cold-storage mirror role — SQLite
+        # remains the source of truth for semantic recall. When unset or
+        # set to anything else, we run SQLite-only.
         backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
         self._postgres_store = None
         if backend_choice == "postgres":
             try:
                 from postgres_store import PostgresStore
                 self._postgres_store = PostgresStore()
-                use_mssql = False  # Mutually exclusive: don't open both mirrors.
                 print(f"[neural] Postgres backend: {self._embedder.backend.__class__.__name__} ({self._dim}d)")
             except Exception as e:
                 print(f"[neural] Postgres unavailable ({e}), falling back to SQLite")
 
-        # Try MSSQL (skipped if postgres path already opened)
-        if use_mssql and self._postgres_store is None:
-            try:
-                from mssql_store import MSSQLStore
-                self._mssql_store = MSSQLStore()
-                print(f"[neural] MSSQL backend: {self._embedder.backend.__class__.__name__} ({self._dim}d)")
-            except Exception as e:
-                print(f"[neural] MSSQL unavailable ({e}), falling back to SQLite")
-                use_mssql = False
-
-        # SQLite always needed for semantic recall (MSSQLStore has no recall method)
+        # SQLite is always the source of truth for semantic recall.
         from memory_client import Mazemaker
         self._sqlite_memory = Mazemaker(
             db_path=self._db_path,
@@ -146,29 +123,12 @@ class Memory:
         self._mmr_lambda_default = float(mmr_lambda or 0.0)
         self._recall_score_floor_default = float(recall_score_floor or 0.0)
         self._recall_score_percentile_default = float(recall_score_percentile or 0.0)
-        # Cross-process MSSQL drift detection. When a separate writer
-        # appends rows to the SQLite source-of-truth without going through
-        # this Memory instance (e.g. another process in the same pool, or
-        # SQLite-only callers like mcp_local.py), MSSQL can fall behind.
-        # Periodically scan SQLite for ids missing from MSSQL and back-fill.
-        # Costs: one MSSQL exists_many round-trip every interval, only when
-        # MSSQL is configured. Fail-open: any error sets the next_check
-        # back so we don't hammer a dead MSSQL.
-        self._last_mssql_drift_check: float = 0.0
-        self._mssql_drift_check_interval: float = 60.0  # seconds
-        self._mssql_drift_check_failed_until: float = 0.0  # back-off on errors
-        # _use_mssql for external probes (the plugin init's \"mssql=%s\" log
-        # line and dashboards). \`backend\` and \`dim\` are exposed as @property
-        # below — those compute from runtime state so they reflect post-init
-        # mutations correctly. Setting them as instance attrs here would
-        # AttributeError on the read-only properties.
-        self._use_mssql = bool(use_mssql)
 
-        if not use_mssql:
+        if self._postgres_store is None:
             print(f"[neural] SQLite backend: {self._embedder.backend.__class__.__name__} ({self._dim}d)")
         else:
-            print(f"[neural] Hybrid mode: MSSQL (graph) + SQLite (recall)")
-        
+            print(f"[neural] Hybrid mode: Postgres+pgvector (graph) + SQLite (recall)")
+
         # --- LSTM + kNN (auto-initialized) ---
         self._access_logger = None
         self._lstm = None
@@ -253,23 +213,12 @@ class Memory:
                 mem_id = r.get('id')
                 emb = r.get('embedding')
                 
-                # If embedding not in result, try to fetch it.
-                # Order: MSSQL (if mirror is active) -> in-memory SQLite graph
-                # cache -> SQLite store on disk. The original code stopped
-                # at MSSQL when it was configured, so any base_result whose
-                # MSSQL row hadn't been mirrored yet (mid-backfill, transient
-                # connectivity loss, sync_bridge lag) was silently dropped
-                # from the kNN candidate set — degrading the rerank quality
-                # without any signal that it had happened. Fall through to
-                # SQLite when MSSQL returns nothing.
+                # If embedding not in result, try to fetch it from the
+                # in-memory SQLite graph cache, then the SQLite store on
+                # disk. (Postgres mirror is graph-only; embeddings live in
+                # SQLite.)
                 if emb is None:
-                    if self._mssql_store:
-                        try:
-                            full = self._mssql_store.get(mem_id)
-                            emb = full.get('embedding', []) if full else []
-                        except Exception:
-                            emb = []
-                    if not emb and self._sqlite_memory:
+                    if self._sqlite_memory:
                         # Fast path: in-memory graph has embeddings
                         node = self._sqlite_memory._graph_nodes.get(mem_id, {})
                         emb = node.get('embedding', [])
@@ -484,7 +433,7 @@ class Memory:
     
     def remember(self, text: str, label: str = "", auto_chunk: bool = True,
                  auto_connect: bool = True, detect_conflicts: bool = True) -> int | list[int]:
-        """Store a memory. SQLite primary, MSSQL mirror. Returns memory ID.
+        """Store a memory. SQLite primary, optional Postgres mirror. Returns memory ID.
 
         Refuses empty-after-strip text. Without this guard, chunk_text('')
         returned [''] and remember_chunked happily stored an empty-content
@@ -503,250 +452,30 @@ class Memory:
         # SQLite always (source of truth)
         mem_id = self._sqlite_memory.remember(text, label, auto_connect=auto_connect,
                                               detect_conflicts=detect_conflicts)
-        # MSSQL mirror — pass the SQLite id_ so MSSQL's row carries the same
-        # primary key. Without this, the two backends drift into separate id
-        # spaces and any cross-backend lookup (recall_multihop, think) silently
-        # returns nothing because it queries MSSQL with the SQLite id.
-        #
-        # We must mirror what SQLite ACTUALLY wrote, not what we passed in:
-        # Mazemaker.remember may have run conflict-fusion and rewritten
-        # the row's content as \"[CANONICAL] new\\n[PREVIOUSLY] old\". Passing
-        # the bare `text` would diverge the mirror from SQLite's
-        # post-fusion content. Read the canonical row back and mirror that.
-        if self._mssql_store:
+        # Postgres mirror — preserve SQLite-assigned id so cross-backend
+        # lookups (think, recall_multihop) hit the same row both sides.
+        # Read the canonical SQLite row in case conflict-fusion rewrote it.
+        if self._postgres_store:
             try:
                 canonical = self._sqlite_memory.store.get(int(mem_id), include_embedding=True)
                 if canonical is not None:
-                    self._mssql_store.store(
+                    self._postgres_store.store(
                         canonical.get("label") or label or text[:60],
                         canonical.get("content") or text,
                         canonical.get("embedding") or embedding,
                         id_=int(mem_id),
                     )
                 else:
-                    # Fall back to the input if the read-back somehow failed.
-                    self._mssql_store.store(
+                    self._postgres_store.store(
                         label or text[:60], text, embedding, id_=int(mem_id)
                     )
-                # Mirror any connections SQLite's auto_connect just attached
-                # to this memory. Without this, MSSQL has the memory rows but
-                # no edges between them — so recall_multihop's MSSQL graph
-                # expansion (`get_connections(id)`) returns [] even though
-                # SQLite knows the edges. With ID alignment from iter 48
-                # both sides agree on which row each edge points at.
-                self._mirror_connections_for(int(mem_id))
             except Exception:
                 pass
         return mem_id
 
-    def _mirror_connections_for(self, mem_id: int) -> None:
-        """Copy SQLite's edges for `mem_id` into the MSSQL mirror.
-
-        Idempotent: MSSQLStore.add_connection MERGEs on (source, target)
-        and canonicalises source<target, so calling this repeatedly for
-        the same memory keeps the MSSQL connections table consistent
-        with SQLite without producing duplicates.
-
-        Two-phase: (1) gather all distinct OTHER endpoints across the
-        edges, batch-check existence in MSSQL via a single IN-query, and
-        backfill any missing rows; (2) emit add_connection for each edge.
-        The previous per-edge _ensure_mssql_memory loop fired one
-        exists() round-trip per neighbour — for a memory with 8 new
-        auto_connect edges that's 8 sequential SQL calls, dominating
-        the mirror latency on a remote MSSQL server.
-        """
-        if not self._mssql_store:
-            return
-        store = self._sqlite_memory.store
-        try:
-            edges = list(store.get_connections(mem_id))
-            if not edges:
-                return
-            # Phase 1: collect distinct neighbours and batch-check existence.
-            others = set()
-            for c in edges:
-                src = int(c.get("source"))
-                tgt = int(c.get("target"))
-                other = tgt if src == mem_id else src
-                if other != mem_id:
-                    others.add(other)
-            if others:
-                self._ensure_mssql_memories(others)
-            # Phase 2: emit edge inserts.
-            for c in edges:
-                src = int(c.get("source"))
-                tgt = int(c.get("target"))
-                weight = float(c.get("weight") or 0.0)
-                edge_type = c.get("edge_type") or c.get("type") or "similar"
-                self._mssql_store.add_connection(src, tgt, weight, edge_type)
-        except Exception:
-            pass
-
-    def _check_mssql_drift(self) -> None:
-        """Detect rows present in SQLite but missing from MSSQL.
-
-        Throttled to once every `self._mssql_drift_check_interval` seconds
-        (default 60s). When MSSQL is configured but currently unreachable,
-        the failed-until back-off skips the check for 5 minutes so we
-        don't hammer a dead server.
-
-        Compares the SQLite `MAX(id)` to the MSSQL `MAX(id)`. If SQLite
-        has higher ids, scans the gap and backfills via the existing
-        `_ensure_mssql_memories` upsert path — same canonicalisation rules,
-        same IDENTITY_INSERT machinery, same exists_many short-circuit.
-
-        Costs: 2 MAX(id) queries per check (one SQLite, one MSSQL). Both
-        are O(1) on indexed primary keys. When no drift exists, we exit
-        after the comparison; no per-row work.
-
-        Fail-open: any MSSQL error puts the check on a 5-minute back-off
-        and is logged at debug level. Recall + remember continue to work
-        through SQLite even with MSSQL down (the documented architecture).
-        """
-        if not self._mssql_store:
-            return
-        now = time.time()
-        if now < self._mssql_drift_check_failed_until:
-            return  # MSSQL recently failed; back off
-        if now - self._last_mssql_drift_check < self._mssql_drift_check_interval:
-            return
-        self._last_mssql_drift_check = now
-        try:
-            # Cheap top-id queries on both sides.
-            sql_row = self._sqlite_memory.store.conn.execute(
-                "SELECT MAX(id) FROM memories"
-            ).fetchone()
-            sql_top = int(sql_row[0]) if sql_row and sql_row[0] is not None else 0
-            if sql_top == 0:
-                return
-            cursor = self._mssql_store.conn.cursor()
-            cursor.execute("SELECT ISNULL(MAX(id), 0) FROM memories")
-            mssql_top = int(cursor.fetchone()[0] or 0)
-        except Exception as e:
-            # MSSQL unreachable / offline. Document case: user said
-            # "make sure everything is also always sync with mssql (dont
-            # running rn, spare ram for smoke-testing)" — back off and
-            # try again in 5min so a transient outage doesn't waste cycles.
-            self._mssql_drift_check_failed_until = now + 300.0
-            try:
-                import logging
-                logging.getLogger(__name__).debug(
-                    "MSSQL drift check failed (%s); backing off 300s", e
-                )
-            except Exception:
-                pass
-            return
-
-        if sql_top <= mssql_top:
-            return  # MSSQL is current — nothing to backfill
-
-        # SQLite has rows MSSQL doesn't. Scan the gap. Cap at 1000 ids per
-        # cycle so a wide gap (e.g. MSSQL was offline for hours and SQLite
-        # gained 50K rows) doesn't stall the recall hot path. Subsequent
-        # cycles handle the next 1000.
-        try:
-            rows = self._sqlite_memory.store.conn.execute(
-                "SELECT id FROM memories WHERE id > ? ORDER BY id LIMIT 1000",
-                (mssql_top,),
-            ).fetchall()
-        except Exception:
-            return
-        missing_ids = [int(r[0]) for r in rows]
-        if not missing_ids:
-            return
-        try:
-            self._ensure_mssql_memories(missing_ids)
-        except Exception as e:
-            try:
-                import logging
-                logging.getLogger(__name__).debug(
-                    "MSSQL backfill failed for %d ids: %s", len(missing_ids), e
-                )
-            except Exception:
-                pass
-
-    def _ensure_mssql_memories(self, ids: "set[int] | list[int]") -> None:
-        """Batch-version of _ensure_mssql_memory.
-
-        One MSSQL `WHERE id IN (...)` discovers which ids are already
-        present; the remaining ids are backfilled one at a time (the
-        backfill itself can't easily batch since each row's embedding
-        is a per-row blob, and MSSQL's IDENTITY_INSERT path is per-
-        statement). For typical write bursts of 3-10 edges, this drops
-        the existence-check round-trips from N to 1.
-        """
-        if not self._mssql_store or not ids:
-            return
-        ids = [int(i) for i in ids]
-        try:
-            present = self._mssql_store.exists_many(ids)
-        except Exception:
-            # Fallback: per-row exists() if exists_many isn't available
-            # on this MSSQLStore version.
-            present = set()
-            for i in ids:
-                try:
-                    if self._mssql_store.exists(i):
-                        present.add(i)
-                except Exception:
-                    pass
-        missing = [i for i in ids if i not in present]
-        if not missing:
-            return
-        # Backfill missing ids — one MSSQL upsert each, but at least we
-        # avoided N existence checks.
-        for mid in missing:
-            try:
-                mem = self._sqlite_memory.store.get(int(mid), include_embedding=True)
-            except Exception:
-                continue
-            if mem is None:
-                continue
-            try:
-                self._mssql_store.store(
-                    mem.get("label") or "",
-                    mem.get("content") or "",
-                    mem.get("embedding") or [],
-                    id_=int(mid),
-                )
-            except Exception:
-                pass
-
-    def _ensure_mssql_memory(self, mem_id: int) -> None:
-        """Make sure memory `mem_id` exists in MSSQL; mirror it from SQLite if not.
-
-        Cheap fast-path: a single-row `SELECT 1 FROM memories WHERE id=?`
-        decides whether the lazy backfill is needed. The expensive case
-        (read SQLite + MSSQL upsert) only fires for memories pre-dating
-        MSSQL configuration. Previously this called the full get(id), which
-        pulled the embedding blob over the wire just to test existence.
-        """
-        if not self._mssql_store:
-            return
-        try:
-            if self._mssql_store.exists(int(mem_id)):
-                return
-        except Exception:
-            return
-        try:
-            mem = self._sqlite_memory.store.get(int(mem_id), include_embedding=True)
-        except Exception:
-            return
-        if mem is None:
-            return
-        try:
-            self._mssql_store.store(
-                mem.get("label") or "",
-                mem.get("content") or "",
-                mem.get("embedding") or [],
-                id_=int(mem_id),
-            )
-        except Exception:
-            pass
-    
     def remember_embedding(self, embedding: list[float], label: str = "",
                            content: str = "") -> int:
-        """Store a memory with pre-computed embedding. SQLite primary, MSSQL mirror.
+        """Store a memory with pre-computed embedding. SQLite primary, optional Postgres mirror.
 
         Honours the same dim-lock invariants as remember(): refuses to write
         when the SQLite-side dim_lock is False, and refuses embeddings whose
@@ -765,8 +494,6 @@ class Memory:
                 f"embedding dim={len(embedding)}, expected {nm.dim} "
                 f"({getattr(nm, '_embed_fingerprint', '?')})"
             )
-        # First write to a fresh DB pins the fingerprint via the same helper
-        # remember() uses, so this entry point can't end-run the pin either.
         if hasattr(nm, "_pin_fingerprint_if_unset"):
             try:
                 nm._pin_fingerprint_if_unset()
@@ -774,10 +501,10 @@ class Memory:
                 pass
         # SQLite always
         mem_id = nm.store.store(label or content[:60], content, embedding)
-        # MSSQL mirror — preserve the SQLite-assigned id (see remember())
-        if self._mssql_store:
+        # Postgres mirror — preserve the SQLite-assigned id
+        if self._postgres_store:
             try:
-                self._mssql_store.store(
+                self._postgres_store.store(
                     label or content[:60], content, embedding, id_=int(mem_id)
                 )
             except Exception:
@@ -788,13 +515,7 @@ class Memory:
                mmr_lambda: Optional[float] = None,
                score_floor: Optional[float] = None,
                score_percentile: Optional[float] = None) -> list[dict]:
-        # Periodic cross-process drift check — opportunistic, throttled,
-        # fail-open. Detects rows another process appended to the shared
-        # SQLite (mcp_local, SaaS server, sync_bridge) and backfills MSSQL
-        # if configured. The HNSW drift check inside Mazemaker.recall
-        # handles the in-memory index side; this handles MSSQL replication.
-        self._check_mssql_drift()
-        """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall (MSSQLStore has no recall).
+        """Semantic search with LSTM+kNN enhancement. Always uses SQLite for recall.
 
         mmr_lambda, score_floor, and score_percentile allow per-call override
         of the defaults configured at construction. None means "use the
@@ -810,7 +531,7 @@ class Memory:
         """
         embedding = self._embedder.embed(query)
 
-        # Always use SQLite for semantic recall — MSSQL is graph-only
+        # Always use SQLite for semantic recall — Postgres mirror is graph-only
         base_results = self._sqlite_memory.recall(
             query, k * 3, query_vec=embedding,
             mmr_lambda=mmr_lambda, score_floor=score_floor,
@@ -822,23 +543,22 @@ class Memory:
         return enhanced[:k]
 
     def recall_multihop(self, query: str, k: int = 5, hops: int = 2) -> list[dict]:
-        """Multi-hop retrieval: SQLite recall + MSSQL graph expansion (if available)."""
+        """Multi-hop retrieval: SQLite recall + Postgres graph expansion (if available)."""
         results = self.recall(query, k)
-        if not self._mssql_store:
+        if not self._postgres_store:
             return results
 
         expanded = []
         seen = {r['id'] for r in results}
         for r in results:
             try:
-                conns = self._mssql_store.get_connections(r['id'])
+                conns = self._postgres_store.get_connections(r['id'])
                 for c in conns:
                     other = c['target'] if c['source'] == r['id'] else c['source']
                     if other in seen:
                         continue
                     seen.add(other)
-                    # Skip embedding — we only render label/content here.
-                    mem = self._mssql_store.get(other, include_embedding=False)
+                    mem = self._postgres_store.get(other, include_embedding=False)
                     if mem:
                         expanded.append({
                             'id': other,
@@ -849,39 +569,33 @@ class Memory:
                         })
             except Exception:
                 pass
-        # Previously the function built `expanded` and then returned
-        # `results[:k]` — silently throwing away every MSSQL-discovered
-        # neighbour. Append the expansions; cap the total at 2*k so the
-        # caller still gets a bounded result set.
         merged = list(results) + expanded
         return merged[: max(k * 2, k)]
 
     def think(self, start_id: int, depth: int = 3, decay: float = 0.85) -> list[dict]:
-        """Spreading activation. SQLite primary, MSSQL enhanced if available."""
-        # Always use SQLite think
+        """Spreading activation. SQLite primary, Postgres-enhanced if available."""
         base = self._sqlite_memory.think(start_id, depth, decay)
-        
-        if not self._mssql_store:
+
+        if not self._postgres_store:
             return base
-        
-        # MSSQL graph expansion (enhances with additional connections)
+
         try:
             visited = {start_id}
             frontier = [start_id]
-            mssql_results = []
+            pg_results = []
             current_decay = decay
-            
+
             for _ in range(depth):
                 next_frontier = []
                 for nid in frontier:
-                    conns = self._mssql_store.get_connections(nid)
+                    conns = self._postgres_store.get_connections(nid)
                     for c in conns:
                         other = c['target'] if c['source'] == nid else c['source']
                         if other not in visited:
                             visited.add(other)
                             activation = c['weight'] * current_decay
-                            mem = self._mssql_store.get(other)
-                            mssql_results.append({
+                            mem = self._postgres_store.get(other)
+                            pg_results.append({
                                 'id': other,
                                 'label': mem['label'] if mem else f'node_{other}',
                                 'activation': round(activation, 4),
@@ -889,10 +603,9 @@ class Memory:
                             next_frontier.append(other)
                 frontier = next_frontier
                 current_decay *= decay
-            
-            # Merge: SQLite results first, MSSQL adds depth
+
             base_ids = {r['id'] for r in base}
-            for r in mssql_results:
+            for r in pg_results:
                 if r['id'] not in base_ids:
                     base.append(r)
             base.sort(key=lambda x: -x['activation'])
@@ -918,16 +631,13 @@ class Memory:
         s['embedding_dim'] = self._dim
         s['embedding_backend'] = self._embedder.backend.__class__.__name__
         s['backend'] = 'sqlite'
-        s['mssql_mirror'] = self._mssql_store is not None
+        s['postgres_mirror'] = self._postgres_store is not None
         return s
     
     def close(self):
         """Clean shutdown. Saves LSTM weights, flushes logger, closes stores.
 
-        Each subsystem is closed exactly ONCE — the previous body had
-        symmetric duplicate calls (sqlite/mssql close at the top AND at
-        the bottom, knn close + None + close again). pyodbc tolerates
-        double-close as a no-op, but it's still misleading. Order: save
+        Each subsystem is closed exactly ONCE. Order: save
         learned state first (LSTM weights, access logs), then tear down
         engines (knn, lstm), then close stores last so any in-flight
         save can still talk to the underlying file/socket.
@@ -958,19 +668,19 @@ class Memory:
             except Exception:
                 pass
             self._lstm = None
-        # 4. Close stores (SQLite first, then MSSQL mirror) — single close.
+        # 4. Close stores (SQLite first, then Postgres mirror) — single close.
         if self._sqlite_memory:
             try:
                 self._sqlite_memory.close()
             except Exception:
                 pass
             self._sqlite_memory = None
-        if self._mssql_store:
+        if self._postgres_store:
             try:
-                self._mssql_store.close()
+                self._postgres_store.close()
             except Exception:
                 pass
-            self._mssql_store = None
+            self._postgres_store = None
     
     @property
     def dim(self) -> int:
@@ -980,8 +690,6 @@ class Memory:
     def backend(self) -> str:
         if self._postgres_store:
             return "postgres"
-        if self._mssql_store:
-            return "mssql"
         return self._embedder.backend.__class__.__name__
     
     def __enter__(self):

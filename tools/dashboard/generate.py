@@ -2,12 +2,11 @@
 """
 generate.py - Generate interactive Mazemaker dashboard HTML.
 
-Reads from SQLite (default) or MSSQL and produces a self-contained
-interactive HTML file with 3D force graph + Plotly visualizations.
+Reads from SQLite and produces a self-contained interactive HTML file
+with 3D force graph + Plotly visualizations.
 
 Usage:
     python generate.py                          # SQLite, output ~/neural_memory_dashboard.html
-    python generate.py --mssql                  # MSSQL (Mazemaker DB)
     python generate.py --db /path/to/memory.db  # Custom SQLite path
     python generate.py -o /tmp/dashboard.html   # Custom output path
     python generate.py --serve                  # Generate + serve via HTTPS (auto-cert)
@@ -198,104 +197,6 @@ def read_sqlite(db_path: str) -> dict:
     }
 
 
-def read_mssql(server="localhost", database="Mazemaker",
-               username="SA", password=None) -> dict:
-    """Extract visualization data from MSSQL."""
-    try:
-        import pyodbc
-    except ImportError:
-        print("pyodbc required for MSSQL. pip install pyodbc")
-        sys.exit(1)
-
-    if not password:
-        print("MSSQL password required. Use --mssql-password or set MSSQL_PASSWORD env var.")
-        sys.exit(1)
-
-    conn_str = (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={server};DATABASE={database};UID={username};PWD={password};"
-        f"TrustServerCertificate=yes;"
-    )
-    conn = pyodbc.connect(conn_str, autocommit=True)
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT TOP 200 m.id, m.label, LEN(ISNULL(m.content,'')) AS clen,
-               m.salience, m.access_count,
-               ISNULL(o.out_degree, 0), ISNULL(i.in_degree, 0),
-               ISNULL(o.avg_weight, 0)
-        FROM memories m
-        LEFT JOIN (SELECT source_id, COUNT(*) AS out_degree, AVG(CAST(weight AS FLOAT)) AS avg_weight
-                   FROM connections GROUP BY source_id) o ON m.id = o.source_id
-        LEFT JOIN (SELECT target_id, COUNT(*) AS in_degree
-                   FROM connections GROUP BY target_id) i ON m.id = i.target_id
-        ORDER BY (ISNULL(o.out_degree,0) + ISNULL(i.in_degree,0)) DESC
-    """)
-    nodes = []
-    for r in cur.fetchall():
-        label = r[1] or ""
-        nodes.append({
-            "id": r[0], "label": label[:50], "category": _categorize(label),
-            "content_length": r[2] or 0, "salience": r[3] or 1.0,
-            "access_count": r[4] or 0, "out_degree": r[5],
-            "in_degree": r[6], "total_degree": r[5] + r[6],
-            "avg_weight": round(r[7], 4),
-        })
-
-    hub_ids = [n["id"] for n in nodes[:120]]
-    id_set = set(hub_ids)
-
-    id_list = ",".join(str(x) for x in hub_ids)
-    cur.execute(f"SELECT source_id, target_id, weight FROM connections WHERE source_id IN ({id_list}) AND target_id IN ({id_list})")
-    edges = [{"source": r[0], "target": r[1], "weight": round(r[2], 4)} for r in cur.fetchall()]
-
-    cur.execute("""
-        SELECT cat, COUNT(*) FROM (
-            SELECT CASE
-                WHEN label LIKE 'peer:%' THEN 'Peer'
-                WHEN label LIKE 'turn:%' OR label LIKE 'msg:%' THEN 'Conversation'
-                WHEN label LIKE 'session:%' THEN 'Session'
-                WHEN label LIKE 'doc:%' THEN 'Document'
-                WHEN label LIKE 'skill:%' THEN 'Skill'
-                ELSE 'Other'
-            END AS cat FROM memories
-        ) t GROUP BY cat ORDER BY COUNT(*) DESC
-    """)
-    categories = [{"name": r[0], "count": r[1]} for r in cur.fetchall()]
-
-    cur.execute("""
-        SELECT bucket, COUNT(*) FROM (
-            SELECT CASE
-                WHEN weight >= 0.8 THEN 'Strong (0.8-1.0)'
-                WHEN weight >= 0.6 THEN 'Med-Strong (0.6-0.8)'
-                WHEN weight >= 0.4 THEN 'Medium (0.4-0.6)'
-                WHEN weight >= 0.2 THEN 'Weak (0.2-0.4)'
-                ELSE 'Very Weak (0-0.2)'
-            END AS bucket FROM connections
-        ) t GROUP BY bucket
-    """)
-    weights = [{"bucket": r[0], "count": r[1]} for r in cur.fetchall()]
-
-    cur.execute("SELECT COUNT(*) FROM memories")
-    n_mem = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM connections")
-    n_conn = cur.fetchone()[0]
-
-    # Read actual embedding dim from DB
-    cur.execute("SELECT TOP 1 vector_dim FROM memories WHERE embedding IS NOT NULL")
-    dim_row = cur.fetchone()
-    mssql_dim = dim_row[0] if dim_row else 1024
-
-    conn.close()
-
-    return {
-        "nodes": nodes, "edges": edges,
-        "categories": categories, "weights": weights,
-        "stats": {"memories": n_mem, "connections": n_conn,
-                  "embedding_dim": mssql_dim, "source": "MSSQL", "path": f"{server}/{database}"},
-    }
-
-
 def _categorize(label: str) -> str:
     if label.startswith("peer:"):
         return "Peer"
@@ -412,24 +313,15 @@ def serve_https(output_path: str, port: int):
 def main():
     parser = argparse.ArgumentParser(description="Generate Mazemaker Dashboard")
     parser.add_argument("--db", default=DEFAULT_SQLITE, help="SQLite database path")
-    parser.add_argument("--mssql", action="store_true", help="Use MSSQL instead of SQLite")
-    parser.add_argument("--mssql-server", default="localhost")
-    parser.add_argument("--mssql-database", default="Mazemaker")
-    parser.add_argument("--mssql-username", default="SA")
-    parser.add_argument("--mssql-password", default=None, help="Or set MSSQL_PASSWORD env var")
     parser.add_argument("-o", "--output", default=os.path.expanduser("~/neural_memory_dashboard.html"))
     parser.add_argument("--serve", action="store_true", help="Serve via HTTPS after generating")
     parser.add_argument("--port", type=int, default=8443, help="HTTPS port (default: 8443)")
     args = parser.parse_args()
 
-    if args.mssql:
-        pw = args.mssql_password or os.environ.get("MSSQL_PASSWORD")
-        data = read_mssql(args.mssql_server, args.mssql_database, args.mssql_username, pw)
-    else:
-        if not os.path.exists(args.db):
-            print(f"Database not found: {args.db}")
-            sys.exit(1)
-        data = read_sqlite(args.db)
+    if not os.path.exists(args.db):
+        print(f"Database not found: {args.db}")
+        sys.exit(1)
+    data = read_sqlite(args.db)
 
     generate_html(data, args.output)
 

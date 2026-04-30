@@ -2,13 +2,12 @@
 """
 live_server.py — FastAPI WebSocket server for Mazemaker Live Dashboard.
 
-Auto-detects MSSQL (primary) vs SQLite (fallback). Reads config from
-~/.hermes/config.yaml for MSSQL credentials.
+Reads from the SQLite source-of-truth.
 
 Usage:
     python live_server.py                             # auto-detect DB
     python live_server.py --port 8443                 # custom port
-    python live_server.py --db /path/to/memory.db     # force SQLite
+    python live_server.py --db /path/to/memory.db     # custom SQLite path
     python live_server.py --no-tls                    # HTTP only
     python live_server.py --desktop-layer             # reduced logging
     python live_server.py --watch-interval 1          # poll every 1s
@@ -90,30 +89,6 @@ def _ensure_libs() -> None:
             logger.info(f"  ✓ {filename} ({kb} KB)")
         except Exception as exc:
             logger.warning(f"  ✗ {filename}: {exc}")
-
-
-# ═══════════════════════════════════════════════════════════
-# Config loader
-# ═══════════════════════════════════════════════════════════
-
-def load_mssql_config() -> dict | None:
-    try:
-        import yaml
-        with open(CONFIG_PATH) as fh:
-            cfg = yaml.safe_load(fh)
-        mssql = cfg.get("memory", {}).get("neural", {}).get("dream", {}).get("mssql", {})
-        if not mssql.get("password"):
-            return None
-        return {
-            "server":   mssql.get("server",   "127.0.0.1"),
-            "database": mssql.get("database", "Mazemaker"),
-            "username": mssql.get("username", "SA"),
-            "password": mssql["password"],
-            "driver":   mssql.get("driver",   "{ODBC Driver 18 for SQL Server}"),
-        }
-    except Exception as exc:
-        logger.warning(f"Cannot read MSSQL config: {exc}")
-        return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -248,127 +223,7 @@ def _read_sqlite_body(conn, t0, db_path):
     }
 
 
-def read_mssql(mssql_cfg: dict) -> dict:
-    import pyodbc
-    t0 = time.perf_counter()
-    cs = (
-        f"DRIVER={mssql_cfg['driver']};"
-        f"SERVER={mssql_cfg['server']};"
-        f"DATABASE={mssql_cfg['database']};"
-        f"UID={mssql_cfg['username']};PWD={mssql_cfg['password']};"
-        "TrustServerCertificate=yes;Encrypt=no;"
-    )
-    conn = pyodbc.connect(cs, autocommit=True)
-    try:
-        return _read_mssql_body(conn, mssql_cfg, t0)
-    finally:
-        conn.close()
-
-
-def _read_mssql_body(conn, mssql_cfg, t0):
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT TOP 200 m.id, m.label, LEN(ISNULL(m.content,'')) AS clen,
-               m.salience, m.access_count,
-               ISNULL(o.out_degree, 0), ISNULL(i.in_degree, 0), ISNULL(o.avg_weight, 0)
-        FROM memories m
-        LEFT JOIN (SELECT source_id, COUNT(*) AS out_degree,
-                          AVG(CAST(weight AS FLOAT)) AS avg_weight
-                   FROM connections GROUP BY source_id) o ON m.id = o.source_id
-        LEFT JOIN (SELECT target_id, COUNT(*) AS in_degree
-                   FROM connections GROUP BY target_id) i ON m.id = i.target_id
-        ORDER BY (ISNULL(o.out_degree,0) + ISNULL(i.in_degree,0)) DESC
-    """)
-    nodes = []
-    for r in cur.fetchall():
-        lbl = r[1] or ""
-        nodes.append({
-            "id": r[0], "label": lbl[:50], "category": _categorize(lbl),
-            "content_length": r[2] or 0, "salience": r[3] or 1.0,
-            "access_count": r[4] or 0, "out_degree": r[5],
-            "in_degree": r[6], "total_degree": r[5] + r[6],
-            "avg_weight": round(r[7], 4),
-        })
-
-    hub_ids = [n["id"] for n in nodes[:NODE_LIMIT]]
-    id_list = ",".join(str(x) for x in hub_ids)
-    if id_list:
-        cur.execute(
-            f"SELECT TOP {EDGE_LIMIT} source_id, target_id, weight FROM connections "
-            f"WHERE source_id IN ({id_list}) AND target_id IN ({id_list}) "
-            f"ORDER BY weight DESC"
-        )
-        edges = [{"source": r[0], "target": r[1], "weight": round(r[2], 4)} for r in cur.fetchall()]
-    else:
-        edges = []
-
-    cur.execute("""
-        SELECT cat, COUNT(*) FROM (
-            SELECT CASE
-                WHEN label LIKE 'peer:%'                       THEN 'Peer'
-                WHEN label LIKE 'turn:%' OR label LIKE 'msg:%' THEN 'Conversation'
-                WHEN label LIKE 'session:%'                    THEN 'Session'
-                WHEN label LIKE 'doc:%'                        THEN 'Document'
-                WHEN label LIKE 'skill:%'                      THEN 'Skill'
-                ELSE 'Other'
-            END AS cat FROM memories
-        ) t GROUP BY cat ORDER BY COUNT(*) DESC
-    """)
-    categories = [{"name": r[0], "count": r[1]} for r in cur.fetchall()]
-
-    cur.execute("""
-        SELECT bucket, COUNT(*) FROM (
-            SELECT CASE
-                WHEN weight >= 0.8 THEN 'Strong (0.8-1.0)'
-                WHEN weight >= 0.6 THEN 'Med-Strong (0.6-0.8)'
-                WHEN weight >= 0.4 THEN 'Medium (0.4-0.6)'
-                WHEN weight >= 0.2 THEN 'Weak (0.2-0.4)'
-                ELSE 'Very Weak (0-0.2)'
-            END AS bucket FROM connections
-        ) t GROUP BY bucket
-    """)
-    weights = [{"bucket": r[0], "count": r[1]} for r in cur.fetchall()]
-
-    cur.execute("SELECT COUNT(*) FROM memories");    n_mem  = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM connections"); n_conn = cur.fetchone()[0]
-
-    n_dreams = 0
-    try:
-        cur.execute("SELECT COUNT(*) FROM dream_sessions"); n_dreams = cur.fetchone()[0]
-    except Exception:
-        pass
-
-    cur.execute("SELECT TOP 1 vector_dim FROM memories WHERE embedding IS NOT NULL")
-    dr  = cur.fetchone()
-    dim = dr[0] if dr else 1024
-
-    ms = round((time.perf_counter() - t0) * 1000, 2)
-    _metrics["db_query_ms"] = ms
-    return {
-        "nodes": nodes, "edges": edges,
-        "categories": categories, "weights": weights,
-        "stats": {
-            "memories": n_mem, "connections": n_conn,
-            "embedding_dim": dim, "source": "MSSQL",
-            "path": f"{mssql_cfg['server']}/{mssql_cfg['database']}",
-            "dream_sessions": n_dreams, "query_ms": ms,
-        },
-    }
-
-
 def load_data(args) -> tuple[dict, callable]:
-    mssql_cfg = None if args.db else load_mssql_config()
-    if mssql_cfg:
-        try:
-            data = read_mssql(mssql_cfg)
-            s = data["stats"]
-            logger.info(f"MSSQL: {s['memories']}M  {s['connections']}C  ({s['query_ms']}ms)")
-            _metrics["db_source"] = "MSSQL"
-            return data, lambda: read_mssql(mssql_cfg)
-        except Exception as exc:
-            logger.warning(f"MSSQL failed ({exc}), falling back to SQLite")
-
     db_path = args.db or DEFAULT_SQLITE
     if not os.path.exists(db_path):
         logger.error(f"Database not found: {db_path}")

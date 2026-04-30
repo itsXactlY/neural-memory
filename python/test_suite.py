@@ -384,7 +384,7 @@ def test_27():
     from mazemaker import Memory
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f: db = f.name
     try:
-        with Memory(db_path=db, embedding_backend="hash", use_cpp=False, use_mssql=False) as m:
+        with Memory(db_path=db, embedding_backend="hash", use_cpp=False) as m:
             m.remember("Test memory")
             r = m.recall("test", k=1)
             assert len(r) >= 1
@@ -395,7 +395,7 @@ def test_28():
     from mazemaker import Memory
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f: db = f.name
     try:
-        with Memory(db_path=db, embedding_backend="hash", use_cpp=False, use_mssql=False) as m:
+        with Memory(db_path=db, embedding_backend="hash", use_cpp=False) as m:
             m.remember("a")
             m.remember("b")
             s = m.stats()

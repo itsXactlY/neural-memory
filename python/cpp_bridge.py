@@ -150,14 +150,7 @@ class MazemakerCpp:
         ]
         lib.mazemaker_think_c.restype = ctypes.c_int
 
-        # --- MSSQL Graph Edge Operations ---
-
-        # uint64_t mazemaker_store_mssql(handle, vec, dim, label, content)
-        lib.mazemaker_store_mssql.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
-            ctypes.c_char_p, ctypes.c_char_p
-        ]
-        lib.mazemaker_store_mssql.restype = ctypes.c_uint64
+        # --- Graph Edge Operations (in-memory graph) ---
 
         # int mazemaker_add_edge(handle, from_id, to_id, weight, edge_type)
         lib.mazemaker_add_edge.argtypes = [
@@ -309,27 +302,17 @@ class MazemakerCpp:
             'total_consolidations': stats.total_consolidations,
         }
 
-    # --- MSSQL Graph Edge Operations ---
-
-    def store_mssql(self, embedding: list[float], label: str = "", content: str = "") -> int:
-        """Store vector + create GraphNode in MSSQL. Returns node ID."""
-        assert self._handle, "Not initialized."
-        arr = (ctypes.c_float * len(embedding))(*embedding)
-        label_b = label.encode('utf-8') if label else None
-        content_b = content.encode('utf-8') if content else None
-        return self._lib.mazemaker_store_mssql(
-            self._handle, arr, len(embedding), label_b, content_b
-        )
+    # --- Graph Edge Operations (in-memory graph) ---
 
     def add_edge(self, from_id: int, to_id: int, weight: float, edge_type: str = "similar") -> bool:
-        """Add edge to GraphEdges in MSSQL."""
+        """Add edge to the in-memory graph."""
         assert self._handle, "Not initialized."
         return bool(self._lib.mazemaker_add_edge(
             self._handle, from_id, to_id, weight, edge_type.encode('utf-8')
         ))
 
     def batch_strengthen_edges(self, edges: list[tuple[int, int]], delta: float = 0.05) -> int:
-        """Batch strengthen edges in MSSQL.
+        """Batch strengthen edges by delta.
 
         Args:
             edges: list of (from_id, to_id) tuples
@@ -348,16 +331,12 @@ class MazemakerCpp:
         )
 
     def bulk_weaken_prune(self, delta: float = 0.01, threshold: float = 0.05) -> int:
-        """Bulk weaken all edges, then prune below threshold.
-
-        Single SQL UPDATE + DELETE — no per-row deadlock risk.
-        Returns number of edges pruned.
-        """
+        """Bulk weaken all edges then prune below threshold."""
         assert self._handle, "Not initialized."
         return self._lib.mazemaker_bulk_weaken_prune(self._handle, delta, threshold)
 
     def get_edges(self, node_id: int, max_edges: int = 100) -> list[dict]:
-        """Get all edges for a node from MSSQL GraphEdges."""
+        """Get all edges for a node."""
         assert self._handle, "Not initialized."
         edge_ids = (ctypes.c_uint64 * (max_edges * 2))()
         weights = (ctypes.c_float * max_edges)()
@@ -376,7 +355,7 @@ class MazemakerCpp:
         ]
 
     def count_edges(self) -> int:
-        """Count edges in MSSQL GraphEdges table."""
+        """Count edges in the in-memory graph."""
         assert self._handle, "Not initialized."
         return self._lib.mazemaker_count_edges(self._handle)
     

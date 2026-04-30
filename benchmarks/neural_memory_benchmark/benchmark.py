@@ -51,7 +51,7 @@ def _assert_not_hotpath(p) -> None:
 
 ALL_SUITES = [
     "retrieval", "dream", "gpu", "scalability",
-    "graph", "concurrent", "conflict", "mssql", "agentic", "qa",
+    "graph", "concurrent", "conflict", "agentic", "qa",
     # v2 suites — added for the "truly unique" pass:
     "diversity", "lstm_knn", "continuity", "conflict_quality", "baseline",
     # v3 suites — codex audit 2026-04-28 follow-ups:
@@ -155,18 +155,6 @@ def _run_conflict(cfg, memories, queries):
         memories=memories,
         output_dir=cfg.paths.results_dir,
         conflict_groups=cfg.conflict.conflict_groups,
-    )
-    return bm.run()
-
-
-def _run_mssql(cfg, memories, queries):
-    from suites.mssql import MSSQLBenchmark
-    bm = MSSQLBenchmark(
-        db_path=_new_db(),
-        memories=memories,
-        output_dir=cfg.paths.results_dir,
-        batch_sizes=cfg.mssql.batch_sizes,
-        total_records=cfg.mssql.total_records,
     )
     return bm.run()
 
@@ -329,7 +317,6 @@ SUITE_RUNNERS = {
     "graph":       _run_graph,
     "concurrent":  _run_concurrent,
     "conflict":    _run_conflict,
-    "mssql":       _run_mssql,
     "agentic":     _run_agentic,
     "qa":          _run_qa,
     # v2 suites

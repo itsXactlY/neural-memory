@@ -137,9 +137,6 @@ int main() {
     // Initialize adapter (no DB connection needed for in-memory benchmark)
     NeuralMemoryAdapter adapter;
     AdapterConfig config = AdapterConfig::balanced();
-#ifdef USE_MSSQL
-    config.db_config.server = "";  // Disable DB
-#endif
     config.enable_consolidation_thread = false;
     config.enable_decay_thread = false;
     config.enable_link_prediction = false;

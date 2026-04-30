@@ -195,7 +195,7 @@ class EpisodicGenerator(BaseGenerator):
         elif verb in ("configured", "integrated"):
             return self.rng.choice([
                 "memory provider", "embedding backend", "Discord webhook",
-                "MSSQL bridge", "FastAPI server", "nginx reverse proxy",
+                "Postgres bridge", "FastAPI server", "nginx reverse proxy",
             ])
         else:
             return self.rng.choice(self.COMPONENTS)
@@ -253,7 +253,7 @@ class FactualGenerator(BaseGenerator):
         ("RRF", "combines", "multiple retrieval signals"),
         ("WAL", "stands for", "Write-Ahead Log"),
         ("WAL", "enables", "concurrent reads during writes"),
-        ("MSSQL", "is used as", "cold storage for neural memories"),
+        ("Postgres", "is used as", "cold storage for neural memories"),
         ("BGE-M3", "is a", "state-of-the-art multilingual embedding model"),
         ("Louvain", "is a", "community detection algorithm"),
         ("Salience", "decays over", "time based on access frequency"),
@@ -409,7 +409,7 @@ class ConversationalGenerator(BaseGenerator):
         "update the embedding model",
         "investigate slow query latency",
         "create a new cron job",
-        "verify MSSQL sync",
+        "verify Postgres sync",
         "optimize retrieval speed",
         "write tests for the benchmark",
         "analyze memory fragmentation",
@@ -421,7 +421,7 @@ class ConversationalGenerator(BaseGenerator):
         "Applied fix: changed retrieval_mode from 'semantic' to 'hybrid'.",
         "Benchmark results: retrieval latency improved by 34% after HNSW activation.",
         "Dream cycle completed: 142 connections strengthened, 23 pruned.",
-        "MSSQL sync completed: 5,000 records transferred in 12.3s.",
+        "Postgres sync completed: 5,000 records transferred in 12.3s.",
         "Deployed v2.4.1 to production. Health checks passing.",
         "Refactored memory_client.py: extracted embedding logic into embed_provider.",
         "Tests written and passing: 47/47 unit tests, 12/12 integration tests.",
@@ -496,8 +496,8 @@ class GraphGenerator(BaseGenerator):
             "Discord webhooks notify on system events",
             "The API server runs on port 8443 with TLS",
             "SQLite stores memories in WAL mode for concurrent access",
-            "MSSQL serves as cold storage for archived memories",
-            "The sync bridge transfers data from SQLite to MSSQL",
+            "Postgres serves as cold storage for archived memories",
+            "The sync bridge transfers data from SQLite to Postgres",
             "WAL checkpoints run automatically every 5 seconds",
             "Backup repo syncs to github.com/itsXactlY/hermes-backup",
         ],
@@ -621,8 +621,8 @@ class AdversarialGenerator(BaseGenerator):
          "GPU recall uses cosine similarity via sklearn."),
         ("WAL mode allows concurrent reads during writes.",
          "WAL mode blocks all reads during write transactions."),
-        ("MSSQL bridge syncs one-way from SQLite to MSSQL.",
-         "MSSQL bridge syncs bidirectionally between SQLite and MSSQL."),
+        ("Postgres bridge syncs one-way from SQLite to Postgres.",
+         "Postgres bridge syncs bidirectionally between SQLite and Postgres."),
         ("The embed server uses UNIX domain sockets.",
          "The embed server uses TCP localhost:8080."),
     ]

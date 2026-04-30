@@ -91,9 +91,9 @@ def test_install_sync():
     print("\n[1] INSTALLATION SYNC")
     sources = [
         '__init__.py', 'access_logger.py', 'config.py', 'cpp_bridge.py',
-        'cpp_dream_backend.py', 'dream_engine.py', 'dream_mssql_store.py',
-        'dream_worker.py', 'embed_provider.py', 'lstm_knn_bridge.py',
-        'memory_client.py', 'mssql_store.py', 'neural_memory.py',
+        'dream_engine.py', 'dream_postgres_store.py',
+        'embed_provider.py', 'lstm_knn_bridge.py',
+        'memory_client.py', 'postgres_store.py',
     ]
     missing = [f for f in sources if not (PYTHON_DIR / f).exists()]
     if missing:

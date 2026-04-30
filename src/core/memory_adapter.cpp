@@ -41,21 +41,7 @@ bool NeuralMemoryAdapter::initialize(const AdapterConfig& config) {
     
     // Initialize Knowledge Graph
     graph_ = std::make_unique<graph::KnowledgeGraph>();
-    
-    // Initialize MSSQL (optional - skip if no server configured)
-#ifdef USE_MSSQL
-    if (!config.db_config.server.empty()) {
-        db_ = std::make_unique<mssql::MSSQLVectorAdapter>(config.db_config);
-        db_->initialize();
-        
-        // Sync ID sequence with the database max ID
-        int64_t max_id = db_->get_max_vector_id();
-        if (max_id > 0) {
-            memory_manager_->set_next_id(max_id + 1);
-        }
-    }
-#endif
-    
+
     // Start background threads
     running_ = true;
     
@@ -84,18 +70,11 @@ void NeuralMemoryAdapter::shutdown() {
     
     // Final consolidation
     consolidate();
-    
-#ifdef USE_MSSQL
-    if (db_) db_->shutdown();
-#endif
 
     hopfield_.reset();
     memory_manager_.reset();
     graph_.reset();
-#ifdef USE_MSSQL
-    db_.reset();
-#endif
-    
+
     initialized_ = false;
 }
 
@@ -132,14 +111,6 @@ uint64_t NeuralMemoryAdapter::store(const std::vector<float>& embedding,
                 graph::EdgeType::Similar, sim_score);
         }
     }
-    
-    // 5. Store in MSSQL (if available)
-#ifdef USE_MSSQL
-    if (db_) {
-        std::string metadata = "{\"label\":\"" + label + "\",\"source\":\"" + source + "\"}";
-        db_->insert_vector(id, embedding, metadata);
-    }
-#endif
     
     auto end = Clock::now();
     auto us = std::chrono::duration_cast<Microseconds>(end - start).count();
@@ -497,47 +468,29 @@ void NeuralMemoryAdapter::link_prediction_worker() {
 }
 
 // ============================================================================
-// MSSQL Graph Edge Operations (delegate to db_)
+// Graph Edge Operations (in-memory graph_)
 // ============================================================================
-
-#ifdef USE_MSSQL
-
-uint64_t NeuralMemoryAdapter::store_mssql(const std::vector<float>& embedding,
-                                           const std::string& label,
-                                           const std::string& content) {
-    if (!db_) return 0;
-
-    // Generate a unique ID
-    uint64_t id = memory_manager_->remember(embedding, label, content);
-
-    // Store vector in MSSQL
-    std::string metadata = "{\"label\":\"" + label + "\",\"source\":\"mssql\"}";
-    if (!db_->insert_vector(id, embedding, metadata)) return 0;
-
-    // Create graph node
-    if (!db_->insert_graph_node(id, "memory",
-                                 "{\"label\":\"" + label + "\"}")) return 0;
-
-    return id;
-}
 
 bool NeuralMemoryAdapter::add_edge(uint64_t from_id, uint64_t to_id, float weight,
                                     const std::string& edge_type) {
-    if (!db_) return false;
-    return db_->insert_graph_edge(from_id, to_id, edge_type, weight);
+    if (!graph_) return false;
+    (void)edge_type;
+    return graph_->add_edge(from_id, to_id, graph::EdgeType::Similar, weight);
 }
 
 int NeuralMemoryAdapter::batch_add_edges(const std::vector<uint64_t>& from_ids,
                                           const std::vector<uint64_t>& to_ids,
                                           const std::vector<float>& weights,
                                           const std::string& edge_type) {
-    if (!db_ || from_ids.empty() || from_ids.size() != to_ids.size() ||
+    if (!graph_ || from_ids.empty() || from_ids.size() != to_ids.size() ||
         from_ids.size() != weights.size())
         return 0;
+    (void)edge_type;
 
     int added = 0;
     for (size_t i = 0; i < from_ids.size(); ++i) {
-        if (db_->insert_graph_edge(from_ids[i], to_ids[i], edge_type, weights[i])) {
+        if (graph_->add_edge(from_ids[i], to_ids[i],
+                             graph::EdgeType::Similar, weights[i])) {
             added++;
         }
     }
@@ -547,32 +500,42 @@ int NeuralMemoryAdapter::batch_add_edges(const std::vector<uint64_t>& from_ids,
 int NeuralMemoryAdapter::batch_strengthen_edges(const std::vector<uint64_t>& from_ids,
                                                  const std::vector<uint64_t>& to_ids,
                                                  float delta) {
-    if (!db_) return 0;
-    return db_->batch_strengthen_edges(from_ids, to_ids, delta);
+    if (!graph_ || from_ids.size() != to_ids.size()) return 0;
+    int touched = 0;
+    for (size_t i = 0; i < from_ids.size(); ++i) {
+        graph_->hebbian_strengthen(from_ids[i], to_ids[i], delta);
+        touched++;
+    }
+    return touched;
 }
 
 int NeuralMemoryAdapter::bulk_weaken_prune(float delta, float threshold) {
-    if (!db_) return 0;
-    return db_->bulk_weaken_prune(delta, threshold);
+    if (!graph_) return 0;
+    // Approximate: decay by (1 - delta) then prune below threshold.
+    float decay_factor = std::max(0.0f, 1.0f - delta);
+    graph_->decay_edges(decay_factor);
+    size_t before = graph_->edge_count();
+    graph_->prune_weak_edges(threshold);
+    size_t after = graph_->edge_count();
+    return static_cast<int>(before > after ? before - after : 0);
 }
 
-std::vector<NeuralMemoryAdapter::EdgeInfo> NeuralMemoryAdapter::get_edges(uint64_t node_id) const {
-    if (!db_) return {};
-    auto db_edges = db_->get_edges(node_id);
+std::vector<NeuralMemoryAdapter::EdgeInfo>
+NeuralMemoryAdapter::get_edges(uint64_t node_id) const {
+    if (!graph_) return {};
+    auto edges = graph_->get_edges(node_id);
     std::vector<EdgeInfo> result;
-    result.reserve(db_edges.size());
-    for (const auto& e : db_edges) {
-        result.push_back({e.from_id, e.to_id, e.weight});
+    result.reserve(edges.size());
+    for (const auto& e : edges) {
+        result.push_back({e.source_id, e.target_id, e.weight});
     }
     return result;
 }
 
 int64_t NeuralMemoryAdapter::count_edges() const {
-    if (!db_) return 0;
-    return db_->count_edges();
+    if (!graph_) return 0;
+    return static_cast<int64_t>(graph_->edge_count());
 }
-
-#endif
 
 // ============================================================================
 // Helpers

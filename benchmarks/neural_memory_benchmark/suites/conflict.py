@@ -57,7 +57,7 @@ class ConflictBenchmark:
             ("HNSW activates at 5,000 memories.", "HNSW activates at 10,000 memories."),
             ("Salience decays at 0.95 per day.", "Salience decays at 0.5 per day."),
             ("WAL allows concurrent reads.", "WAL blocks reads during writes."),
-            ("MSSQL syncs one-way from SQLite.", "MSSQL syncs bidirectionally."),
+            ("Postgres syncs one-way from SQLite.", "Postgres syncs bidirectionally."),
             ("BGE-M3 uses 1024 dimensions.", "BGE-M3 uses 768 dimensions."),
             ("PPR uses teleportation probability 0.15.", "PPR teleportation is 0.3."),
         ]

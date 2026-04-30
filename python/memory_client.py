@@ -244,8 +244,7 @@ class SQLiteStore:
         # arbitrary orientation. Without this sweep, `WHERE source_id=? AND
         # target_id=?` lookups miss the legacy rows half the time and
         # downstream code (recall connection rendering, in-memory graph
-        # hydration) sees inconsistent state. Mirrors the iter 61 MSSQL
-        # migration on the SQLite side.
+        # hydration) sees inconsistent state.
         try:
             # Step 1: when a non-canonical row has a canonical twin, lift the
             # canonical row's weight to MAX(both) so we don't lose the
@@ -703,7 +702,6 @@ class Mazemaker:
         self,
         db_path: str | Path = DB_PATH,
         embedding_backend: str = "auto",
-        use_mssql: bool = False,
         use_cpp: bool = True,
         embedder=None,
         retrieval_mode: str = "semantic",
@@ -728,17 +726,10 @@ class Mazemaker:
             from embed_provider import EmbeddingProvider
             self.embedder = EmbeddingProvider(backend=embedding_backend)
 
-        # Backend dispatch. The original entry point is `use_mssql=True`
-        # which selects MSSQLStore as a graph mirror alongside the SQLite
-        # source-of-truth. To support pgvector deployments we add a
-        # parallel `MM_DB_BACKEND` env-var dispatch with the same role.
-        # Default remains SQLite. MSSQL paths are unchanged — excision
-        # is a follow-up after pgvector soak time.
+        # Backend dispatch. SQLite is the default; MM_DB_BACKEND=postgres
+        # opts in to the Postgres + pgvector store.
         backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
-        if use_mssql or backend_choice == "mssql":
-            from mssql_store import MSSQLStore
-            self.store = MSSQLStore()
-        elif backend_choice == "postgres":
+        if backend_choice == "postgres":
             from postgres_store import PostgresStore
             self.store = PostgresStore()
         else:
@@ -915,19 +906,11 @@ class Mazemaker:
         therefore harmless; only an actual mismatch against a
         previously-pinned fingerprint produces dim_locked=False.
 
-        Stores without db_meta support (currently MSSQLStore) get a
-        \"locked-on-current-backend\" result so writes proceed. The earlier
-        \"return False\" here was a critical regression: it tripped the
-        remember() dim_locked guard on every MSSQL write, blocking the
-        entire MSSQL deployment path. The one-model invariant on MSSQL
-        is enforced server-side via the schema's vector_dim column
-        (and ultimately by the ONE-MODEL discipline of the ops team)
-        rather than by a Python-side fingerprint.
+        Stores without db_meta support get a \"locked-on-current-backend\"
+        result so writes proceed; the one-model invariant on those stores
+        is enforced server-side via the schema's vector_dim column.
         """
         if not hasattr(self.store, "get_meta"):
-            # MSSQLStore: no Python-side fingerprint, but writes are not
-            # blocked. The \"\" reason field stays empty so stats() shows
-            # mismatch_reason=None.
             return True, ""
         stored = self.store.get_meta("embed_fingerprint")
         if stored is None:
@@ -999,8 +982,8 @@ class Mazemaker:
                 node_s.setdefault("connections", {})[tgt] = w
                 node_t.setdefault("connections", {})[src] = w
         else:
-            # MSSQL store path (no get_all_connections) — fall back to the
-            # per-memory query so behaviour is preserved on non-SQLite backends.
+            # Non-SQLite store path (no get_all_connections) — fall back to
+            # the per-memory query so behaviour is preserved.
             for mem in all_mems:
                 self._refresh_connections(mem["id"])
 

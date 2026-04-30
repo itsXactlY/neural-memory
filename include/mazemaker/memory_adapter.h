@@ -7,9 +7,6 @@
 #include "mazemaker/hopfield.h"
 #include "mazemaker/memory.h"
 #include "mazemaker/graph.h"
-#ifdef USE_MSSQL
-#include "mazemaker/mssql.h"
-#endif
 
 #include <string>
 #include <vector>
@@ -48,11 +45,6 @@ struct AdapterConfig {
     int graph_max_depth = 5;
     size_t link_prediction_interval_sec = 300;  // Every 5 min
     float edge_prune_threshold = 0.01f;
-    
-    // --- MSSQL ---
-#ifdef USE_MSSQL
-    mssql::ConnectionConfig db_config;
-#endif
     
     // --- Background Threads ---
     bool enable_consolidation_thread = true;
@@ -224,15 +216,9 @@ public:
     
     const AdapterConfig& config() const { return config_; }
 
-    // --- MSSQL Graph Edge Operations (direct DB access) ---
-#ifdef USE_MSSQL
+    // --- Graph Edge Operations (in-memory graph) ---
 
-    // Store vector + create GraphNode in MSSQL. Returns node ID.
-    uint64_t store_mssql(const std::vector<float>& embedding,
-                         const std::string& label,
-                         const std::string& content);
-
-    // Add edge to GraphEdges. Returns true on success.
+    // Add edge. Returns true on success.
     bool add_edge(uint64_t from_id, uint64_t to_id, float weight,
                   const std::string& edge_type = "similar");
 
@@ -242,12 +228,12 @@ public:
                         const std::vector<float>& weights,
                         const std::string& edge_type = "similar");
 
-    // Batch strengthen: UPDATE GraphEdges SET weight = CASE WHEN weight + delta > 1.0 THEN 1.0 ELSE weight + delta END WHERE from_node_id = ? AND to_node_id = ?
+    // Batch strengthen edges by delta (clamped to 1.0).
     int batch_strengthen_edges(const std::vector<uint64_t>& from_ids,
                                const std::vector<uint64_t>& to_ids,
                                float delta);
 
-    // Bulk weaken + prune: UPDATE GraphEdges SET weight = MAX(weight - delta, 0) WHERE weight > threshold; DELETE WHERE weight < threshold
+    // Bulk weaken edges by delta and prune those below threshold.
     int bulk_weaken_prune(float delta, float threshold);
 
     // Get all edges for a node
@@ -261,10 +247,6 @@ public:
     // Count edges
     int64_t count_edges() const;
 
-    mssql::MSSQLVectorAdapter* db() { return db_.get(); }
-
-#endif
-
 private:
     AdapterConfig config_;
     bool initialized_ = false;
@@ -273,10 +255,7 @@ private:
     std::unique_ptr<HopfieldLayer> hopfield_;
     std::unique_ptr<memory::MemoryManager> memory_manager_;
     std::unique_ptr<graph::KnowledgeGraph> graph_;
-#ifdef USE_MSSQL
-    std::unique_ptr<mssql::MSSQLVectorAdapter> db_;
-#endif
-    
+
     // Background threads
     std::thread consolidation_thread_;
     std::thread decay_thread_;

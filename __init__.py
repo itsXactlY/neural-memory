@@ -182,21 +182,7 @@ class NeuralMemoryProvider(MemoryProvider):
             self._config = get_config()
             self._session_id = session_id
 
-            # Set MSSQL env vars from config.yaml — single source of truth.
-            # C++ bridge reads these via std::getenv(), not from config dict.
-            mssql_cfg = self._config.get("dream", {}).get("mssql", {})
-            env_map = {
-                "MSSQL_SERVER": mssql_cfg.get("server", ""),
-                "MSSQL_DATABASE": mssql_cfg.get("database", ""),
-                "MSSQL_USERNAME": mssql_cfg.get("username", ""),
-                "MSSQL_PASSWORD": mssql_cfg.get("password", ""),
-                "MSSQL_DRIVER": mssql_cfg.get("driver", "{ODBC Driver 18 for SQL Server}"),
-            }
-            for key, val in env_map.items():
-                if val:
-                    os.environ[key] = str(val)
-
-            # Use Memory class (auto-detects MSSQL vs SQLite)
+            # Use Memory class (auto-detects Postgres vs SQLite)
             from mazemaker import Memory
             self._memory = Memory(
                 db_path=self._config["db_path"],
@@ -211,10 +197,9 @@ class NeuralMemoryProvider(MemoryProvider):
 
             backend = self._memory.backend if hasattr(self._memory, 'backend') else 'unknown'
             logger.info(
-                "Neural memory initialized: db=%s, backend=%s, mssql=%s",
+                "Neural memory initialized: db=%s, backend=%s",
                 self._config["db_path"],
                 backend,
-                self._memory._use_mssql if hasattr(self._memory, '_use_mssql') else False,
             )
         except ImportError as e:
             logger.warning("Neural memory dependencies not available: %s", e)
@@ -224,36 +209,12 @@ class NeuralMemoryProvider(MemoryProvider):
             self._memory = None
 
     def _start_dream_engine(self) -> None:
-        """Start dream engine — MSSQL (C++) if available, SQLite fallback."""
-        import os
+        """Start the SQLite-backed dream engine."""
         from pathlib import Path
 
         try:
             from dream_engine import DreamEngine
 
-            # Check if MSSQL is configured
-            mssql_server = os.environ.get("MSSQL_SERVER", "")
-            mssql_password = os.environ.get("MSSQL_PASSWORD", "")
-
-            if mssql_server and mssql_password:
-                # MSSQL active → use C++ dream backend
-                try:
-                    from cpp_dream_backend import CppDreamBackend
-                    backend = CppDreamBackend(dim=self._memory.dim if hasattr(self._memory, 'dim') else 1024)
-                    self._dream = DreamEngine(
-                        backend,
-                        neural_memory=self._memory,
-                        idle_threshold=600,
-                        memory_threshold=50,
-                        min_dream_interval=600,
-                    )
-                    self._dream.start()
-                    logger.info("Dream engine started: C++ → MSSQL")
-                    return
-                except Exception as e:
-                    logger.warning("C++ dream backend failed, falling back: %s", e)
-
-            # SQLite fallback — use memory.db which has all tables (memories, connections, dream_*)
             db_path = self._config.get("db_path", str(Path.home() / ".neural_memory" / "memory.db"))
             self._dream = DreamEngine.sqlite(
                 db_path,
@@ -263,7 +224,7 @@ class NeuralMemoryProvider(MemoryProvider):
                 min_dream_interval=600,
             )
             self._dream.start()
-            logger.info("Dream engine started: SQLite fallback")
+            logger.info("Dream engine started: SQLite")
 
         except Exception as e:
             logger.warning("Dream engine failed to start: %s", e)
@@ -372,8 +333,8 @@ class NeuralMemoryProvider(MemoryProvider):
                     # Skip meta/debug/angry content
                     content_lower = content.lower()
                     if any(skip in content_lower for skip in (
-                        "mazemaker", "tool_result", "test_suite", "mssql",
-                        "config.yaml", "odbc", "embedding", "connection string",
+                        "mazemaker", "tool_result", "test_suite",
+                        "config.yaml", "embedding", "connection string",
                         "scheiße", "dreck", "huren", "verfickt",
                         "system note", "memory-context",
                     )):
@@ -413,11 +374,11 @@ class NeuralMemoryProvider(MemoryProvider):
         "tool_result",
         "test_suite",
         "config.yaml",
-        "mssql",
         "sqlite",
+        "postgres",
+        "pgvector",
         "embedding",
         "connection string",
-        "odbc",
     )
 
     def _is_garbage(self, text: str) -> bool:

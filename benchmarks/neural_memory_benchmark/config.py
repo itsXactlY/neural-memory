@@ -201,18 +201,6 @@ class ConflictConfig:
     measure_recall_degradation: bool = True
 
 
-# ── MSSQL benchmark ──────────────────────────────────────────────────────────
-@dataclass
-class MSSQLConfig:
-    """MSSQL sync bridge benchmark."""
-    # Batch sizes to test
-    batch_sizes: list = field(default_factory=lambda: [100, 500, 1000, 5000])
-    # Total records to sync
-    total_records: int = 10_000
-    # Run MSSQL sync if bridge is available?
-    run_if_available: bool = True
-
-
 # ── Agentic workflow benchmark ────────────────────────────────────────────────
 @dataclass
 class AgenticConfig:
@@ -241,7 +229,6 @@ class BenchmarkConfig:
     graph: GraphConfig = field(default_factory=GraphConfig)
     concurrent: ConcurrentConfig = field(default_factory=ConcurrentConfig)
     conflict: ConflictConfig = field(default_factory=ConflictConfig)
-    mssql: MSSQLConfig = field(default_factory=MSSQLConfig)
     agentic: AgenticConfig = field(default_factory=AgenticConfig)
 
     # Suites to run (empty = all)

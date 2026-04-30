@@ -8,7 +8,7 @@ git clone https://github.com/itsXactlY/mazemaker-adapter.git
 cd mazemaker-adapter
 
 # Install dev dependencies
-pip install sentence-transformers numpy pyodbc pytest
+pip install sentence-transformers numpy pytest
 
 # Build
 mkdir build && cd build
@@ -102,7 +102,7 @@ cd build && ./bench_vector_ops
 | Tag | Description |
 |-----|-------------|
 | `embed` | Embedding provider tests |
-| `storage` | SQLite/MSSQL storage tests |
+| `storage` | SQLite/Postgres storage tests |
 | `memory` | Memory client tests |
 | `graph` | Knowledge graph tests |
 | `threading` | Thread safety tests |
@@ -123,10 +123,10 @@ Modern Hopfield Networks are mathematically equivalent to Transformer attention 
 - Exponential storage capacity
 - Natural connection discovery via self-attention
 
-### Why SQLite + MSSQL?
+### Why SQLite + Postgres?
 
 - **SQLite**: Fast local storage, zero config, works everywhere
-- **MSSQL**: Production deployments, shared memory across agents, full ACID
+- **Postgres + pgvector**: Pro-tier deployments, shared memory across agents, ACID, native ARM
 
 ### Why Python + C++?
 

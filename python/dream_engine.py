@@ -8,10 +8,6 @@ Implements three phases inspired by biological sleep:
 Runs as a background daemon during idle periods. Stores results
 in the same SQLite DB as the main mazemaker, extended with
 dream-specific tables.
-
-MSSQL support: if mssql_store is configured, dreams run against
-the shared MSSQL backend (sneaky multi-agent consolidation).
-Otherwise falls back to SQLite.
 """
 
 from __future__ import annotations
@@ -87,7 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_sessions_started_at
 # ---------------------------------------------------------------------------
 
 class DreamBackend:
-    """Interface for dream storage backends (SQLite or MSSQL)."""
+    """Interface for dream storage backends (SQLite or Postgres)."""
 
     def start_session(self, phase: str) -> int:
         raise NotImplementedError
@@ -195,7 +191,7 @@ class SQLiteDreamBackend(DreamBackend):
 
     @property
     def conn(self):
-        """Persistent connection for DreamWorker compatibility (like MSSQLStore.conn)."""
+        """Persistent connection for DreamWorker compatibility."""
         if self._persistent_conn is None:
             self._persistent_conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._persistent_conn.row_factory = sqlite3.Row
@@ -702,10 +698,11 @@ class DreamEngine:
         return cls(backend, neural_memory, **kwargs)
 
     @classmethod
-    def mssql(cls, mssql_config: dict, neural_memory: Optional[Any] = None, **kwargs) -> 'DreamEngine':
-        """Create a DreamEngine with MSSQL backend."""
-        from dream_mssql_store import DreamMSSQLStore
-        backend = DreamMSSQLStore.from_config(mssql_config)
+    def postgres(cls, dsn: Optional[str] = None,
+                 neural_memory: Optional[Any] = None, **kwargs) -> 'DreamEngine':
+        """Create a DreamEngine with Postgres+pgvector backend."""
+        from dream_postgres_store import DreamPostgresStore
+        backend = DreamPostgresStore(dsn=dsn)
         return cls(backend, neural_memory, **kwargs)
 
     def start(self) -> None:

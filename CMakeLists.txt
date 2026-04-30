@@ -5,7 +5,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(neural-memory-adapter VERSION 1.1.0 LANGUAGES CXX)
 
-option(USE_MSSQL "Build with MSSQL/ODBC support (requires unixodbc-dev)" ON)
 option(USE_CXX26 "Try C++26 (auto-fallback to C++23 if unsupported)" ON)
 option(USE_NATIVE_ARCH "Compile with -march=native (4-5x speedup on AVX2/AVX-512 hosts; off=portable)" OFF)
 
@@ -50,33 +49,7 @@ if(OpenMP_CXX_FOUND)
     add_definitions(-DHAS_OPENMP=1)
 endif()
 
-# MSSQL / ODBC (optional)
-if(USE_MSSQL)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(ODBC QUIET odbc)
-    endif()
-    if(NOT ODBC_FOUND)
-        find_path(ODBC_INCLUDE_DIR sql.h PATHS /usr/include /usr/local/include PATH_SUFFIXES odbc)
-        find_library(ODBC_LIBRARY NAMES odbc unixodbc)
-        if(ODBC_INCLUDE_DIR AND ODBC_LIBRARY)
-            set(ODBC_FOUND TRUE)
-            set(ODBC_INCLUDE_DIRS ${ODBC_INCLUDE_DIR})
-            set(ODBC_LIBRARIES ${ODBC_LIBRARY})
-        endif()
-    endif()
-    if(ODBC_FOUND)
-        message(STATUS "MSSQL: ODBC found, building with MSSQL support")
-        add_definitions(-DUSE_MSSQL=1)
-    else()
-        message(WARNING "MSSQL: ODBC not found, disabling MSSQL support")
-        set(USE_MSSQL OFF)
-    endif()
-else()
-    message(STATUS "MSSQL: disabled (-DUSE_MSSQL=OFF)")
-endif()
-
-include_directories(${CMAKE_SOURCE_DIR}/include ${ODBC_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR}/include)
 
 set(NEURAL_SOURCES
     src/simd/simd_engine.cpp
@@ -89,18 +62,9 @@ set(NEURAL_SOURCES
     src/core/c_api.cpp
 )
 
-if(USE_MSSQL AND ODBC_FOUND)
-    list(APPEND NEURAL_SOURCES
-        src/mssql/connection_pool.cpp
-        src/mssql/bulk_ops.cpp
-        src/mssql/vector_store.cpp
-    )
-endif()
-
 add_library(mazemaker SHARED ${NEURAL_SOURCES})
 target_compile_options(mazemaker PRIVATE ${OPT_FLAGS} ${WARN_FLAGS})
 target_link_libraries(mazemaker PRIVATE
-    $<$<BOOL:${USE_MSSQL}>:${ODBC_LIBRARIES}>
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
     pthread stdc++
 )

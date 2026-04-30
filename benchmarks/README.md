@@ -214,7 +214,7 @@ Each suite writes one JSON to `benchmarks/results/<output_dir>/results/<suite>_r
 | `channel_ablation` | zero one skynet channel; defaults live-resolved from `Mazemaker` | clean per-channel attribution; surfaces dead-weight channels |
 | `hnsw_exactness` | HNSW vs exact at 1k/10k; `use_cpp/rerank` off; activation asserted | the only HNSW recall-loss measurement that flags non-activation |
 
-Plus the legacy v1 suites (`retrieval`, `dream`, `gpu`, `scalability`, `graph`, `concurrent`, `conflict`, `mssql`, `agentic`, `qa`) — all still wired and runnable, but the v4 suites above are what produced the codex `yes` verdict.
+Plus the legacy v1 suites (`retrieval`, `dream`, `gpu`, `scalability`, `graph`, `concurrent`, `conflict`,  `agentic`, `qa`) — all still wired and runnable, but the v4 suites above are what produced the codex `yes` verdict.
 
 ---
 
@@ -274,7 +274,7 @@ benchmarks/
         ├── channel_ablation.py        ← live-resolved defaults
         ├── hnsw_exactness.py          ← exact vs ANN with activation asserts
         └── (legacy: retrieval, dream, gpu, scalability, graph,
-             concurrent, conflict, mssql, agentic, qa)
+             concurrent, conflict, agentic, qa)
 ```
 
 ---

@@ -37,31 +37,8 @@ MAZEMAKER_API MazemakerHandle mazemaker_create_dim(int vector_dim) {
     config.enable_consolidation_thread = false;
     config.enable_decay_thread = false;
     config.enable_link_prediction = false;
-    // Disable MSSQL (Python client uses SQLite)
-#ifdef USE_MSSQL
-    // Read MSSQL config from environment variables
-    if (const char* server = std::getenv("MSSQL_SERVER")) {
-        config.db_config.server = server;
-    }
-    if (const char* database = std::getenv("MSSQL_DATABASE")) {
-        config.db_config.database = database;
-    }
-    if (const char* username = std::getenv("MSSQL_USERNAME")) {
-        config.db_config.username = username;
-    }
-    if (const char* password = std::getenv("MSSQL_PASSWORD")) {
-        config.db_config.password = password;
-    }
-    if (const char* driver = std::getenv("MSSQL_DRIVER")) {
-        config.db_config.driver = driver;
-    }
-    // Always trust self-signed local certs for development
-    config.db_config.trust_server_certificate = true;
-    
-    if (!config.db_config.server.empty() && config.db_config.username.empty()) {
-        config.db_config.server = ""; // No credentials, disable MSSQL
-    }
-#endif
+    // C API binds to in-memory adapter. Persistence is handled by Python
+    // backends (SQLite or Postgres+pgvector).
 
     if (!adapter->initialize(config)) {
         delete adapter;
@@ -315,27 +292,10 @@ MAZEMAKER_API void mazemaker_stats_c(MazemakerHandle handle, MazemakerStats* sta
 }
 
 // ============================================================================
-// Graph / Edge Operations (MSSQL-backed)
+// Graph / Edge Operations (in-memory adapter)
 // ============================================================================
-
-#ifdef USE_MSSQL
-
-MAZEMAKER_API uint64_t mazemaker_store_mssql(
-    MazemakerHandle handle,
-    const float* vec,
-    int dim,
-    const char* label,
-    const char* content
-) {
-    if (!handle || !vec || dim <= 0) return 0;
-    auto* adapter = to_adapter(handle);
-
-    std::vector<float> embedding(vec, vec + dim);
-    std::string lbl = label ? label : "";
-    std::string cnt = content ? content : "";
-
-    return adapter->store_mssql(embedding, lbl, cnt);
-}
+// Edge persistence is handled by the Python layer (SQLite or Postgres). The
+// C API exposes the in-memory graph operations only.
 
 MAZEMAKER_API int mazemaker_add_edge(
     MazemakerHandle handle,
@@ -421,52 +381,6 @@ MAZEMAKER_API int64_t mazemaker_count_edges(MazemakerHandle handle) {
     if (!handle) return 0;
     return to_adapter(handle)->count_edges();
 }
-
-#else
-
-// Stubs when MSSQL is not compiled in
-
-MAZEMAKER_API uint64_t mazemaker_store_mssql(
-    MazemakerHandle handle, const float* vec, int dim,
-    const char* label, const char* content) {
-    return 0;
-}
-
-MAZEMAKER_API int mazemaker_add_edge(
-    MazemakerHandle handle, uint64_t from_id, uint64_t to_id,
-    float weight, const char* edge_type) {
-    return 0;
-}
-
-MAZEMAKER_API int mazemaker_batch_add_edges(
-    MazemakerHandle handle, const uint64_t* from_ids,
-    const uint64_t* to_ids, const float* weights,
-    int count, const char* edge_type) {
-    return 0;
-}
-
-MAZEMAKER_API int mazemaker_batch_strengthen_edges(
-    MazemakerHandle handle, const uint64_t* from_ids,
-    const uint64_t* to_ids, int count, float delta) {
-    return 0;
-}
-
-MAZEMAKER_API int mazemaker_bulk_weaken_prune(
-    MazemakerHandle handle, float delta, float threshold) {
-    return 0;
-}
-
-MAZEMAKER_API int mazemaker_get_edges(
-    MazemakerHandle handle, uint64_t node_id,
-    uint64_t* edge_ids, float* weights, int max_edges) {
-    return 0;
-}
-
-MAZEMAKER_API int64_t mazemaker_count_edges(MazemakerHandle handle) {
-    return 0;
-}
-
-#endif
 
 // ============================================================================
 // LSTM Predictor C API

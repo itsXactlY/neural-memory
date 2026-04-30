@@ -101,7 +101,6 @@ def ingest(payload: dict[str, Any], *, db_path: str | None = None, threshold: fl
     mem = Memory(
         db_path=db_path,
         embedding_backend=os.environ.get("NEURAL_MEMORY_EMBEDDING_BACKEND", "auto"),
-        use_mssql=False,
         retrieval_mode=os.environ.get("NEURAL_MEMORY_RETRIEVAL_MODE", "hybrid"),
         use_hnsw=os.environ.get("NEURAL_MEMORY_USE_HNSW", "auto"),
         lazy_graph=os.environ.get("NEURAL_MEMORY_LAZY_GRAPH", "true").lower() in {"1", "true", "yes", "on"},
