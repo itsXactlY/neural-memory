@@ -566,9 +566,7 @@ flowchart LR
 
 ## Migrating from another memory system
 
-If you're trying to leave somewhere — Honcho's data loss, Hindsight's
-benchmark theatre, whatever — the migration tools take you with your
-data, not as an empty user.
+Two importers ship with Mazemaker so you don't arrive as an empty user:
 
 ```bash
 # Honcho — point at an export directory
