@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from classify_memory_kind import classify_memory_kind
+from entity_extraction import EntityRegistry
 from schema_upgrade import SchemaUpgrade
 
 # ============================================================================
@@ -420,9 +421,18 @@ class SQLiteStore:
             return cur.rowcount
     
     def get_stats(self) -> dict:
-        mem_count = self.conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        # Phase 7 Commit 3: exclude kind='entity' rows from the user-facing
+        # memory count. Entities are derived nodes in the unified graph; the
+        # historic 'memories' count means "memories the user added", not
+        # "all rows in the memories table". Surface entity count separately.
+        mem_count = self.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE kind IS NULL OR kind != 'entity'"
+        ).fetchone()[0]
+        entity_count = self.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE kind = 'entity'"
+        ).fetchone()[0]
         conn_count = self.conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
-        return {'memories': mem_count, 'connections': conn_count}
+        return {'memories': mem_count, 'connections': conn_count, 'entities': entity_count}
     
     def close(self):
         self.conn.close()
@@ -464,6 +474,10 @@ class NeuralMemory:
             self.store = MSSQLStore()
         else:
             self.store = SQLiteStore(db_path)
+
+        # Phase 7 Commit 3: entity registry (kind='entity' nodes + mentions_entity edges).
+        # Skipped for MSSQL backend (Commit 3 punt; MSSQL lacks _lock attr).
+        self.entities = EntityRegistry(self.store) if not use_mssql else None
 
         self.dim = self.embedder.dim
 
@@ -690,6 +704,22 @@ class NeuralMemory:
         self._graph_nodes[node_id] = node
         return node
     
+    # ------------------------------------------------------------------
+    # Phase 7 Commit 3: entity registry public API
+    # ------------------------------------------------------------------
+
+    def get_entity(self, name: str) -> Optional[dict[str, Any]]:
+        """Return entity dict (id, label, frequency, last_seen) or None."""
+        return self.entities.get_entity(name) if self.entities else None
+
+    def get_entities_for_memory(self, memory_id: int) -> list[dict[str, Any]]:
+        """Return entity dicts linked to memory_id via mentions_entity edges."""
+        return self.entities.get_entities_for_memory(memory_id) if self.entities else []
+
+    def count_entities_named(self, name: str) -> int:
+        """Case-insensitive count of entities with given name."""
+        return self.entities.count_entities_named(name) if self.entities else 0
+
     @staticmethod
     def _normalize_dates(text: str, ref_time: float = None) -> str:
         """H18: replace relative dates ("yesterday", "last week", "N days ago")
@@ -861,6 +891,17 @@ class NeuralMemory:
             valid_to=valid_to,
             metadata=metadata,
         )
+
+        # Phase 7 Commit 3: extract entities from text + create mentions_entity edges.
+        # Skip for entity-kind writes (avoid recursive entity-of-entity loops).
+        if self.entities is not None and kind != "entity":
+            try:
+                self.entities.process_memory(mem_id, text)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "entity extraction failed for memory %d: %s", mem_id, exc,
+                )
         
         # Add to in-memory graph
         self._graph_nodes[mem_id] = {
