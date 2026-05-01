@@ -182,6 +182,41 @@ def proc_section() -> str:
     return "\n".join(interesting[:8]) if interesting else "  (none of interest running)"
 
 
+def phase7_5_wiring_section() -> str:
+    """One-glance Phase 7.5 wiring scoreboard."""
+    if not _NM_DB.exists():
+        return "  (DB not found)"
+    conn = sqlite3.connect(str(_NM_DB))
+    try:
+        proc_n = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE procedural_score IS NOT NULL"
+        ).fetchone()[0]
+        ent_n = conn.execute(
+            "SELECT COUNT(*) FROM connections WHERE edge_type='mentions_entity'"
+        ).fetchone()[0]
+        contradict_n = conn.execute(
+            "SELECT COUNT(*) FROM connections WHERE edge_type='contradicts'"
+        ).fetchone()[0]
+        insight_n = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE kind='dream_insight'"
+        ).fetchone()[0]
+        locus_n = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE kind='locus'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    lines = [
+        "  Subphase  Status     Live signal",
+        f"  α  proc   SHIPPED   procedural_score populated rows: {proc_n}",
+        f"  β  entity SHIPPED   mentions_entity edges:           {ent_n}",
+        f"  γ  stale  SHIPPED   computed at-query from age (no row count)",
+        f"  δ  contra SHIPPED   contradicts edges:               {contradict_n}",
+        f"  ε  locus  DEFERRED  locus nodes:                     {locus_n}",
+        f"  D5 (Valiendo lane):  dream_insight nodes:            {insight_n}",
+    ]
+    return "\n".join(lines)
+
+
 def ingest_section() -> str:
     """Look for traces of recent ingest_ae_corpus.py runs in the live DB metadata."""
     if not _NM_DB.exists():
@@ -234,6 +269,8 @@ def main() -> int:
     print(repo_section())
     print(_section("Live DB"))
     print(db_section())
+    print(_section("Phase 7.5 wiring"))
+    print(phase7_5_wiring_section())
     print(_section("Ingest sources"))
     print(ingest_section())
     print(_section("Bridge mailboxes"))
