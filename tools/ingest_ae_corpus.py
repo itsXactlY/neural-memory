@@ -40,6 +40,10 @@ _AE_SKILL_DIR = Path("/Users/tito/.hermes/skills/angels-electric")  # SKILL.md +
 _LANGGRAPH_KERNEL = Path("/Users/tito/lWORKSPACEl/Projects/AngelsElectric/LangGraph/context-kernel")
 _CLAUDE_MEMORY = Path("/Users/tito/.claude/projects/-Users-tito/memory")
 _VALIENDO_HANDOFFS = Path("/Users/tito/.hermes/artifacts/valiendo/handoffs")
+_BRIDGE_AGENTS_DIR = Path("/Users/tito/.hermes/agent-bridge/agents")  # bridge inbox.jsonl per agent
+
+# Bridge messages: limit to last N days to avoid pulling stale history
+_BRIDGE_MAX_AGE_DAYS = 60
 
 # Memory-file kind heuristics (file-name prefix → memory kind).
 _MEMORY_PREFIX_TO_KIND = {
@@ -202,6 +206,84 @@ def _existing_content_hashes(store) -> set[str]:
     return hashes
 
 
+def _gather_bridge_messages() -> list[dict]:
+    """Walk bridge agent mailboxes (inbox.jsonl + outbox.jsonl) and return
+    one chunk-descriptor per message. Only recent messages (last 60 days)
+    to avoid stale archive ingest. Each message is treated as a discrete
+    experience-kind memory."""
+    if not _BRIDGE_AGENTS_DIR.exists():
+        return []
+
+    import datetime as _dt
+    cutoff = (_dt.datetime.now(_dt.timezone.utc) -
+              _dt.timedelta(days=_BRIDGE_MAX_AGE_DAYS))
+
+    out: list[dict] = []
+    seen_msg_ids: set[str] = set()  # avoid double-counting (msg in inbox + outbox)
+    for agent_dir in sorted(_BRIDGE_AGENTS_DIR.iterdir()):
+        if not agent_dir.is_dir():
+            continue
+        for mailbox_name in ("inbox.jsonl", "outbox.jsonl"):
+            mailbox = agent_dir / mailbox_name
+            if not mailbox.exists():
+                continue
+            for line in mailbox.read_text(encoding="utf-8",
+                                           errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg_id = msg.get("id")
+                if not msg_id or msg_id in seen_msg_ids:
+                    continue
+                # Date filter
+                created_at = msg.get("createdAt")
+                if created_at:
+                    try:
+                        ts = _dt.datetime.fromisoformat(
+                            created_at.replace("Z", "+00:00"))
+                        if ts < cutoff:
+                            continue
+                        valid_from = ts.timestamp()
+                    except Exception:
+                        valid_from = mailbox.stat().st_mtime
+                else:
+                    valid_from = mailbox.stat().st_mtime
+                seen_msg_ids.add(msg_id)
+
+                # Build chunk content: subject + body excerpt
+                subject = msg.get("subject") or "(no subject)"
+                body = msg.get("body") or ""
+                # Cap body to avoid pathological-size single-message ingests
+                if len(body) > 8000:
+                    body = body[:8000] + "\n[...truncated]"
+                msg_type = msg.get("type") or "message"
+                from_ = msg.get("from") or "?"
+                to_ = msg.get("to") or "?"
+                heading = f"bridge:{from_}->{to_}: {subject}"[:80]
+                content = f"[{from_} → {to_}, {created_at}] {subject}\n\n{body}"
+                out.append({
+                    "path": mailbox,  # for traceability
+                    "source_label": "bridge_mailbox",
+                    "default_kind": "experience",
+                    "origin_system": "hermes",
+                    "_synthetic_chunk": True,  # signal we built our own
+                    "_synthetic_heading": heading,
+                    "_synthetic_body": content,
+                    "_synthetic_mtime": valid_from,
+                    "_msg_id": msg_id,
+                    "_msg_type": msg_type,
+                    "_from": from_,
+                    "_to": to_,
+                    "_thread_id": msg.get("threadId") or "",
+                    "_tags": msg.get("tags") or [],
+                })
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--db", default=None, help="DB path override")
@@ -247,6 +329,32 @@ def main() -> int:
                 "mtime": path.stat().st_mtime,
             })
             total_chunks += 1
+
+    # Bridge messages — synthetic chunks (one per message, not chunked further)
+    bridge_descs = _gather_bridge_messages()
+    print(f"Gathered {len(bridge_descs)} bridge messages (last {_BRIDGE_MAX_AGE_DAYS} days)",
+          file=sys.stderr)
+    for desc in bridge_descs:
+        body = desc["_synthetic_body"]
+        chunk_inventory.append({
+            "path": desc["path"],
+            "source_label": desc["source_label"],
+            "default_kind": desc["default_kind"],
+            "origin_system": desc["origin_system"],
+            "heading": desc["_synthetic_heading"],
+            "body": body,
+            "content_hash": _content_hash(body),
+            "mtime": desc["_synthetic_mtime"],
+            "_extra_metadata": {
+                "msg_id": desc["_msg_id"],
+                "msg_type": desc["_msg_type"],
+                "from": desc["_from"],
+                "to": desc["_to"],
+                "thread_id": desc["_thread_id"],
+                "tags": desc["_tags"],
+            },
+        })
+        total_chunks += 1
 
     print(f"Total chunks: {total_chunks}  Skipped oversize: {skipped_oversize}",
           file=sys.stderr)
@@ -305,6 +413,9 @@ def main() -> int:
             "file_mtime": c["mtime"],
             "ingested_by": "ingest_ae_corpus.py",
         }
+        # Bridge messages carry extra structured metadata
+        if c.get("_extra_metadata"):
+            metadata.update(c["_extra_metadata"])
 
         try:
             mem.remember(
