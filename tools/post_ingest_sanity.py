@@ -120,6 +120,14 @@ _CONTRACTS = [
      "__SANITY_PROCEDURAL_SCORE_CHECK__",
      "_procedural_score_populated",
      None),
+    # Valiendo D5 wiring graceful check: kind='dream_insight' recall path
+    # is callable without crashing. Returns 0 results until live dream
+    # cycles fire post-D5 (commit 43679fa). When that happens, this
+    # contract starts seeing rows and will continue to pass.
+    ("dream_insight — recall path callable (D5 wiring graceful check)",
+     "self image insight",
+     "_dream_insight_path",
+     None),
 ]
 
 
@@ -204,6 +212,19 @@ def main() -> int:
             count = row[0] if row else 0
             results = [{"id": -1, "content": f"populated_count={count}",
                         "label": "sanity_check"}] if count > 0 else []
+        elif channel == "_dream_insight_path":
+            # Valiendo D5 wiring guard: recall(kind='dream_insight') path
+            # must not crash. Returns 0 results until live dream cycles
+            # fire after commit 43679fa, then transitions to seeing rows.
+            # We pass on either outcome — the test is "does the path
+            # work end-to-end" not "are there rows yet."
+            try:
+                _ = mem.recall(query, k=args.k, kind="dream_insight")
+                results = [{"id": -2, "content": "path_callable",
+                            "label": "sanity_check"}]
+            except Exception as e:
+                print(f"        dream_insight path raised: {e}")
+                results = []
         else:
             results = mem.recall(query, k=args.k)
 
