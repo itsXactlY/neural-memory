@@ -93,13 +93,17 @@ class SchemaUpgrade:
 
     @staticmethod
     def _ensure_fts5(conn: sqlite3.Connection) -> int:
-        """Phase 7 Commit 5: create memories_fts virtual table if missing and
-        backfill from existing memories. Returns number of rows backfilled.
-        Idempotent — re-running adds only memories not yet in the FTS index.
+        """Phase 7 Commit 5: create memories_fts virtual table if missing,
+        backfill missing user memories, and DEFENSIVELY remove entity rows
+        that may have snuck in via stale-code paths (e.g., a long-running
+        process holding pre-fix memory_client.py in memory).
 
-        Internal-content mode: FTS index stores content. Trade-off: 2x storage
-        for content text, in exchange for trivial sync (no triggers needed).
-        For 1000s of memories at ~100 bytes avg this is negligible.
+        Returns number of rows backfilled (positive) minus entity rows
+        cleaned (negative contribution). Idempotent.
+
+        Internal-content mode: FTS index stores content. Trade-off: 2x
+        storage for content text, in exchange for trivial sync. Negligible
+        at AE scale.
 
         Silent no-op if SQLite was compiled without FTS5 support.
         """
@@ -108,16 +112,28 @@ class SchemaUpgrade:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(content)"
             )
         except sqlite3.OperationalError:
-            # FTS5 not available in this SQLite build. Sparse channel will
-            # error out at query time; that's acceptable given the optional
-            # nature of the channel.
             return 0
+
+        # Defensive cleanup: remove entity rows from FTS index. Triggers
+        # whenever a long-running process with stale code has inserted entity
+        # content (caught 2026-05-01 — bcd72db was a forward-guard only;
+        # running hermes kept adding entity rows until it reloaded the module).
+        try:
+            conn.execute(
+                """DELETE FROM memories_fts
+                   WHERE rowid IN (SELECT id FROM memories WHERE kind = 'entity')"""
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # Backfill: only memories whose rowid is missing from the FTS index.
+        # Skip kind='entity' rows (entities don't belong in sparse search).
         cur = conn.execute(
             """INSERT INTO memories_fts(rowid, content)
                SELECT m.id, m.content FROM memories m
                WHERE NOT EXISTS (SELECT 1 FROM memories_fts f WHERE f.rowid = m.id)
-               AND m.content IS NOT NULL"""
+               AND m.content IS NOT NULL
+               AND (m.kind IS NULL OR m.kind != 'entity')"""
         )
         return cur.rowcount or 0
 
