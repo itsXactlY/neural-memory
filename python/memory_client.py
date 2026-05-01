@@ -1573,6 +1573,43 @@ class NeuralMemory:
                        "procedural_score": r[6] or 0.0}
                 for r in rows}
 
+        # ---- Phase 7.5-β: per-candidate entity_score ------------------
+        # If query mentions entities and a candidate's mentions_entity edges
+        # overlap them, boost via the entity channel. Caught 2026-05-01:
+        # CandidateFeatures.entity_score had been a no-op because the call
+        # site never populated it. This batches all candidate-edge lookups
+        # into one IN-query for performance.
+        entity_score_by_id: dict[int, float] = {}
+        try:
+            from entity_extraction import extract_entities
+            query_entities = {e.lower() for e in extract_entities(query)}
+            if query_entities:
+                with self.store._lock:
+                    edge_rows = self.store.conn.execute(
+                        f"SELECT c.source_id, m.label "
+                        f"FROM connections c JOIN memories m ON m.id = c.target_id "
+                        f"WHERE c.edge_type = 'mentions_entity' "
+                        f"  AND m.kind = 'entity' "
+                        f"  AND c.source_id IN ({placeholders})",
+                        tuple(candidate_ids),
+                    ).fetchall()
+                cand_entities: dict[int, set[str]] = {}
+                for src_id, ent_label in edge_rows:
+                    if ent_label:
+                        cand_entities.setdefault(src_id, set()).add(
+                            ent_label.lower()
+                        )
+                qmax = max(len(query_entities), 1)
+                for cid, ents in cand_entities.items():
+                    overlap = len(ents & query_entities)
+                    if overlap > 0:
+                        entity_score_by_id[cid] = min(overlap / qmax, 1.0)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug(
+                "entity_score wiring failed silently: %s", exc,
+            )
+
         # ---- Apply kind / as_of post-filters at candidate level --------
         if kind is not None:
             candidate_ids = {cid for cid in candidate_ids
@@ -1607,6 +1644,7 @@ class NeuralMemory:
                 graph_score=per_channel_scores.get("graph", {}).get(cid, 0.0),
                 temporal_score=per_channel_scores.get("temporal", {}).get(cid, 0.0),
                 procedural_score=float(m.get("procedural_score") or 0.0),
+                entity_score=float(entity_score_by_id.get(cid, 0.0)),
                 rrf_feature=_rrf(cid),
                 salience=float(m.get("salience", 1.0)),
                 confidence=float(m.get("confidence", 1.0)),
