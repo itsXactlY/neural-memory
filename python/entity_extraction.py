@@ -46,6 +46,20 @@ _STOPWORDS: frozenset[str] = frozenset({
     "Such", "Same", "Other", "Another", "More", "Most", "Less", "Least",
     "Just", "Only", "Even", "Also", "Still", "Yet", "Already",
     "Note", "Notes", "See", "Read", "Write", "Run", "Add", "Remove",
+    # Caught in second-pass cleanup 2026-05-01 22:18Z:
+    "Created", "Updated", "Deleted", "Modified", "Replaced",
+    "New", "Old", "Initial", "Final", "Latest", "Previous", "Current",
+    "Source", "Target", "Origin", "Destination", "Path",
+    "Purpose", "Reason", "Cause", "Effect",
+    "Both", "Either", "Neither",
+    "Don",  # fragment from "Don't"
+    "ACK", "NACK", "FYI", "RFC",  # status/protocol noise (real but generic)
+    "Library",  # macOS path component
+    "User", "Owner", "Author",  # generic role nouns
+    "Status", "State", "Stage", "Level",
+    "Type", "Kind", "Class", "Mode",
+    "Default", "Auto", "Manual",
+    "Block", "Step", "Item", "Entry", "Record",
 })
 
 

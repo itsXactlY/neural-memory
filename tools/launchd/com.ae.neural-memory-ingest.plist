@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.ae.neural-memory-ingest.plist — daily corpus ingest into ~/.neural_memory/memory.db
+
+  Re-runs tools/ingest_ae_corpus.py + tools/post_ingest_sanity.py daily at 04:15 local time.
+  Idempotent: ingest_ae_corpus.py dedupes by content_hash, so unchanged chunks are skipped.
+
+  TEMPLATE — not installed automatically. AE main-builder lane should install via:
+
+    cp /Users/tito/lWORKSPACEl/research/neural-memory/tools/launchd/com.ae.neural-memory-ingest.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ae.neural-memory-ingest.plist
+
+  Schedule rationale:
+  - 04:15 chosen: AFTER 03:32 memory-autocommit timer (so latest memory edits are committed first)
+                  AFTER 04:30 vault-status-sync (intentional: ingest reads claude-memory, vault is separate)
+  - Daily cadence: most AE canonical sources (operator skill, kernel docs, claude-memory) change at < daily rate
+  - Add idempotency-confirm via post_ingest_sanity.py — exits non-zero if retrieval contracts regress
+
+  Logs: ~/.neural_memory/logs/ingest.{stdout,stderr}.log
+
+  To uninstall:
+    launchctl bootout gui/$(id -u)/com.ae.neural-memory-ingest
+    rm ~/Library/LaunchAgents/com.ae.neural-memory-ingest.plist
+
+  Source: tools/launchd/com.ae.neural-memory-ingest.plist in ernes-toe/neural-memory:patches/phase-b-2026-04-18
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ae.neural-memory-ingest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>mkdir -p $HOME/.neural_memory/logs &amp;&amp; /opt/homebrew/bin/python3.11 /Users/tito/lWORKSPACEl/research/neural-memory/tools/ingest_ae_corpus.py &amp;&amp; /opt/homebrew/bin/python3.11 /Users/tito/lWORKSPACEl/research/neural-memory/tools/post_ingest_sanity.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tito/.neural_memory/logs/ingest.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/tito/.neural_memory/logs/ingest.stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/tito</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
