@@ -5,11 +5,16 @@ Wraps the C++ library via ctypes. Uses embed_provider for text->vector.
 """
 
 import ctypes
+import json
 import sqlite3
 import struct
 import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+from classify_memory_kind import classify_memory_kind
+from schema_upgrade import SchemaUpgrade
 
 # ============================================================================
 # Find the shared library
@@ -150,14 +155,55 @@ class SQLiteStore:
         self.conn.executescript(SCHEMA)
         _migrate_bitemporal(self.conn)
         self.conn.commit()
+        # Phase 7: extend with typed/temporal/governance/locus columns. Idempotent.
+        SchemaUpgrade(str(db_path)).upgrade()
         self._lock = threading.Lock()
-    
-    def store(self, label: str, content: str, embedding: list[float]) -> int:
+
+    def store(
+        self,
+        label: str,
+        content: str,
+        embedding: list[float],
+        *,
+        kind: Optional[str] = None,
+        confidence: Optional[float] = None,
+        source: Optional[str] = None,
+        origin_system: Optional[str] = None,
+        valid_from: Optional[float] = None,
+        valid_to: Optional[float] = None,
+        transaction_time: Optional[float] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> int:
         blob = struct.pack(f'{len(embedding)}f', *embedding)
+        if transaction_time is None:
+            transaction_time = time.time()
+        metadata_json = json.dumps(metadata) if metadata else None
+
+        # Build INSERT dynamically: only include typed columns when caller
+        # provided a non-None value. Schema-defined defaults handle the rest.
+        cols = ["label", "content", "embedding"]
+        vals: list[Any] = [label, content, blob]
+        for col_name, col_value in (
+            ("kind", kind),
+            ("confidence", confidence),
+            ("source", source),
+            ("origin_system", origin_system),
+            ("valid_from", valid_from),
+            ("valid_to", valid_to),
+            ("transaction_time", transaction_time),
+            ("metadata_json", metadata_json),
+        ):
+            if col_value is not None:
+                cols.append(col_name)
+                vals.append(col_value)
+
+        placeholders = ",".join("?" * len(vals))
+        col_list = ",".join(cols)
+
         with self._lock:
             cur = self.conn.execute(
-                "INSERT INTO memories (label, content, embedding) VALUES (?, ?, ?)",
-                (label, content, blob)
+                f"INSERT INTO memories ({col_list}) VALUES ({placeholders})",
+                tuple(vals),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -697,7 +743,15 @@ class NeuralMemory:
         return out
 
     def remember(self, text: str, label: str = "", detect_conflicts: bool = True,
-                 normalize_dates: bool = True) -> int:
+                 normalize_dates: bool = True,
+                 *,
+                 kind: Optional[str] = None,
+                 confidence: Optional[float] = None,
+                 source: Optional[str] = None,
+                 origin_system: Optional[str] = None,
+                 valid_from: Optional[float] = None,
+                 valid_to: Optional[float] = None,
+                 metadata: Optional[dict[str, Any]] = None) -> int:
         """Store a memory. Returns memory ID.
 
         If detect_conflicts=True, checks for existing memories about the same
@@ -706,12 +760,30 @@ class NeuralMemory:
         If normalize_dates=True (default; H18), relative dates in the content
         are converted to absolute ISO dates before storage. Pass False to
         preserve verbatim text.
+
+        Phase 7 typed-memory kwargs (all optional, all keyword-only):
+        - kind: one of memory_types.MEMORY_KINDS. Auto-classified from text
+          via classify_memory_kind() when not provided.
+        - confidence: caller-supplied confidence in [0,1]; defaults to schema
+          default (1.0).
+        - source: provenance label (e.g., 'whatsapp', 'estimate_form', 'cli').
+        - origin_system: which system wrote this memory (e.g., 'ae', 'hermes').
+        - valid_from / valid_to: bi-temporal validity window (Graphiti-style).
+        - metadata: dict, JSON-serialized into metadata_json column.
+
+        Note: H19 supersession path (when detect_conflicts fires) does NOT yet
+        propagate typed kwargs through replace_memory(). Superseded memories
+        retain pre-supersession typing. Tracked for Commit 3.
         """
         import math
         import time
 
         if normalize_dates:
             text = self._normalize_dates(text)
+
+        # Auto-classify kind from text when caller did not specify.
+        if kind is None:
+            kind = classify_memory_kind(text, metadata=metadata)
 
         embedding = self.embedder.embed(text)
         
@@ -779,7 +851,16 @@ class NeuralMemory:
                     # Don't create duplicate - update existing
                     return conflict_id
         
-        mem_id = self.store.store(label or text[:60], text, embedding)
+        mem_id = self.store.store(
+            label or text[:60], text, embedding,
+            kind=kind,
+            confidence=confidence,
+            source=source,
+            origin_system=origin_system,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            metadata=metadata,
+        )
         
         # Add to in-memory graph
         self._graph_nodes[mem_id] = {
