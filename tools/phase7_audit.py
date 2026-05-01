@@ -160,6 +160,45 @@ def audit(db_path: str) -> dict:
         "above_1.5":  sal_buckets[4],
     }
 
+    # ---- Phase 7 feature usage (shipped but unwired detection) ---------
+    # Caught 2026-05-01: Phase 7 commits 1-10 shipped schema + APIs for
+    # node kinds (dream_insight, locus, profile_trait), edge types
+    # (summarizes, contradicts, located_in, rem_bridge), and metadata
+    # fields (valid_to, locus_id, procedural_score). But several features
+    # had ZERO production rows in live DB, indicating no consumer wires
+    # the API to actually populate them. Surface this so wiring gaps are
+    # visible in routine audits.
+    feature_usage = {}
+    feature_checks = [
+        ("dream_insight_nodes",
+         "SELECT COUNT(*) FROM memories WHERE kind='dream_insight'"),
+        ("locus_nodes",
+         "SELECT COUNT(*) FROM memories WHERE kind='locus'"),
+        ("profile_trait_nodes",
+         "SELECT COUNT(*) FROM memories WHERE kind='profile_trait'"),
+        ("summarizes_edges",
+         "SELECT COUNT(*) FROM connections WHERE edge_type='summarizes'"),
+        ("contradicts_edges",
+         "SELECT COUNT(*) FROM connections WHERE edge_type='contradicts'"),
+        ("located_in_edges",
+         "SELECT COUNT(*) FROM connections WHERE edge_type='located_in'"),
+        ("memories_with_valid_to",
+         "SELECT COUNT(*) FROM memories WHERE valid_to IS NOT NULL"),
+        ("memories_with_locus_id",
+         "SELECT COUNT(*) FROM memories WHERE locus_id IS NOT NULL"),
+        ("memories_with_procedural_score",
+         "SELECT COUNT(*) FROM memories WHERE procedural_score IS NOT NULL"),
+    ]
+    for name, q in feature_checks:
+        try:
+            feature_usage[name] = conn.execute(q).fetchone()[0]
+        except sqlite3.OperationalError:
+            feature_usage[name] = None
+    out["phase7_feature_usage"] = feature_usage
+    out["phase7_unwired_features"] = sorted(
+        k for k, v in feature_usage.items() if v == 0
+    )
+
     # ---- dream_insights bloat detection ---------------------------------
     # Caught 2026-05-01: add_insight() does unconditional INSERT, so every
     # dream cycle re-emits the same bridge/cluster insights. Without a
@@ -280,6 +319,18 @@ def render_text(report: dict) -> str:
     lines.append(_section("Salience distribution"))
     for bucket, n in report["salience_distribution"].items():
         lines.append(f"  {bucket:12s} {n:6d}")
+
+    if "phase7_feature_usage" in report:
+        lines.append(_section("Phase 7 feature usage (live DB row counts)"))
+        for name, count in sorted(report["phase7_feature_usage"].items()):
+            tag = " <- UNWIRED" if count == 0 else ""
+            tag = " <- COL MISSING" if count is None else tag
+            lines.append(f"  {name:35s} {count if count is not None else '?':>8}{tag}")
+        if report["phase7_unwired_features"]:
+            lines.append(f"")
+            lines.append(f"  >> {len(report['phase7_unwired_features'])} features shipped but unwired:")
+            for name in report["phase7_unwired_features"]:
+                lines.append(f"     - {name}")
 
     if "dream_insights" in report:
         di = report["dream_insights"]
