@@ -96,7 +96,18 @@ def _load(db_path: str | None):
     captured = io.StringIO()
     with contextlib.redirect_stdout(captured):
         from memory_client import NeuralMemory
-        kwargs = {"embedding_backend": "auto", "use_cpp": False, "use_hnsw": False}
+        # Prefer sentence-transformers if installed (semantic > lexical for
+        # natural-language queries). Falls through to auto-detect if not.
+        # Caught 2026-05-01: TF-IDF backend top-25 doesn't carry enough
+        # procedural-kind memories for kind-filter queries to work; sentence-
+        # transformers does.
+        backend = "sentence-transformers"
+        try:
+            import sentence_transformers  # noqa: F401
+        except ImportError:
+            backend = "auto"
+        kwargs = {"embedding_backend": backend,
+                  "use_cpp": False, "use_hnsw": False}
         if db_path:
             kwargs["db_path"] = db_path
         mem = NeuralMemory(**kwargs)
