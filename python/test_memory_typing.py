@@ -209,6 +209,53 @@ class SQLiteStoreTypedKwargsTests(unittest.TestCase):
                          "origin_system", "metadata_json", "memory_visibility"):
             self.assertIn(required, cols)
 
+    def test_replace_memory_propagates_typed_kwargs(self) -> None:
+        """H19 supersession path now propagates typed kwargs into the
+        replacement (carryover from C2/C3 punt)."""
+        mid = self.store.store("orig", "original content", self.embedding,
+                               kind="claim", source="whatsapp")
+        # Replace with new content + new typed kwargs
+        self.store.replace_memory(
+            memory_id=mid,
+            content="updated content",
+            label="orig",
+            embedding=self.embedding,
+            kind="experience",
+            source="dashboard",
+            confidence=0.7,
+            valid_from=1500.0,
+        )
+        self.store.conn.row_factory = sqlite3.Row
+        row = self.store.conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (mid,)
+        ).fetchone()
+        self.assertEqual(row["content"], "updated content")
+        self.assertEqual(row["kind"], "experience")
+        self.assertEqual(row["source"], "dashboard")
+        self.assertAlmostEqual(row["confidence"], 0.7)
+        self.assertEqual(row["valid_from"], 1500.0)
+
+    def test_replace_memory_preserves_typed_kwargs_when_omitted(self) -> None:
+        """When caller omits typed kwargs, replacement preserves the
+        existing row's typed values (no silent NULL-out)."""
+        mid = self.store.store("orig", "original content", self.embedding,
+                               kind="claim", source="whatsapp", confidence=0.9)
+        self.store.replace_memory(
+            memory_id=mid,
+            content="updated content",
+            label="orig",
+            embedding=self.embedding,
+            # no typed kwargs — old typing should be preserved
+        )
+        self.store.conn.row_factory = sqlite3.Row
+        row = self.store.conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (mid,)
+        ).fetchone()
+        self.assertEqual(row["content"], "updated content")
+        self.assertEqual(row["kind"], "claim")
+        self.assertEqual(row["source"], "whatsapp")
+        self.assertAlmostEqual(row["confidence"], 0.9)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -406,17 +406,52 @@ class SQLiteStore:
             return cur.lastrowid
 
     def replace_memory(self, memory_id: int, content: str, label: str,
-                       embedding: list[float]) -> None:
+                       embedding: list[float],
+                       *,
+                       kind: Optional[str] = None,
+                       confidence: Optional[float] = None,
+                       source: Optional[str] = None,
+                       origin_system: Optional[str] = None,
+                       valid_from: Optional[float] = None,
+                       valid_to: Optional[float] = None,
+                       transaction_time: Optional[float] = None,
+                       metadata: Optional[dict[str, Any]] = None) -> None:
         """H19: cleanly replace a memory's content + label + embedding in place.
         No `[SUPERSEDED]` prefix. Caller should have called archive_superseded()
         first to preserve audit history.
+
+        Phase 7 Commit 11 (carryover from C2/C3 punt): typed kwargs now flow
+        through. When supersession fires, the new memory's kind/confidence/
+        source/origin_system/temporal/metadata can replace the old typing.
+        Defaults preserve old typing when caller omits kwargs.
         """
         blob = struct.pack(f'{len(embedding)}f', *embedding) if embedding else None
+
+        # Build dynamic UPDATE: always update content/label/embedding;
+        # additionally update typed cols when caller supplied them.
+        sets: list[str] = ["content = ?", "label = ?", "embedding = ?"]
+        vals: list[Any] = [content, label, blob]
+        metadata_json = json.dumps(metadata) if metadata else None
+
+        for col_name, col_value in (
+            ("kind", kind),
+            ("confidence", confidence),
+            ("source", source),
+            ("origin_system", origin_system),
+            ("valid_from", valid_from),
+            ("valid_to", valid_to),
+            ("transaction_time", transaction_time),
+            ("metadata_json", metadata_json),
+        ):
+            if col_value is not None:
+                sets.append(f"{col_name} = ?")
+                vals.append(col_value)
+        vals.append(memory_id)
+
         with self._lock:
             self.conn.execute(
-                """UPDATE memories SET content = ?, label = ?, embedding = ?
-                   WHERE id = ?""",
-                (content, label, blob, memory_id),
+                f"UPDATE memories SET {', '.join(sets)} WHERE id = ?",
+                tuple(vals),
             )
             # Phase 7 Commit 5: refresh FTS5 row so sparse_search doesn't return
             # stale superseded content. Silent no-op if FTS5 unavailable.
@@ -1066,11 +1101,23 @@ class NeuralMemory:
                             superseded_at=now_ts,
                             superseded_reason=f"cosine={similarity:.3f} content_differs",
                         )
+                        # Phase 7 C11 carryover: propagate typed kwargs from
+                        # the user's remember() call into the supersession
+                        # replacement. transaction_time auto-stamps to now if
+                        # not provided.
                         self.store.replace_memory(
                             memory_id=conflict_id,
                             content=text,
                             label=label or text[:60],
                             embedding=embedding,
+                            kind=kind,
+                            confidence=confidence,
+                            source=source,
+                            origin_system=origin_system,
+                            valid_from=valid_from,
+                            valid_to=valid_to,
+                            transaction_time=time.time(),
+                            metadata=metadata,
                         )
                     except Exception as exc:
                         # Fall back to legacy [SUPERSEDED] prefix if anything
