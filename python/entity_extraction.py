@@ -23,15 +23,29 @@ from typing import Any, Optional
 # entities. Acronyms (NEC, GFCI, EMT, MC) intentionally NOT filtered — they
 # function as entities in retrieval.
 _STOPWORDS: frozenset[str] = frozenset({
+    # Articles + demonstratives
     "The", "This", "That", "These", "Those", "A", "An",
+    # Pronouns
     "I", "We", "You", "He", "She", "It", "They", "Them",
     "My", "Your", "His", "Her", "Its", "Their", "Our",
+    # Conjunctions
     "And", "Or", "But", "Yet", "So", "For", "Nor",
+    # Question words
     "When", "Where", "What", "How", "Why", "Who", "Which", "Whose",
+    # Conditionals + temporal connectors
     "If", "Then", "Else", "Because", "While", "After", "Before",
     "Always", "Never", "Sometimes", "Today", "Tomorrow", "Yesterday",
+    # Interjections / responses
     "Yes", "No", "OK", "Okay", "Maybe", "Perhaps",
     "Now", "Soon", "Later", "Here", "There", "Then",
+    # Caught post-AE-corpus-ingest 2026-05-01 — over-extracted noise:
+    "NOT", "NULL", "TODO", "FIXME", "TBD", "TBA", "XXX",
+    "Use", "Do", "All", "Per", "Each", "Every", "Some", "Any", "None",
+    "Users",  # directory path component, not an entity
+    "From", "Into", "Onto", "Upon", "Within", "Without",
+    "Such", "Same", "Other", "Another", "More", "Most", "Less", "Least",
+    "Just", "Only", "Even", "Also", "Still", "Yet", "Already",
+    "Note", "Notes", "See", "Read", "Write", "Run", "Add", "Remove",
 })
 
 
