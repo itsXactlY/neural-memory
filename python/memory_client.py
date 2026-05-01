@@ -1364,7 +1364,8 @@ class NeuralMemory:
             row = self.store.conn.execute(
                 "SELECT id, label, content, salience, access_count, kind, "
                 "confidence, valid_from, valid_to, transaction_time, "
-                "origin_system, source FROM memories WHERE id = ?",
+                "origin_system, source, memory_visibility, pin_state, "
+                "metadata_json FROM memories WHERE id = ?",
                 (memory_id,),
             ).fetchone()
         if not row:
@@ -1374,7 +1375,8 @@ class NeuralMemory:
             "salience": row[3], "access_count": row[4], "kind": row[5],
             "confidence": row[6], "valid_from": row[7], "valid_to": row[8],
             "transaction_time": row[9], "origin_system": row[10],
-            "source": row[11],
+            "source": row[11], "memory_visibility": row[12],
+            "pin_state": row[13], "metadata_json": row[14],
         }
 
     def get_edges(self, memory_id: int) -> list[dict[str, Any]]:
@@ -1491,6 +1493,141 @@ class NeuralMemory:
         inter = wa & wb
         union = wa | wb
         return len(inter) / len(union)
+
+    # ------------------------------------------------------------------
+    # Phase 7 Commit 10: locus overlay + governance + explanation paths
+    # ------------------------------------------------------------------
+
+    def create_locus(self, wing: str, room: str) -> int:
+        """Create a locus_room node and link it under a locus_wing parent
+        (auto-creating the wing if missing). Returns the room locus id.
+
+        Loci are kind='locus' nodes in the unified graph; located_in edges
+        connect memories -> rooms -> wings. Per handoff sec 4.2, locus is an
+        OVERLAY, not the canonical durable structure.
+        """
+        wing_id = self._get_or_create_locus_node(wing, level="wing", parent=None)
+        room_id = self._get_or_create_locus_node(room, level="room", parent=wing_id)
+        return room_id
+
+    def _get_or_create_locus_node(self, label: str, *, level: str,
+                                   parent: Optional[int]) -> int:
+        """Find or create a locus node with the given label + level."""
+        with self.store._lock:
+            row = self.store.conn.execute(
+                "SELECT id FROM memories WHERE kind = 'locus' AND label = ? LIMIT 1",
+                (label,),
+            ).fetchone()
+        if row:
+            return row[0]
+        meta = {"level": level, "parent": parent}
+        node_id = self.store.store(
+            label=label,
+            content=f"Locus {level}: {label}",
+            embedding=[0.0] * 16,
+            kind="locus",
+            origin_system="locus_overlay",
+            metadata=meta,
+        )
+        if parent is not None:
+            try:
+                self.store.add_connection(node_id, parent, weight=1.0,
+                                          edge_type="located_in")
+            except Exception:
+                pass
+        return node_id
+
+    def assign_locus(self, memory_id: int, locus_id: int) -> None:
+        """Add a located_in edge from memory to locus. Idempotent."""
+        if self.has_edge(memory_id, locus_id, edge_type="located_in"):
+            return
+        self.store.add_connection(memory_id, locus_id, weight=1.0,
+                                  edge_type="located_in")
+
+    def memory_count(self, *, exclude_overlay: bool = True) -> int:
+        """Count user memories. By default excludes entity + locus overlay
+        nodes (which are derived/system, not user-authored memories)."""
+        with self.store._lock:
+            if exclude_overlay:
+                row = self.store.conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE kind IS NULL "
+                    "OR (kind != 'entity' AND kind != 'locus')"
+                ).fetchone()
+            else:
+                row = self.store.conn.execute(
+                    "SELECT COUNT(*) FROM memories"
+                ).fetchone()
+        return row[0]
+
+    def forget(self, memory_id: int, *, mode: str = "background") -> None:
+        """Soft-forget operation per handoff sec 11.4.
+
+        Modes:
+            'background': sets memory_visibility='backgrounded' — keeps the
+                row + edges intact, just deprioritizes from default recall.
+            'delete':     hard-delete (rare; use 'background' first).
+            'redact':     replace content with a redaction marker; preserves
+                edges + audit trail per H19 invariant.
+
+        Default 'background' is the safe choice.
+        """
+        if mode == "background":
+            with self.store._lock:
+                self.store.conn.execute(
+                    "UPDATE memories SET memory_visibility = 'backgrounded' "
+                    "WHERE id = ?",
+                    (memory_id,),
+                )
+                self.store.conn.commit()
+        elif mode == "delete":
+            with self.store._lock:
+                self.store.conn.execute(
+                    "DELETE FROM memories WHERE id = ?", (memory_id,),
+                )
+                self.store.conn.commit()
+        elif mode == "redact":
+            with self.store._lock:
+                self.store.conn.execute(
+                    "UPDATE memories SET content = '[REDACTED]', "
+                    "memory_visibility = 'hidden' WHERE id = ?",
+                    (memory_id,),
+                )
+                self.store.conn.commit()
+        else:
+            raise ValueError(f"unknown forget mode: {mode!r}")
+
+    def explain_recall(self, query: str, k: int = 5,
+                       *, kind: Optional[str] = None,
+                       as_of: Optional[float] = None) -> list[dict[str, Any]]:
+        """recall() with per-result explanation paths attached.
+
+        Returns the same dicts as recall(), each augmented with an
+        `explanation` key containing:
+            - channels: list of channels that contributed
+            - final_score: combined score
+            - features: dict of feature scores including 'salience'
+
+        Per addendum lines 541-547 + handoff sec 12.4.
+        """
+        results = self.recall(query, k=k, kind=kind, as_of=as_of)
+        intent = self._classify_intent(query)
+        for r in results:
+            r["explanation"] = {
+                "query": query,
+                "intent": intent,
+                "channels": ["dense"]
+                            + (["sparse"] if self.sparse_search else [])
+                            + (["temporal"] if as_of is not None else [])
+                            + (["graph"] if self._graph_nodes else []),
+                "final_score": r.get("combined", r.get("similarity", 0.0)),
+                "features": {
+                    "semantic":          r.get("similarity", 0.0),
+                    "temporal_score":    r.get("temporal_score", 0.0),
+                    "salience":          r.get("salience_factor", 1.0),
+                    "combined":          r.get("combined", 0.0),
+                },
+            }
+        return results
 
     def run_contradiction_detection_once(self,
                                           jaccard_threshold: float = 0.4) -> dict[str, int]:
