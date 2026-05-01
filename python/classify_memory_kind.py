@@ -30,6 +30,7 @@ from memory_types import MEMORY_KINDS
 #   "If permit jurisdiction is unclear, call the village before quoting."
 #   "Always photograph panel labels before leaving the job."
 _PROCEDURAL_PATTERNS = [
+    # English imperative / conditional / how-to patterns
     re.compile(r"^\s*when\s+\w", re.IGNORECASE),
     re.compile(r"^\s*if\s+\w", re.IGNORECASE),
     re.compile(r"^\s*always\b", re.IGNORECASE),
@@ -40,6 +41,16 @@ _PROCEDURAL_PATTERNS = [
     re.compile(r"\bsteps?\s+(to|for)\b", re.IGNORECASE),
     re.compile(r"\bcheck(?:list)?\b.*\bbefore\b", re.IGNORECASE),
     re.compile(r"\b(remember|make sure)\s+to\b", re.IGNORECASE),
+    # Spanish patterns for AE crew comms (whatsapp Spanish messages)
+    re.compile(r"^\s*cuando\s+\w", re.IGNORECASE),         # "When..."
+    re.compile(r"^\s*si\s+\w", re.IGNORECASE),             # "If..."
+    re.compile(r"^\s*siempre\b", re.IGNORECASE),           # "Always..."
+    re.compile(r"^\s*nunca\b", re.IGNORECASE),             # "Never..."
+    re.compile(r"^\s*antes\s+de\s+\w", re.IGNORECASE),     # "Before doing..."
+    re.compile(r"^\s*despu[eé]s\s+de\s+\w", re.IGNORECASE),# "After doing..."
+    re.compile(r"\bcomo\s+(hago|hacemos|debemos)\b", re.IGNORECASE),
+    re.compile(r"\bpasos?\s+(para|de)\b", re.IGNORECASE),
+    re.compile(r"\b(recuerda|asegur[aá]te)\s+de\b", re.IGNORECASE),
 ]
 
 
