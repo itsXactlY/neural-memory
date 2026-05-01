@@ -1612,6 +1612,29 @@ class NeuralMemory:
                 "entity_score wiring failed silently: %s", exc,
             )
 
+        # ---- Phase 7.5-δ: per-candidate contradicts-edge count -------
+        # Wired even though contradicts edges currently have 0 rows,
+        # so the contradiction-detection runner ships from D5 onward,
+        # this scorer instantly discounts memories with active conflicts.
+        contradicts_count_by_id: dict[int, int] = {}
+        try:
+            with self.store._lock:
+                cedge_rows = self.store.conn.execute(
+                    f"SELECT source_id, COUNT(*) "
+                    f"FROM connections "
+                    f"WHERE edge_type='contradicts' "
+                    f"  AND source_id IN ({placeholders}) "
+                    f"GROUP BY source_id",
+                    tuple(candidate_ids),
+                ).fetchall()
+            for src_id, cnt in cedge_rows:
+                contradicts_count_by_id[src_id] = cnt or 0
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug(
+                "contradicts edge count failed silently: %s", exc,
+            )
+
         # ---- Apply kind / as_of post-filters at candidate level --------
         if kind is not None:
             candidate_ids = {cid for cid in candidate_ids
@@ -1653,6 +1676,15 @@ class NeuralMemory:
             # Linear ramp from 0 (fresh) to 0.3 (90+ days untouched)
             stale_penalty = min(age_days / 300.0, 0.3) if age_days > 30 else 0.0
 
+            # Phase 7.5-δ: contradiction_penalty from contradicts-edge count.
+            # Currently 0 in live DB (the contradicts edge type has no
+            # production consumer yet) — but wired so when a real
+            # contradiction-detection runner ships, the scorer immediately
+            # discounts memories with active contradictions.
+            contradiction_penalty = float(
+                contradicts_count_by_id.get(cid, 0)
+            ) * 0.05
+
             features = CandidateFeatures(
                 memory_id=cid,
                 semantic_score=per_channel_scores.get("semantic", {}).get(cid, 0.0),
@@ -1662,6 +1694,7 @@ class NeuralMemory:
                 procedural_score=float(m.get("procedural_score") or 0.0),
                 entity_score=float(entity_score_by_id.get(cid, 0.0)),
                 stale_penalty=stale_penalty,
+                contradiction_penalty=contradiction_penalty,
                 rrf_feature=_rrf(cid),
                 salience=float(m.get("salience", 1.0)),
                 confidence=float(m.get("confidence", 1.0)),
