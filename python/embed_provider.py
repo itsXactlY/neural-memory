@@ -313,6 +313,19 @@ class EmbeddingProvider:
             self.backend = SentenceTransformerBackend()
         elif backend == "tfidf":
             self.backend = TfidfSvdBackend()
+        elif backend == "bge-m3":
+            # Phase 7 follow-up: route to embedding_registry's BgeM3Backend.
+            # Falls through to hash if FlagEmbedding/weights unavailable.
+            try:
+                from embedding_registry import BgeM3Backend, BackendUnavailable
+                try:
+                    self.backend = BgeM3Backend()
+                except BackendUnavailable as e:
+                    print(f"[embed] bge-m3 unavailable, falling back to hash: {e}",
+                          file=sys.stderr)
+                    self.backend = HashBackend()
+            except ImportError:
+                self.backend = HashBackend()
         else:
             self.backend = HashBackend()
         
