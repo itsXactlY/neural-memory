@@ -789,23 +789,63 @@ class NeuralMemory:
         """SQLite FTS5 BM25 retrieval. Returns memories whose content matches
         the FTS query, ranked by built-in BM25 relevance.
 
-        Borrowed pattern from Hindsight without forking off into a separate
-        store: results return canonical memory IDs from the same memories
-        table that dense/graph retrieval uses.
+        FTS5's default whitespace-split treats multi-word queries as
+        implicit-AND, requiring ALL terms in the same chunk. For natural-
+        language queries that's too strict (caught post-ingest 2026-05-01:
+        240 AE-domain queries returned 0 hits each). We tokenize on
+        whitespace, strip punctuation, drop stopwords, and OR-join the
+        terms so BM25 ranks chunks containing MORE of the query terms
+        higher without requiring the conjunction.
 
         Returns empty list if FTS5 is unavailable on this SQLite build.
         """
         if not query or not query.strip():
             return []
+
+        # Tokenize: keep alphanumerics + a few special chars common in AE
+        # corpus (slash for "12/2 romex", hyphen for "lot-12"). Drop
+        # punctuation, lowercase. Skip very short tokens + common stopwords.
+        import re
+        _SPARSE_STOPWORDS = frozenset({
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "and", "or", "but", "of", "in", "on", "at", "to", "for", "by",
+            "with", "from", "as", "this", "that", "these", "those", "it",
+            "its", "what", "when", "where", "why", "how", "who", "which",
+            "do", "does", "did", "have", "has", "had", "will", "would",
+            "should", "could", "can", "may", "might", "i", "we", "you",
+            "they", "he", "she", "find", "show", "list", "give", "tell",
+            "memories", "mention", "memory", "notes", "note", "about",
+        })
+        tokens = re.findall(r"[A-Za-z0-9/\-]+", query.lower())
+        # Keep tokens with at least 2 alphanumerics, drop stopwords
+        kept = [t for t in tokens
+                if len(re.sub(r"[^A-Za-z0-9]", "", t)) >= 2
+                and t not in _SPARSE_STOPWORDS]
+        if not kept:
+            return []
+        # Quote each token (FTS5 phrase syntax) and OR-join
+        # Use phrase quoting so tokens with hyphens/slashes match literally
+        fts_query = " OR ".join(f'"{t}"' for t in kept)
+
         try:
             with self.store._lock:
                 rows = self.store.conn.execute(
                     "SELECT rowid FROM memories_fts WHERE content MATCH ? "
                     "ORDER BY rank LIMIT ?",
-                    (query, k),
+                    (fts_query, k),
                 ).fetchall()
         except sqlite3.OperationalError:
-            return []  # FTS5 unavailable or query syntax error
+            # If preprocessing produced an unparseable FTS5 query, fall back
+            # to bare first-token search rather than returning empty.
+            try:
+                with self.store._lock:
+                    rows = self.store.conn.execute(
+                        "SELECT rowid FROM memories_fts WHERE content MATCH ? "
+                        "ORDER BY rank LIMIT ?",
+                        (kept[0], k),
+                    ).fetchall()
+            except sqlite3.OperationalError:
+                return []
         results = []
         for row in rows:
             mem = self.store.get(row[0])
