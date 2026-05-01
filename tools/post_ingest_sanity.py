@@ -112,6 +112,14 @@ _CONTRACTS = [
      "neural memory retrieval architecture",
      "hybrid",
      None),
+    # Phase 7.5-α wiring guard: procedural_score must be populated.
+    # If the auto-default wire breaks (e.g., kind classifier regression
+    # or store.store() drops the kwarg), procedural memories will lose
+    # their procedural-channel signal in the unified scorer.
+    ("procedural_score — kind=procedural memories have populated score",
+     "__SANITY_PROCEDURAL_SCORE_CHECK__",
+     "_procedural_score_populated",
+     None),
 ]
 
 
@@ -184,6 +192,18 @@ def main() -> int:
             results = mem.recall(query, k=args.k, kind="procedural")
         elif channel == "hybrid":
             results = mem.hybrid_recall(query, k=args.k)
+        elif channel == "_procedural_score_populated":
+            # Phase 7.5-α structural check: count procedural memories with
+            # populated procedural_score directly via DB. Synthesize a
+            # results-shaped placeholder so downstream filter logic works.
+            with mem.store._lock:
+                row = mem.store.conn.execute(
+                    "SELECT COUNT(*) FROM memories "
+                    "WHERE kind='procedural' AND procedural_score IS NOT NULL"
+                ).fetchone()
+            count = row[0] if row else 0
+            results = [{"id": -1, "content": f"populated_count={count}",
+                        "label": "sanity_check"}] if count > 0 else []
         else:
             results = mem.recall(query, k=args.k)
 
