@@ -781,7 +781,8 @@ class NeuralMemory:
                  origin_system: Optional[str] = None,
                  valid_from: Optional[float] = None,
                  valid_to: Optional[float] = None,
-                 metadata: Optional[dict[str, Any]] = None) -> int:
+                 metadata: Optional[dict[str, Any]] = None,
+                 evidence_ids: Optional[list[int]] = None) -> int:
         """Store a memory. Returns memory ID.
 
         If detect_conflicts=True, checks for existing memories about the same
@@ -902,6 +903,25 @@ class NeuralMemory:
                 logging.getLogger(__name__).warning(
                     "entity extraction failed for memory %d: %s", mem_id, exc,
                 )
+
+        # Phase 7 Commit 4: derived_from edges from new memory back to supporting
+        # experiences. Used by procedural memory to cite its evidence base, and
+        # by dream-insight nodes to point at source memories. Invalid evidence
+        # IDs are silently skipped (best-effort link).
+        if evidence_ids:
+            for ev_id in evidence_ids:
+                try:
+                    self.store.add_connection(
+                        source=mem_id,
+                        target=int(ev_id),
+                        weight=1.0,
+                        edge_type="derived_from",
+                    )
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "evidence link failed (mem=%d ev=%s): %s", mem_id, ev_id, exc,
+                    )
         
         # Add to in-memory graph
         self._graph_nodes[mem_id] = {
@@ -1055,16 +1075,53 @@ class NeuralMemory:
         eff = base * decay + boost
         return max(SALIENCE_MIN, min(SALIENCE_MAX, eff))
 
-    def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
-        """
-        Retrieve memories related to query.
+    def recall(self, query: str, k: int = 5, temporal_weight: float = 0.2,
+               *, kind: Optional[str] = None) -> list[dict]:
+        """Retrieve memories related to query.
 
         Args:
             query: Search query
             k: Number of results
             temporal_weight: Weight for recency scoring (0=pure similarity, 1=pure recency)
+            kind: Optional Phase 7 filter — when set, only return memories
+                  whose `kind` column matches (e.g., 'procedural', 'experience').
+                  When kind is set, the inner search over-fetches by 5x to
+                  compensate for filtering loss.
 
         Returns list of {id, label, content, similarity, temporal_score, connections}.
+        """
+        if kind is None:
+            return self._recall_inner(query, k, temporal_weight)
+
+        # Phase 7 Commit 4: over-fetch + post-filter by kind. The over-fetch
+        # compensates when many top candidates don't match the filter; if all
+        # filter out, the result list may legitimately be shorter than k.
+        raw = self._recall_inner(query, max(k * 5, 25), temporal_weight)
+        if not raw:
+            return []
+        return self._filter_by_kind(raw, kind)[:k]
+
+    def _filter_by_kind(self, results: list[dict], kind: str) -> list[dict]:
+        """Filter recall results to only memories whose `kind` column matches.
+
+        Single batched SELECT — one DB roundtrip regardless of result-set size.
+        """
+        if not results:
+            return []
+        ids = [r['id'] for r in results]
+        placeholders = ",".join("?" * len(ids))
+        with self.store._lock:
+            rows = self.store.conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders}) AND kind = ?",
+                (*ids, kind),
+            ).fetchall()
+        matching = {row[0] for row in rows}
+        return [r for r in results if r['id'] in matching]
+
+    def _recall_inner(self, query: str, k: int = 5, temporal_weight: float = 0.2) -> list[dict]:
+        """Original recall implementation — used by recall() and Phase 7
+        retrieval channels. Maintains pre-Phase-7 behavior when called with
+        no extra args.
         """
         import math
         import time
