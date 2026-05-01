@@ -206,8 +206,18 @@ class SQLiteStore:
                 f"INSERT INTO memories ({col_list}) VALUES ({placeholders})",
                 tuple(vals),
             )
+            new_id = cur.lastrowid
+            # Phase 7 Commit 5: sync FTS5 index for sparse retrieval. Silent
+            # no-op if memories_fts wasn't created (SQLite without FTS5 support).
+            try:
+                self.conn.execute(
+                    "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+                    (new_id, content),
+                )
+            except sqlite3.OperationalError:
+                pass
             self.conn.commit()
-            return cur.lastrowid
+            return new_id
     
     def get_all(self) -> list[dict]:
         import struct
@@ -402,6 +412,16 @@ class SQLiteStore:
                    WHERE id = ?""",
                 (content, label, blob, memory_id),
             )
+            # Phase 7 Commit 5: refresh FTS5 row so sparse_search doesn't return
+            # stale superseded content. Silent no-op if FTS5 unavailable.
+            try:
+                self.conn.execute("DELETE FROM memories_fts WHERE rowid = ?", (memory_id,))
+                self.conn.execute(
+                    "INSERT INTO memories_fts(rowid, content) VALUES (?, ?)",
+                    (memory_id, content),
+                )
+            except sqlite3.OperationalError:
+                pass
             self.conn.commit()
 
     def set_edge_valid_to(self, source_id: int, target_id: int, ts: float) -> int:
@@ -719,6 +739,79 @@ class NeuralMemory:
     def count_entities_named(self, name: str) -> int:
         """Case-insensitive count of entities with given name."""
         return self.entities.count_entities_named(name) if self.entities else 0
+
+    # ------------------------------------------------------------------
+    # Phase 7 Commit 5: sparse + temporal retrieval channels
+    # ------------------------------------------------------------------
+
+    def sparse_search(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+        """SQLite FTS5 BM25 retrieval. Returns memories whose content matches
+        the FTS query, ranked by built-in BM25 relevance.
+
+        Borrowed pattern from Hindsight without forking off into a separate
+        store: results return canonical memory IDs from the same memories
+        table that dense/graph retrieval uses.
+
+        Returns empty list if FTS5 is unavailable on this SQLite build.
+        """
+        if not query or not query.strip():
+            return []
+        try:
+            with self.store._lock:
+                rows = self.store.conn.execute(
+                    "SELECT rowid FROM memories_fts WHERE content MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (query, k),
+                ).fetchall()
+        except sqlite3.OperationalError:
+            return []  # FTS5 unavailable or query syntax error
+        results = []
+        for row in rows:
+            mem = self.store.get(row[0])
+            if mem:
+                results.append(mem)
+        return results
+
+    def temporal_search(self, query: str, as_of: float,
+                        k: int = 5) -> list[dict[str, Any]]:
+        """Semantic recall + bi-temporal validity filter at point-in-time `as_of`.
+
+        Returns only memories whose [valid_from, valid_to] window contains
+        `as_of`. NULL valid_from is treated as -infinity; NULL valid_to as
+        +infinity (matches Graphiti's "always-valid" semantics for non-
+        bi-temporal memories).
+
+        Per addendum lines 318-330 + handoff section 7.5.
+        """
+        # Over-fetch so the temporal filter has candidates to work with.
+        raw = self._recall_inner(query, max(k * 5, 25))
+        if not raw:
+            return []
+        ids = [r['id'] for r in raw]
+        placeholders = ",".join("?" * len(ids))
+        with self.store._lock:
+            rows = self.store.conn.execute(
+                f"SELECT id, valid_from, valid_to FROM memories "
+                f"WHERE id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        validity = {r[0]: (r[1], r[2]) for r in rows}
+        valid_results = [
+            r for r in raw
+            if self._is_valid_at(*validity.get(r['id'], (None, None)), as_of=as_of)
+        ]
+        return valid_results[:k]
+
+    @staticmethod
+    def _is_valid_at(valid_from: Optional[float], valid_to: Optional[float],
+                     as_of: float) -> bool:
+        """Bi-temporal validity check. NULL bounds are treated as unbounded
+        (always-valid semantics for memories without explicit validity)."""
+        if valid_from is not None and valid_from > as_of:
+            return False
+        if valid_to is not None and as_of >= valid_to:
+            return False
+        return True
 
     @staticmethod
     def _normalize_dates(text: str, ref_time: float = None) -> str:

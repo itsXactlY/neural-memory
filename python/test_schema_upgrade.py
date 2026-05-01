@@ -159,9 +159,11 @@ class SchemaUpgradeTests(unittest.TestCase):
             schema_after_first, schema_after_second,
             "schema diverged after second upgrade — not idempotent",
         )
-        self.assertEqual(
-            second, {"memories_columns_added": 0, "connections_columns_added": 0}
-        )
+        # Second-run column adds must be zero (idempotency proof). Other keys
+        # may be present (e.g., fts_rows_backfilled added in P7C5) — only the
+        # column-add counts are part of the idempotency contract.
+        self.assertEqual(second["memories_columns_added"], 0)
+        self.assertEqual(second["connections_columns_added"], 0)
         self.assertEqual(first["memories_columns_added"], 16)
         self.assertEqual(first["connections_columns_added"], 7)
 
