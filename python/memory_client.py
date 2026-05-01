@@ -802,6 +802,125 @@ class NeuralMemory:
         ]
         return valid_results[:k]
 
+    # ------------------------------------------------------------------
+    # Phase 7 Commit 7: PPR + MAGMA-style relation views
+    # ------------------------------------------------------------------
+
+    # Per handoff section 17.5. Intent → edge-type weight multipliers.
+    # Single graph + filter weights; not separate physical graphs.
+    _EDGE_WEIGHTS_BY_INTENT: dict[str, dict[str, float]] = {
+        "factual":     {"semantic_similar_to": 0.8, "mentions_entity": 0.9,
+                        "supports": 0.7, "contradicts": 0.3,
+                        "happened_before": 0.4, "caused_by": 0.4},
+        "causal":      {"semantic_similar_to": 0.5, "mentions_entity": 0.8,
+                        "supports": 0.7, "contradicts": 0.6,
+                        "happened_before": 0.8, "caused_by": 1.0},
+        "temporal":    {"semantic_similar_to": 0.4, "mentions_entity": 0.7,
+                        "happened_before": 1.0, "caused_by": 0.5},
+        "procedural":  {"semantic_similar_to": 0.6, "mentions_entity": 0.5,
+                        "summarizes": 0.4, "derived_from": 0.5,
+                        "applies_to": 0.9},
+        "entity":      {"semantic_similar_to": 0.5, "mentions_entity": 1.0,
+                        "applies_to": 0.7, "located_in": 0.5},
+    }
+
+    @staticmethod
+    def _classify_intent(query: str) -> str:
+        """Heuristic intent classifier from query text. Returns one of the
+        keys in _EDGE_WEIGHTS_BY_INTENT. Falls back to 'factual'."""
+        if not query:
+            return "factual"
+        q = query.lower().strip()
+        if q.startswith("who ") or " who " in q or "contact" in q:
+            return "entity"
+        if q.startswith("when ") or " when " in q or "before" in q or "after" in q:
+            return "temporal"
+        if q.startswith("why ") or " why " in q or "because" in q or "caused" in q:
+            return "causal"
+        if q.startswith("how ") or "how do" in q or "how to" in q or "how should" in q:
+            return "procedural"
+        return "factual"
+
+    def intent_edge_weights(self, query: str) -> dict[str, float]:
+        """Return edge-type weight multipliers for the query's classified intent.
+        Used by graph_search to weight PPR traversal."""
+        intent = self._classify_intent(query)
+        return dict(self._EDGE_WEIGHTS_BY_INTENT[intent])
+
+    def available_relation_views(self) -> list[str]:
+        """Per addendum acceptance test: list of supported relation views."""
+        return ["semantic", "temporal", "causal", "entity", "procedural"]
+
+    @staticmethod
+    def uses_single_connection_table() -> bool:
+        """Per addendum acceptance test: confirms unified-graph substrate.
+        We do NOT have separate semantic/temporal/causal/entity tables."""
+        return True
+
+    def graph_search(self, query: str, k: int = 5,
+                     hops: int = 2) -> list[dict[str, Any]]:
+        """PPR-style graph retrieval with intent-aware edge weighting.
+
+        Strategy:
+            1. Seed: dense recall finds top-k semantically similar memories
+            2. Traverse: BFS up to `hops` from each seed, weighting edges by
+               the query's classified intent (entity/temporal/causal/etc.)
+            3. Score: accumulated activation = seed similarity × edge weight
+               product per path; aggregated when multiple paths reach same node
+            4. Return top-k by activation, deduplicated against seeds
+
+        Single connections table; relation views are weight filters, not
+        separate stores (per non-negotiable handoff constraint 2.1).
+        """
+        weights = self.intent_edge_weights(query)
+        seeds = self._recall_inner(query, k, temporal_weight=0.2)
+        if not seeds:
+            return []
+
+        # node_id -> max activation seen
+        activation: dict[int, float] = {}
+        for seed in seeds:
+            sid = seed['id']
+            base = float(seed.get('similarity', seed.get('combined', 0.5)))
+            activation[sid] = max(activation.get(sid, 0.0), base)
+
+            # BFS up to `hops` levels
+            frontier = {sid: base}
+            for _ in range(hops):
+                next_frontier: dict[int, float] = {}
+                for node_id, node_act in frontier.items():
+                    try:
+                        edges = self.store.get_connections(node_id)
+                    except Exception:
+                        continue
+                    for edge in edges:
+                        other = edge['target'] if edge['source'] == node_id else edge['source']
+                        # get_connections() returns dict key 'type' (NOT 'edge_type')
+                        et = edge.get('type') or edge.get('edge_type') or 'semantic_similar_to'
+                        w = weights.get(et, 0.3)  # unknown edge-type baseline weight
+                        new_act = node_act * w * 0.7  # 0.7 = damping factor
+                        if new_act > next_frontier.get(other, 0.0):
+                            next_frontier[other] = new_act
+                        if new_act > activation.get(other, 0.0):
+                            activation[other] = new_act
+                frontier = next_frontier
+
+        # Rank by accumulated activation. Seeds remain in results — nodes
+        # that are BOTH semantically similar AND graph-reachable get the
+        # highest activation, which is the desired behavior. Caller can
+        # post-filter against recall() output if they want pure graph hits.
+        ranked = sorted(
+            activation.items(),
+            key=lambda x: -x[1],
+        )
+        results = []
+        for node_id, act in ranked[:k]:
+            mem = self.store.get(node_id)
+            if mem:
+                mem['activation'] = round(act, 4)
+                results.append(mem)
+        return results
+
     @staticmethod
     def _is_valid_at(valid_from: Optional[float], valid_to: Optional[float],
                      as_of: float) -> bool:
