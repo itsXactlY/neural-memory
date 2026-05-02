@@ -76,20 +76,24 @@ class RecallAccessLogger:
             pass
 
     def _maybe_rotate(self) -> None:
-        """Rotate log if it exceeds size threshold."""
+        """Rotate log if it exceeds size threshold.
+
+        Reviewer B1 fix 2026-05-02: size-check now inside lock so
+        concurrent rotation can't split-write across files.
+        """
         try:
-            if not self.path.exists():
-                return
-            size = self.path.stat().st_size
-            if size < self.rotate_at:
-                return
-            # Find next available rotation slot
-            for n in range(1, 1000):
-                rotated = self.path.with_suffix(f".jsonl.{n}")
-                if not rotated.exists():
-                    with self._lock:
+            with self._lock:
+                if not self.path.exists():
+                    return
+                size = self.path.stat().st_size
+                if size < self.rotate_at:
+                    return
+                # Find next available rotation slot
+                for n in range(1, 1000):
+                    rotated = self.path.with_suffix(f".jsonl.{n}")
+                    if not rotated.exists():
                         self.path.rename(rotated)
-                    break
+                        break
         except Exception:
             pass
 

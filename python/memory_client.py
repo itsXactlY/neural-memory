@@ -1639,6 +1639,10 @@ class NeuralMemory:
                      rerank: Optional[bool] = None,
                      mmr_lambda: float = 0.0,
                      percentile_floor: float = 0.0) -> list[dict[str, Any]]:
+        # Reviewer B7 fix 2026-05-02: e2e latency timer. Was previously
+        # placed at the result-materialize step, missing scoring+MMR+
+        # percentile work. AccessLogger now sees true end-to-end ms.
+        _hybrid_recall_t0 = time.time()
         """Multi-channel hybrid retrieval. Borrowed Hindsight's pool-union
         shape (dense + sparse + graph + temporal candidates) but applied
         the salience-weighted continuous scoring law instead of pure RRF.
@@ -1991,7 +1995,8 @@ class NeuralMemory:
         # Mazemaker-inspired Pattern D (2026-05-02): access logger captures
         # every recall event as JSONL for future tuning + labeling-signal
         # mining. Best-effort, never blocks retrieval. Disable via env.
-        _hybrid_recall_t0 = time.time()
+        # Note: _hybrid_recall_t0 set at function entry for true e2e ms
+        # (reviewer B7 fix 2026-05-02).
         results: list[dict[str, Any]] = []
         for cid, final_score, _m, features in scored[:k]:
             row = self.store.get(cid)

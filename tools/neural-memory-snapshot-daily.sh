@@ -33,21 +33,31 @@ mkdir -p "$DEST" "$LOGS"
 echo "$(date -Iseconds)  snapshot-daily start  dest=$DEST" >> "$LOG_FILE"
 
 # 1. memory.db — gzip during copy. Skip if today's snapshot already done.
+# Caught 2026-05-02 reviewer (B4): disk-full mid-gzip leaves a partial
+# memory.db.gz; subsequent runs see the file exists and skip → corruption
+# persists. Fix: write to .tmp then atomic mv only on success.
 if [[ -f "$DEST/memory.db.gz" ]]; then
     echo "$(date -Iseconds)  memory.db.gz already exists, skipping" >> "$LOG_FILE"
 else
     if [[ -f "$NM_HOME/memory.db" ]]; then
         SIZE_RAW=$(stat -f%z "$NM_HOME/memory.db" 2>/dev/null || echo "0")
-        gzip -c "$NM_HOME/memory.db" > "$DEST/memory.db.gz"
-        SIZE_GZ=$(stat -f%z "$DEST/memory.db.gz" 2>/dev/null || echo "0")
-        echo "$(date -Iseconds)  memory.db: ${SIZE_RAW}B → ${SIZE_GZ}B (gzipped)" >> "$LOG_FILE"
+        TMP_GZ="$DEST/memory.db.gz.tmp.$$"
+        if gzip -c "$NM_HOME/memory.db" > "$TMP_GZ"; then
+            mv "$TMP_GZ" "$DEST/memory.db.gz"
+            SIZE_GZ=$(stat -f%z "$DEST/memory.db.gz" 2>/dev/null || echo "0")
+            echo "$(date -Iseconds)  memory.db: ${SIZE_RAW}B → ${SIZE_GZ}B (gzipped)" >> "$LOG_FILE"
+        else
+            rm -f "$TMP_GZ" 2>/dev/null || true
+            echo "$(date -Iseconds)  ERROR: gzip failed (likely disk-full); partial file removed" >> "$LOG_FILE"
+        fi
     else
         echo "$(date -Iseconds)  WARN: $NM_HOME/memory.db not found" >> "$LOG_FILE"
     fi
 fi
 
-# 2. bench-history — small, just copy (preserves trajectory log)
-if [[ -d "$NM_HOME/bench-history" ]]; then
+# 2. bench-history — small, just copy. Skip if dest already exists to
+# avoid the bench-history/bench-history/ nesting bug (reviewer B3).
+if [[ -d "$NM_HOME/bench-history" && ! -d "$DEST/bench-history" ]]; then
     cp -R "$NM_HOME/bench-history" "$DEST/bench-history"
 fi
 
