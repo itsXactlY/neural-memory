@@ -220,7 +220,10 @@ Items:
 ${ESCALATIONS}
 
 Read full synth context at: ${NEW_STATE}
-Or quick view: ${PREV_STATE}"
+Or quick view: ${PREV_STATE}
+
+A codex-resolver subagent is being auto-dispatched in the background to
+propose a fix patch for these items (separate bridge FYI when ready)."
         node "$BRIDGE_CLI" send \
             --from "$ORCH_AGENT" \
             --to "$CALLER_AGENT" \
@@ -228,6 +231,20 @@ Or quick view: ${PREV_STATE}"
             --body "$ESC_BODY" \
             --urgency high \
             2>/dev/null || true
+
+        # Auto-dispatch codex-resolver to propose fix patches for the escalation.
+        # Per Tito 2026-05-02: "compound usefulness" — orchestrator finds problems,
+        # resolver proposes fixes, builder applies. Closing the escalation loop.
+        # Resolver is itself a codex gpt-5.5 call (~30-60s); fire-and-forget so
+        # synth doesn't block the daemon's poll cadence.
+        RESOLVER="${REPO}/tools/codex_resolve.sh"
+        if [ -x "$RESOLVER" ]; then
+            ESC_TOPIC="orchestrator-esc-$(date +%H%M%S)"
+            NM_LANE="$LANE" "$RESOLVER" "$ESC_TOPIC" "$ESCALATIONS" \
+                >> "${HOME}/.neural_memory/logs/codex-resolver-${LANE}.log" 2>&1 &
+            log_resolver_pid=$!
+            echo "  [orchestrator] dispatched codex-resolver (pid=$log_resolver_pid) for $ESCALATION_COUNT esc items" >&2
+        fi
     fi
 fi
 
