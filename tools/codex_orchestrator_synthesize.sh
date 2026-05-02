@@ -178,6 +178,15 @@ if [ -n "$ESC_LINE" ]; then
         | sed '/^---$/,$d' \
         | sed '/^\*\*Exit/,$d' \
         | head -c 4000)
+    # Detect prompt-echo: if the extracted text contains literal prompt
+    # phrases ("List ONLY items", "Criteria for escalation", etc.), codex
+    # didn't produce a real synthesis (likely transport error/auth refresh).
+    # Treat as no escalations rather than fire false-positive HIGH-urgency.
+    # Bug caught by builder review 2026-05-02 — repeated false escalations
+    # from codex transport errors echoing prompt criteria.
+    if echo "$ESCALATIONS" | grep -qE 'List ONLY items|Criteria for escalation|If NOTHING meets the criteria|Be terse\. Be evidence-grounded'; then
+        ESCALATIONS=""
+    fi
 else
     ESCALATIONS=""
 fi
