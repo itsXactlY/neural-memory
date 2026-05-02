@@ -182,6 +182,23 @@ def proc_section() -> str:
     return "\n".join(interesting[:8]) if interesting else "  (none of interest running)"
 
 
+def scoring_weights_section() -> str:
+    """Surface DEFAULT_WEIGHTS so operators can see channel balance."""
+    try:
+        sys.path.insert(0, str(_ROOT / "python"))
+        from scoring import DEFAULT_WEIGHTS
+        lines = ["  channel       weight"]
+        for ch in ("semantic", "sparse", "graph", "temporal",
+                   "entity", "procedural", "locus", "rrf"):
+            w = DEFAULT_WEIGHTS.get(ch, 0.0)
+            lines.append(f"  {ch:13s} {w:.2f}")
+        total = sum(DEFAULT_WEIGHTS.values())
+        lines.append(f"  {'TOTAL':13s} {total:.2f}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"  (could not load DEFAULT_WEIGHTS: {e})"
+
+
 def phase7_5_wiring_section() -> str:
     """One-glance Phase 7.5 wiring scoreboard."""
     if not _NM_DB.exists():
@@ -269,6 +286,8 @@ def main() -> int:
     print(repo_section())
     print(_section("Live DB"))
     print(db_section())
+    print(_section("Scoring weights (DEFAULT_WEIGHTS)"))
+    print(scoring_weights_section())
     print(_section("Phase 7.5 wiring"))
     print(phase7_5_wiring_section())
     print(_section("Ingest sources"))
