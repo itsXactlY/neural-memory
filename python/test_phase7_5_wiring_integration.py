@@ -240,6 +240,56 @@ class ScoringFormulaWiringTests(unittest.TestCase):
             self.assertFalse(NeuralMemory._should_skip_rerank(q),
                              f"should NOT skip: {q!r}")
 
+    def test_es_disable_env_preserves_legacy_skip_behavior(self) -> None:
+        # NM_RERANK_ES_DISABLE=1 must restore pre-multilingual skip-rerank
+        # floor for non-ASCII queries (the escape hatch documented in
+        # memory_client.py around _rerank_es_disabled). Verifies the env-var
+        # is read at construction and the disabled flag is set correctly.
+        import os
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+        prior = os.environ.get("NM_RERANK_ES_DISABLE")
+        os.environ["NM_RERANK_ES_DISABLE"] = "1"
+        try:
+            from memory_client import NeuralMemory
+            mem = NeuralMemory(db_path="/tmp/test-es-disable.db",
+                               use_cpp=False, use_hnsw=False)
+            try:
+                self.assertTrue(mem._rerank_es_disabled)
+                self.assertIsNone(mem._rerank_model_es)  # never loaded
+            finally:
+                mem.close()
+        finally:
+            if prior is None:
+                os.environ.pop("NM_RERANK_ES_DISABLE", None)
+            else:
+                os.environ["NM_RERANK_ES_DISABLE"] = prior
+
+    def test_es_path_default_enabled_with_separate_model_name(self) -> None:
+        # Without env var, ES path is enabled and uses the configured
+        # multilingual model name. Documents that English queries with
+        # accented names (e.g., "Did José call yesterday?") will route to
+        # the multilingual model rather than skip rerank — intentional
+        # per per-commit reviewer 77e350b finding.
+        import os
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+        os.environ.pop("NM_RERANK_ES_DISABLE", None)
+        from memory_client import NeuralMemory
+        mem = NeuralMemory(db_path="/tmp/test-es-default.db",
+                           use_cpp=False, use_hnsw=False)
+        try:
+            self.assertFalse(mem._rerank_es_disabled)
+            self.assertNotEqual(mem._rerank_model_name,
+                                mem._rerank_model_es_name)
+            self.assertIn("mmarco", mem._rerank_model_es_name.lower())
+        finally:
+            mem.close()
+
     def test_extreme_values_produce_finite_score(self) -> None:
         # Per round-4 reviewer: the formula has no clamp. Verify all
         # CandidateFeatures fields at extreme values still produce a
