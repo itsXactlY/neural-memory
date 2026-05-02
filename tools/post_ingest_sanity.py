@@ -128,6 +128,16 @@ _CONTRACTS = [
      "self image insight",
      "_dream_insight_path",
      None),
+    # Phase 7.5 latency regression guard: hybrid_recall p50 over 5
+    # canonical-query trials must stay under 2s. Threshold is well
+    # above the 468ms pre-wiring baseline AND well below the 5,441ms
+    # hazard signal from a contention-heavy 5-rec post-wiring bench
+    # on 2026-05-01. Catches both wiring-overhead drift and substrate-
+    # growth scaling regressions.
+    ("perf — hybrid_recall p50 < 2s on canonical query",
+     "Phase 7 unified-graph donor-organ architecture",
+     "_hybrid_recall_p50_perf",
+     None),
 ]
 
 
@@ -224,6 +234,29 @@ def main() -> int:
                             "label": "sanity_check"}]
             except Exception as e:
                 print(f"        dream_insight path raised: {e}")
+                results = []
+        elif channel == "_hybrid_recall_p50_perf":
+            # Phase 7.5 perf regression guard: 5-trial hybrid_recall p50
+            # must stay under 2,000ms. Catches wiring-overhead drift +
+            # substrate-growth regressions. The 2s threshold is 4× the
+            # 468ms pre-wiring baseline (very generous headroom) and
+            # well below the 5,441ms hazard signal observed when
+            # benches contend.
+            import time as _time
+            durations_ms = []
+            for _ in range(5):
+                t0 = _time.perf_counter()
+                _ = mem.hybrid_recall(query, k=10)
+                durations_ms.append((_time.perf_counter() - t0) * 1000.0)
+            durations_ms.sort()
+            p50 = durations_ms[len(durations_ms) // 2]
+            threshold_ms = 2000.0
+            if p50 < threshold_ms:
+                results = [{"id": -3,
+                            "content": f"p50={p50:.0f}ms (under {threshold_ms:.0f}ms)",
+                            "label": "sanity_check"}]
+            else:
+                print(f"        p50={p50:.0f}ms exceeds {threshold_ms:.0f}ms threshold")
                 results = []
         else:
             results = mem.recall(query, k=args.k)
