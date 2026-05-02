@@ -387,6 +387,33 @@ def main() -> int:
     sources = _gather_sources()
     print(f"Gathered {len(sources)} canonical source files", file=sys.stderr)
 
+    # Round-5 archaeologist B7 fix 2026-05-02: file-level dedup. Tito's
+    # OneDrive has multiple physical copies of same files (Old + Misc,
+    # _SOPs/, Combined_Base/, etc.). Same content → same chunks → same
+    # content_hashes — but they all ingest because we walk each path
+    # separately. Pre-walk pass: drop sources whose file-content-hash
+    # matches one already seen. First path wins.
+    seen_file_hashes: set[str] = set()
+    deduped: list[dict] = []
+    file_dupes_skipped = 0
+    for src in sources:
+        path: Path = src["path"]
+        try:
+            file_text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            deduped.append(src)
+            continue
+        file_hash = hashlib.sha256(file_text.encode("utf-8")).hexdigest()[:16]
+        if file_hash in seen_file_hashes:
+            file_dupes_skipped += 1
+            continue
+        seen_file_hashes.add(file_hash)
+        deduped.append(src)
+    if file_dupes_skipped > 0:
+        print(f"Skipped {file_dupes_skipped} duplicate-content source files (file-level dedup)",
+              file=sys.stderr)
+    sources = deduped
+
     # Pre-scan: count chunks
     total_chunks = 0
     skipped_oversize = 0
