@@ -24,7 +24,12 @@ set -uo pipefail
 REPO_DIR="/Users/tito/lWORKSPACEl/research/neural-memory"
 FINDINGS_DIR="${HOME}/.neural_memory/reconciliation-reviews"
 LOG_FILE="${HOME}/.neural_memory/logs/reconciliation-reviewer.log"
-CLAUDE_BIN="/Users/tito/.local/bin/claude"
+# Migrated 2026-05-02 from claude-sonnet-4-6 to codex gpt-5.5 per Tito directive
+# (everything migrates to codex unless required to be anthropic). Reconciliation
+# benefits from gpt-5.5's deeper reasoning since it cross-references claims
+# against current state — that's the "audit" type per our model-selection policy.
+CODEX_BIN="/Applications/Codex.app/Contents/Resources/codex"
+MODEL="${RECONCILIATION_MODEL:-gpt-5.5}"
 
 mkdir -p "$FINDINGS_DIR" "$(dirname "$LOG_FILE")"
 
@@ -156,14 +161,26 @@ Save full report to ${OUT}."
         ;;
 esac
 
-echo "[$(date)] type=${SAMPLE_TYPE} dispatching reconciliation review → ${OUT}" >> "$LOG_FILE"
-"$CLAUDE_BIN" -p \
-    --model claude-sonnet-4-6 \
-    "$PROMPT" \
-    > "${OUT}.transcript" 2>> "$LOG_FILE" \
+# Strip the now-stale "Save your full report to $OUT" instruction since codex
+# captures stdout to OUT directly. Codex sandbox is read-only — no file writes.
+PROMPT_NOFILE=$(echo "$PROMPT" | sed 's|Save full report to.*$|Output your report as markdown to stdout. Be terse, evidence-grounded, no manufactured findings.|; s|Save your full report to.*$|Output your report as markdown to stdout. Be terse, evidence-grounded, no manufactured findings.|')
+
+echo "[$(date)] type=${SAMPLE_TYPE} dispatching codex ${MODEL} reconciliation review → ${OUT}" >> "$LOG_FILE"
+{
+    echo "# Reconciliation review (type=${SAMPLE_TYPE})"
+    echo "**Reviewer:** codex ${MODEL}"
+    echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo ""
+} > "$OUT"
+"$CODEX_BIN" exec \
+    --model "$MODEL" \
+    --sandbox read-only \
+    --cd "$REPO_DIR" \
+    "$PROMPT_NOFILE" \
+    >> "$OUT" 2>> "$LOG_FILE" \
     || echo "[$(date)] WARN: reconciliation review exited non-zero" >> "$LOG_FILE"
 
-if [ -f "$OUT" ]; then
+if [ -s "$OUT" ]; then
     echo "[$(date)] reconciliation review landed at ${OUT}" >> "$LOG_FILE"
 fi
 
