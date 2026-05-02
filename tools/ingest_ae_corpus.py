@@ -153,6 +153,83 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _chunk_hd_catalog(path: Path) -> list[dict]:
+    """Per-SKU chunking for HD price catalog JSON.
+
+    Per round-5 archaeologist B6: JSON catalog was being ingested as
+    ONE 20KB row, not retrievable as discrete SKUs. Walk items[] and
+    emit one memory per SKU + one summary memory.
+
+    Returns chunk dicts shaped like _chunk_markdown output.
+    """
+    chunks: list[dict] = []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception as e:
+        print(f"  skip hd_price_catalog: {e}", file=sys.stderr)
+        return []
+    mtime = path.stat().st_mtime
+
+    # Summary chunk (yearly spend, top job tags)
+    summary = data.get("summary", {})
+    summary_body_lines = [
+        f"HD Pro 7-year purchase summary (Tito's Home Depot account):",
+        f"  Total line items: {summary.get('total_line_items', '?')}",
+        f"  Unique SKUs: {summary.get('unique_skus', '?')}",
+        f"  Total spend seen: ${summary.get('total_spend_seen', '?')}",
+    ]
+    yearly = summary.get("yearly_spend", {})
+    if yearly:
+        summary_body_lines.append("  Yearly spend:")
+        for year, spend in sorted(yearly.items()):
+            summary_body_lines.append(f"    {year}: ${spend}")
+    top_tags = summary.get("top_job_name_tags", {})
+    if top_tags:
+        summary_body_lines.append(f"  Top job-name tags: "
+                                   f"{', '.join(list(top_tags.keys())[:10])}")
+    summary_body = "\n".join(summary_body_lines)
+    chunks.append({
+        "path": path,
+        "source_label": "hd_price_catalog",
+        "default_kind": "world",
+        "origin_system": "ae",
+        "heading": "HD Pro purchase summary",
+        "body": summary_body,
+        "content_hash": _content_hash(summary_body),
+        "mtime": mtime,
+    })
+
+    # One memory per SKU
+    for item in data.get("items", []):
+        sku = item.get("hd_sku", "?")
+        desc = item.get("description", "")
+        cls = item.get("class", "?")
+        subcl = item.get("subclass", "?")
+        first = item.get("first_purchased", "?")
+        body = (
+            f"HD SKU {sku}: {desc}\n"
+            f"  Department: {item.get('department', 'ELECTRICAL')}\n"
+            f"  Class: {cls}\n"
+            f"  Subclass: {subcl}\n"
+            f"  First purchased: {first}\n"
+            f"  Internet SKU: {item.get('internet_sku', '?')}"
+        )
+        # Skip if description is empty (defensive)
+        if not desc:
+            continue
+        chunks.append({
+            "path": path,
+            "source_label": "hd_price_catalog",
+            "default_kind": "world",
+            "origin_system": "ae",
+            "heading": f"HD SKU {sku}: {desc[:60]}",
+            "body": body,
+            "content_hash": _content_hash(body),
+            "mtime": mtime,
+        })
+    return chunks
+
+
 def _kind_for_memory_file(name: str) -> str:
     for prefix, kind in _MEMORY_PREFIX_TO_KIND.items():
         if name.startswith(prefix):
@@ -420,6 +497,15 @@ def main() -> int:
     chunk_inventory: list[dict] = []
     for src in sources:
         path: Path = src["path"]
+        # Round-5 archaeologist B6 fix 2026-05-02: HD price catalog
+        # was landing as ONE 20KB row instead of one-per-SKU. Special-
+        # case its JSON structure: walk items[] + emit per-SKU memories.
+        if src["source_label"] == "hd_price_catalog":
+            for chunk in _chunk_hd_catalog(path):
+                chunk_inventory.append(chunk)
+                total_chunks += 1
+            continue
+
         try:
             size = path.stat().st_size
         except FileNotFoundError:
