@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ae.neural-watcher-health-aor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/tito/lWORKSPACEl/research/neural-memory/tools/codex_always_on_runner.sh</string>
+    </array>
+
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tito/.neural_memory/logs/aor-watcher-health.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tito/.neural_memory/logs/aor-watcher-health.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Applications/Codex.app/Contents/Resources</string>
+        <key>HOME</key>
+        <string>/Users/tito</string>
+        <key>NM_LANE</key>
+        <string>cron</string>
+        <key>AOR_NAME</key>
+        <string>watcher-health</string>
+        <key>AOR_SCRIPT</key>
+        <string>tools/watcher_health_check.sh</string>
+        <!-- Free bash; cheap to fire often. 60s poll, 5min min, 15min max -->
+        <key>AOR_POLL</key>
+        <string>60</string>
+        <key>AOR_MIN_INTERVAL</key>
+        <string>300</string>
+        <key>AOR_MAX_INTERVAL</key>
+        <string>900</string>
+    </dict>
+</dict>
+</plist>
