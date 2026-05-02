@@ -106,7 +106,9 @@ def _mrr(retrieved_ids: list[int], gt_ids: list[int]) -> float:
 
 
 def run_scored(mem, queries: list[dict], k: int = 10,
-              rerank: bool = False) -> dict:
+              rerank: bool = False,
+              mmr_lambda: float = 0.0,
+              percentile_floor: float = 0.0) -> dict:
     """Run scored mode against ground_truth_ids. Reports per-category metrics
     + global metrics + threshold pass/fail.
 
@@ -126,7 +128,11 @@ def run_scored(mem, queries: list[dict], k: int = 10,
     for q in queries:
         if not q["ground_truth_ids"]:
             continue
-        retrieved = mem.hybrid_recall(q["query"], k=k, rerank=rerank)
+        retrieved = mem.hybrid_recall(
+            q["query"], k=k, rerank=rerank,
+            mmr_lambda=mmr_lambda,
+            percentile_floor=percentile_floor,
+        )
         rids = [r["id"] for r in retrieved]
         by_cat[q["category"]].append({
             "id": q["id"],
@@ -183,6 +189,12 @@ def main() -> int:
     parser.add_argument("--rerank", action="store_true",
                         help="Enable cross-encoder rerank in scored mode "
                              "(per the path-to-0.92 docstring)")
+    parser.add_argument("--mmr-lambda", type=float, default=0.0,
+                        help="MMR diversity lambda (0=relevance, "
+                             "1=novelty); sweet spot 0.5-0.7")
+    parser.add_argument("--percentile-floor", type=float, default=0.0,
+                        help="Drop bottom (1-floor) fraction by rank "
+                             "(0=no-op; 0.1=keep top 90%%)")
     parser.add_argument("--out", default=None,
                         help="JSON output path; stdout if omitted")
     args = parser.parse_args()
@@ -202,7 +214,9 @@ def main() -> int:
             result = run_diagnostic(mem, queries, k=args.k)
         else:
             result = run_scored(mem, queries, k=args.k,
-                                rerank=args.rerank)
+                                rerank=args.rerank,
+                                mmr_lambda=args.mmr_lambda,
+                                percentile_floor=args.percentile_floor)
     finally:
         try:
             mem.close()
