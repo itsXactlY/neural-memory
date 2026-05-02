@@ -1084,12 +1084,27 @@ class NeuralMemory:
         for _ in range(hops):
             if not global_frontier:
                 break
+            # Reviewer-round-7 fix 2026-05-02: degrade gracefully if batched
+            # call fails. Without fallback, a single DB error nukes the
+            # whole BFS level → silent termination with partial results.
+            # Old per-node try/except let the BFS continue with one less
+            # node; preserve that behavior.
             try:
                 edges_by_node = self.store.get_connections_batch(
                     list(global_frontier.keys())
                 )
-            except Exception:
+            except Exception as batch_exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "get_connections_batch failed; falling back to per-node: %s",
+                    batch_exc,
+                )
                 edges_by_node = {}
+                for nid in global_frontier:
+                    try:
+                        edges_by_node[nid] = self.store.get_connections(nid)
+                    except Exception:
+                        edges_by_node[nid] = []  # skip this node only
             next_frontier: dict[int, float] = {}
             for node_id, node_act in global_frontier.items():
                 for edge in edges_by_node.get(node_id, []):
