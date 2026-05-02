@@ -1651,7 +1651,7 @@ class NeuralMemory:
                      *,
                      as_of: Optional[float] = None,
                      kind: Optional[str] = None,
-                     hops: int = 2,
+                     hops: int = 1,
                      pool_per_channel: int = 25,
                      rerank: Optional[bool] = None,
                      mmr_lambda: float = 0.0,
