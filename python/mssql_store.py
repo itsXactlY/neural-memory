@@ -45,14 +45,12 @@ _dotenv = _load_dotenv([
 def _env(key: str, fallback: str = "") -> str:
     return os.environ.get(key) or _dotenv.get(key, fallback)
 
+# Reconciliation-reviewer-round-1 fix 2026-05-02: removed dead
+# CREATE DATABASE + USE blocks. _ensure_schema explicitly skips
+# both via the `'GO' not in stmt and 'CREATE DATABASE' not in stmt`
+# guard, so they were never executed. Database creation is the
+# operator's responsibility (DBA-side + connection-string setup).
 SCHEMA_SQL = """
-IF NOT EXISTS (SELECT * FROM sys.databases WHERE name = 'NeuralMemory')
-    CREATE DATABASE NeuralMemory;
-GO
-
-USE NeuralMemory;
-GO
-
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'memories')
 CREATE TABLE memories (
     id BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -128,15 +126,18 @@ class MSSQLStore:
         try:
             cursor.execute("SELECT COUNT(*) FROM memories")
         except Exception:
-            # Table doesn't exist, create it
+            # Reconciliation-reviewer-round-1 fix 2026-05-02: simplified
+            # the dead-code filters. CREATE DATABASE + GO blocks now
+            # absent from SCHEMA_SQL itself; just split + execute.
             for stmt in SCHEMA_SQL.split(';'):
                 stmt = stmt.strip()
-                if stmt and 'GO' not in stmt and 'CREATE DATABASE' not in stmt:
+                if stmt:
                     try:
                         cursor.execute(stmt)
-                    except Exception as e:
+                    except Exception:
                         pass  # Ignore if already exists
-            self.conn.commit()
+            # autocommit=True at connection (line 121) — explicit commit
+            # is a no-op but kept for readability.
     
     def store(self, label: str, content: str, embedding: list[float]) -> int:
         blob = struct.pack(f'{len(embedding)}f', *embedding)
@@ -149,9 +150,14 @@ class MSSQLStore:
         self.conn.commit()
         return row[0] if row else 0
     
-    def get_all(self) -> list[dict]:
+    def get_all(self, limit: int = 100_000) -> list[dict]:
+        # Reconciliation-reviewer-round-1 fix 2026-05-02: bounded by
+        # default to prevent loading entire memories table into RAM
+        # for big substrates. SQLiteStore.get_all has the same shape
+        # without explicit limit because it's row-iterator-based;
+        # MSSQL fetchall() loads all into memory so the cap matters.
         cursor = self.conn.cursor()
-        cursor.execute("SELECT id, label, content, embedding, vector_dim, salience, access_count FROM memories ORDER BY id")
+        cursor.execute(f"SELECT TOP {int(limit)} id, label, content, embedding, vector_dim, salience, access_count FROM memories ORDER BY id")
         results = []
         for row in cursor.fetchall():
             id_, label, content, blob, dim, salience, access = row
