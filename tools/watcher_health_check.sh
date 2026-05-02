@@ -217,6 +217,19 @@ if [ -f "$DB_PATH" ]; then
     HEALTHY+=("substrate count=${CUR} delta=${DELTA}")
 fi
 
+# 7. NM-builder LIVE_FEED tracking (per codex-prescriptive-redesigner Day 1).
+# Cross-lane synthesizer reads this file; if it goes stale (no NM ship in 6h)
+# the synthesizer's NM-lane inferences will be increasingly out-of-date.
+LIVE_FEED="/Users/tito/nm_builder_LIVE_FEED.md"
+A=$(mtime_age "$LIVE_FEED")
+if [ "$A" -lt 0 ]; then
+    ISSUES+=("CRITICAL: nm_builder_LIVE_FEED.md missing — cross-lane synth has no NM truth")
+elif [ "$A" -gt 21600 ]; then
+    ISSUES+=("STALE: nm_builder_LIVE_FEED.md last refreshed ${A}s ago (>6h)")
+else
+    HEALTHY+=("nm_builder_LIVE_FEED.md (${A}s ago)")
+fi
+
 # Report
 {
     echo "[${NOW_HUMAN}] watcher-health check"
