@@ -1752,7 +1752,7 @@ class NeuralMemory:
                 confidence=float(m.get("confidence", 1.0)),
             )
             final = score_candidate(features, DEFAULT_WEIGHTS)
-            scored.append((cid, final, m))
+            scored.append((cid, final, m, features))
 
         scored.sort(key=lambda x: -x[1])
 
@@ -1761,7 +1761,7 @@ class NeuralMemory:
         if use_rerank and len(scored) > 0:
             top_n = min(50, len(scored))
             top_candidates = []
-            for cid, _final, _m in scored[:top_n]:
+            for cid, _final, _m, _f in scored[:top_n]:
                 row = self.store.get(cid)
                 if row:
                     row["_combined"] = _final
@@ -1776,13 +1776,32 @@ class NeuralMemory:
                 scored = [id_to_meta[i] for i in ordered_ids if i in id_to_meta]
 
         # ---- Materialize top-k full memory rows ------------------------
+        # Mazemaker-inspired (2026-05-01): activation trace as first-class
+        # field. Each result now carries a `_trace` dict with the per-channel
+        # contribution that produced its rank. Lets downstream UIs explain
+        # "why did this rank?" without re-querying. See reference_mazemaker_
+        # digest_2026-05-01.md for the pattern.
         results: list[dict[str, Any]] = []
-        for cid, final_score, _m in scored[:k]:
+        for cid, final_score, _m, features in scored[:k]:
             row = self.store.get(cid)
             if row:
                 row["combined"] = round(final_score, 4)
                 row["channels"] = [ch for ch in per_channel_ranks
                                     if cid in per_channel_ranks[ch]]
+                row["_trace"] = {
+                    "semantic":              round(features.semantic_score, 4),
+                    "sparse":                round(features.sparse_score, 4),
+                    "graph":                 round(features.graph_score, 4),
+                    "temporal":              round(features.temporal_score, 4),
+                    "entity":                round(features.entity_score, 4),
+                    "procedural":            round(features.procedural_score, 4),
+                    "locus":                 round(features.locus_score, 4),
+                    "rrf_feature":           round(features.rrf_feature, 4),
+                    "salience":              round(features.salience, 4),
+                    "confidence":            round(features.confidence, 4),
+                    "stale_penalty":         round(features.stale_penalty, 4),
+                    "contradiction_penalty": round(features.contradiction_penalty, 4),
+                }
                 results.append(row)
         return results
 

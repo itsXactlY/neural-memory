@@ -164,6 +164,50 @@ class ScoringFormulaWiringTests(unittest.TestCase):
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
+    def test_activation_trace_present_in_recall_results(self) -> None:
+        # Mazemaker-inspired: hybrid_recall results must carry _trace field
+        # with per-channel contributions. Critical for downstream "why did
+        # this rank?" explainability.
+        import sys
+        import tempfile
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from memory_client import NeuralMemory
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            mem = NeuralMemory(
+                db_path=tmp.name,
+                embedding_backend="auto",
+                use_cpp=False,
+                use_hnsw=False,
+            )
+            mem.remember("Test memory for activation trace", kind="experience")
+            results = mem.hybrid_recall("test memory", k=3)
+            self.assertGreater(len(results), 0,
+                               "should return at least one result")
+            r = results[0]
+            self.assertIn("_trace", r,
+                          "result must carry _trace field")
+            trace = r["_trace"]
+            # All 12 fields must be present
+            expected_fields = {
+                "semantic", "sparse", "graph", "temporal",
+                "entity", "procedural", "locus",
+                "rrf_feature", "salience", "confidence",
+                "stale_penalty", "contradiction_penalty",
+            }
+            self.assertEqual(set(trace.keys()), expected_fields,
+                             f"trace fields differ: got {set(trace.keys())}")
+            for field, value in trace.items():
+                self.assertIsInstance(value, (int, float),
+                                      f"trace.{field} should be numeric, "
+                                      f"got {type(value)}")
+            mem.close()
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+
     def test_extreme_values_produce_finite_score(self) -> None:
         # Per round-4 reviewer: the formula has no clamp. Verify all
         # CandidateFeatures fields at extreme values still produce a
