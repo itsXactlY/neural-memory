@@ -846,6 +846,26 @@ class DreamEngine:
             # iter_connections() — fetchall() previously pulled all 7.7M
             # active edges into a 6.7GB Python heap before any work began.
             updates: List[Tuple[int, int, float, float, str]] = []
+            try:
+                update_batch_size = int(os.environ.get("NM_NREM_UPDATE_BATCH", "50000"))
+            except ValueError:
+                update_batch_size = 50000
+            update_batch_size = max(1, update_batch_size)
+            can_batch_updates = hasattr(self._backend, "apply_connection_changes")
+
+            def flush_updates(*, prune_threshold: float = 0.0) -> int:
+                # In-flight calls pass prune_threshold=0.0 — the prune SQL
+                # `WHERE weight < 0.0` matches nothing, so it's a no-op.
+                # Only the final flush passes 0.05 to actually prune.
+                nonlocal updates
+                if not can_batch_updates:
+                    return 0
+                pruned = self._backend.apply_connection_changes(
+                    updates,
+                    prune_threshold=prune_threshold,
+                )
+                updates = []
+                return pruned
 
             for conn in self._backend.iter_connections():
                 src, tgt = conn["source_id"], conn["target_id"]
@@ -860,18 +880,18 @@ class DreamEngine:
                     if old_w > 0.05:
                         updates.append((src, tgt, old_w, max(old_w - 0.01, 0.0), "nrem_weaken"))
                         stats["weakened"] += 1
+                if can_batch_updates and len(updates) >= update_batch_size:
+                    flush_updates()
 
             # D6 runtime proof on the live 03:45 scheduler showed that opening a
             # fresh SQLite connection + commit per edge turns NREM into a giant
             # SQLite hot loop once the graph reaches millions of connections.
             # Batch the exact same edge updates into one backend transaction when
-            # the backend supports it, but preserve the old step-by-step path for
-            # other backends.
-            if hasattr(self._backend, "apply_connection_changes"):
-                stats["pruned"] = self._backend.apply_connection_changes(
-                    updates,
-                    prune_threshold=0.05,
-                )
+            # the backend supports it, bounded by NM_NREM_UPDATE_BATCH so NREM no
+            # longer holds a full-graph update list in memory. Preserve the old
+            # step-by-step path for other backends.
+            if can_batch_updates:
+                stats["pruned"] = flush_updates(prune_threshold=0.05)
             else:
                 for src, tgt, old_w, new_w, reason in updates:
                     delta = new_w - old_w

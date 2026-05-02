@@ -612,11 +612,12 @@ class NeuralMemory:
         # Spanish content. Per Tito 2026-05-02: AE only needs English
         # + Spanish (mainly English); full multilingual model is overkill.
         #
-        # Strategy: keep English-trained ms-marco as default (proven good
-        # for English — pulled R@5 from 0.26 to 0.74). Skip rerank
-        # automatically when query has non-ASCII chars (Spanish/accented),
-        # falling back to dense+sparse channels (R@5=0.33 baseline for
-        # Spanish vs 0.0 with English-rerank). See _should_skip_rerank.
+        # Strategy: keep English-trained ms-marco as default for English
+        # (proven R@5 lift from 0.26 to 0.74), and route Spanish/non-ASCII
+        # queries to the multilingual ES reranker by default
+        # (mmarco-MiniLMv2-L12-H384-v1, validated +0.030 R@5 absolute).
+        # NM_RERANK_ES_DISABLE=1 restores the legacy skip-rerank floor for
+        # those queries (R@5=0.33 baseline). See _should_skip_rerank.
         #
         # Resolution chain for the model name:
         #   1. constructor kwarg `rerank_model` (highest)

@@ -11,8 +11,10 @@ Run:
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -273,9 +275,6 @@ class ScoringFormulaWiringTests(unittest.TestCase):
         # accented names (e.g., "Did José call yesterday?") will route to
         # the multilingual model rather than skip rerank — intentional
         # per per-commit reviewer 77e350b finding.
-        import os
-        import sys
-        from pathlib import Path
         sys.path.insert(0, str(Path(__file__).resolve().parent))
 
         os.environ.pop("NM_RERANK_ES_DISABLE", None)
@@ -289,6 +288,95 @@ class ScoringFormulaWiringTests(unittest.TestCase):
             self.assertIn("mmarco", mem._rerank_model_es_name.lower())
         finally:
             mem.close()
+
+    def test_es_path_executes_multilingual_model_for_accented_original_query(self) -> None:
+        """Production-path coverage: _maybe_rerank actually loads & calls the
+        ES model when original_query has non-ASCII chars, and ranks by its
+        scores. Per resolver-070621 — the previous lifecycle tests didn't
+        cover the actual call, only the config state.
+        """
+        prior_disable = os.environ.get("NM_RERANK_ES_DISABLE")
+        prior_module = sys.modules.get("sentence_transformers")
+        os.environ.pop("NM_RERANK_ES_DISABLE", None)
+        calls = []
+
+        class FakeCrossEncoder:
+            def __init__(self, name: str) -> None:
+                calls.append(("init", name))
+
+            def predict(self, pairs):
+                calls.append(("predict", pairs))
+                return [0.1, 0.9]
+
+        sys.modules["sentence_transformers"] = types.SimpleNamespace(
+            CrossEncoder=FakeCrossEncoder,
+        )
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.close()
+        try:
+            from memory_client import NeuralMemory
+            mem = NeuralMemory(db_path=tmp.name, use_cpp=False, use_hnsw=False)
+            try:
+                candidates = [
+                    {"id": 1, "content": "low score"},
+                    {"id": 2, "content": "high score"},
+                ]
+                result = mem._maybe_rerank(
+                    "did jose call yesterday",
+                    candidates,
+                    force=True,
+                    original_query="Did José call yesterday?",
+                )
+                self.assertEqual([c["id"] for c in result], [2, 1])
+                init_names = [value for kind, value in calls if kind == "init"]
+                self.assertEqual(init_names, [mem._rerank_model_es_name])
+                self.assertIn("mmarco", init_names[0].lower())
+                self.assertIsNone(mem._rerank_model)
+                self.assertIsNotNone(mem._rerank_model_es)
+            finally:
+                mem.close()
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+            if prior_disable is None:
+                os.environ.pop("NM_RERANK_ES_DISABLE", None)
+            else:
+                os.environ["NM_RERANK_ES_DISABLE"] = prior_disable
+            if prior_module is None:
+                sys.modules.pop("sentence_transformers", None)
+            else:
+                sys.modules["sentence_transformers"] = prior_module
+
+    def test_es_disable_env_skips_execution_for_accented_original_query(self) -> None:
+        """NM_RERANK_ES_DISABLE=1 actually skips _maybe_rerank execution for
+        non-ASCII queries (returns candidates unchanged, no model loaded).
+        """
+        prior_disable = os.environ.get("NM_RERANK_ES_DISABLE")
+        os.environ["NM_RERANK_ES_DISABLE"] = "1"
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.close()
+        try:
+            from memory_client import NeuralMemory
+            mem = NeuralMemory(db_path=tmp.name, use_cpp=False, use_hnsw=False)
+            try:
+                candidates = [{"id": 1, "content": "unchanged"}]
+                result = mem._maybe_rerank(
+                    "did jose call yesterday",
+                    candidates,
+                    force=True,
+                    original_query="Did José call yesterday?",
+                )
+                self.assertIs(result, candidates)
+                self.assertNotIn("rerank_score", result[0])
+                self.assertIsNone(mem._rerank_model)
+                self.assertIsNone(mem._rerank_model_es)
+            finally:
+                mem.close()
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+            if prior_disable is None:
+                os.environ.pop("NM_RERANK_ES_DISABLE", None)
+            else:
+                os.environ["NM_RERANK_ES_DISABLE"] = prior_disable
 
     def test_extreme_values_produce_finite_score(self) -> None:
         # Per round-4 reviewer: the formula has no clamp. Verify all
