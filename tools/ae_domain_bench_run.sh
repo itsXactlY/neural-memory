@@ -43,9 +43,17 @@ cd "$REPO"
     --out "$OUT" >> "$LOG" 2>&1
 RC=$?
 
-if [ "$RC" -ne 0 ]; then
+# rc=0  → all categories passed threshold
+# rc=2  → some categories failed threshold but bench DID run + wrote file (per
+#         run_ae_domain_bench.py:233-234). Continue regression-detect logic.
+# other → real runtime error; bail.
+if [ "$RC" -ne 0 ] && [ "$RC" -ne 2 ]; then
     log "BENCH FAILED rc=${RC}"
     exit "$RC"
+fi
+if [ ! -f "$OUT" ]; then
+    log "BENCH OUT FILE MISSING after rc=${RC}; bailing"
+    exit 99
 fi
 
 # Pull latest R@5 from the JSON report. run_ae_domain_bench.py:168-177
@@ -96,5 +104,7 @@ else
     log "R@5: latest=${LATEST_R5} (no prior run for delta)"
 fi
 
-log "AE-domain bench DONE rc=${RC}"
-exit "$RC"
+log "AE-domain bench DONE rc=${RC} (rc=2 means category-fail, file still valid)"
+# Exit 0 always when file is valid — let regression-alert fire on real drops
+# rather than launchd retry-storming on each threshold-fail.
+exit 0
