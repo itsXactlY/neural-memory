@@ -164,6 +164,18 @@ else
     HEALTHY+=("hermes-plugin symlinks (6/6 intact)")
 fi
 
+# 8. Codex orchestrator daemon (always-on; check it's running)
+ORCH_LOG="${HOME}/.neural_memory/logs/codex-orchestrator-nm-builder.log"
+A=$(mtime_age "$ORCH_LOG")
+if [ "$A" -lt 0 ]; then
+    ISSUES+=("CRITICAL: codex-orchestrator-nm-builder daemon log missing — daemon not started?")
+elif [ "$A" -gt 600 ]; then
+    # Daemon polls every 90s, should write to log on every poll. >10min stale = dead.
+    ISSUES+=("STALE: codex-orchestrator daemon log not updated in ${A}s — daemon may have died (KeepAlive should restart, check stderr)")
+else
+    HEALTHY+=("codex-orchestrator daemon (${A}s ago)")
+fi
+
 # 7. Codex archaeology cron (daily; allow 36h staleness)
 F="${HOME}/.neural_memory/logs/codex-archaeology.stdout.log"
 A=$(mtime_age "$F")

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ae.codex-orchestrator</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/tito/lWORKSPACEl/research/neural-memory/tools/codex_orchestrator_daemon.sh</string>
+    </array>
+
+    <!-- ALWAYS ON AUTONOMOUS — restarts if it dies -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't thrash if it's failing -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tito/.neural_memory/logs/codex-orchestrator-daemon.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/tito/.neural_memory/logs/codex-orchestrator-daemon.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Applications/Codex.app/Contents/Resources</string>
+        <key>HOME</key>
+        <string>/Users/tito</string>
+        <!-- Lane label — change per builder. nm-builder runs this lane;
+             ae-builder should mirror with NM_LANE=ae-builder. -->
+        <key>NM_LANE</key>
+        <string>nm-builder</string>
+        <!-- Poll cadence: 90s (cheap, just bash). Adjust if needed. -->
+        <key>ORCH_POLL_INTERVAL</key>
+        <string>90</string>
+        <!-- Min interval between codex API calls even if events keep coming.
+             5 min default = max 12 codex calls/hour even under heavy activity.
+             Use ORCH_MIN_SYNTH_INTERVAL=600 to halve the budget if needed. -->
+        <key>ORCH_MIN_SYNTH_INTERVAL</key>
+        <string>300</string>
+    </dict>
+</dict>
+</plist>
