@@ -821,6 +821,12 @@ class NeuralMemory:
             p = Path(self._hnsw_index_path)
             p.parent.mkdir(parents=True, exist_ok=True)
             self._hnsw.save_index(str(p))
+            # Holistic-reviewer-round-1 fix 2026-05-02: track our just-
+            # written mtime so the load-skip guard at line 769 doesn't
+            # see "disk newer than my last load" → force a redundant
+            # full re-load. Without this, every save invalidates the
+            # in-RAM cache for our own next load attempt.
+            self._hnsw_mtime = p.stat().st_mtime
             self._hnsw_writes_since_save = 0
         except Exception as exc:
             import logging

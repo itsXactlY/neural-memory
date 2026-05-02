@@ -308,7 +308,11 @@ def main() -> int:
     g = sub.add_parser("graph", help="PPR graph search with intent weights", parents=[db_parent])
     g.add_argument("query")
     g.add_argument("--k", type=int, default=5)
-    g.add_argument("--hops", type=int, default=2)
+    # Holistic-reviewer-round-1 fix 2026-05-02: was default=2; aligned to
+    # library default (hops=1) per perf cliff fix 597f4e6 + batched
+    # b2bda67. CLI users were hitting the 100× perf cliff that the
+    # library fix addressed; pass --hops=2 explicitly for richer signal.
+    g.add_argument("--hops", type=int, default=1)
     g.add_argument("--format", choices=("compact", "json"), default="compact")
     g.set_defaults(fn=cmd_graph)
 
@@ -355,7 +359,8 @@ def main() -> int:
     h.add_argument("--k", type=int, default=5)
     h.add_argument("--kind", default=None)
     h.add_argument("--as-of", dest="as_of", default=None)
-    h.add_argument("--hops", type=int, default=2)
+    # Holistic-reviewer-round-1 fix 2026-05-02: see nm graph above.
+    h.add_argument("--hops", type=int, default=1)
     h.add_argument("--rerank", action="store_true",
                    help="Enable cross-encoder rerank on top-50 (requires sentence-transformers)")
     h.add_argument("--format", choices=("compact", "json"), default="compact")
