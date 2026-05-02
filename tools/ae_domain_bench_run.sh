@@ -24,6 +24,13 @@ BRIDGE_CLI="/Users/tito/lWORKSPACEl/Projects/AngelsElectric/LangGraph/plugins/he
 
 REGRESSION_PTS="${AE_BENCH_REGRESSION_PTS:-0.05}"
 
+# Sonnet diagnostic 2026-05-02 [verified-now]: bench Spanish misses are
+# pure translator-not-set issue (NM_SPANISH_TRANSLATE wires Spanish queries
+# through the EN dict before retrieval; commit a0e7374 wired it but the
+# bench env didn't enable it). Predicted lift: +0.09 R@5 absolute.
+# Override at AOR plist EnvironmentVariables level to disable.
+export NM_SPANISH_TRANSLATE="${NM_SPANISH_TRANSLATE:-1}"
+
 mkdir -p "$HIST" "$LOGS"
 
 TS=$(date +%F-%H%M%S)
