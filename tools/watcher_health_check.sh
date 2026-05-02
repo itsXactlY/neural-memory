@@ -164,6 +164,24 @@ else
     HEALTHY+=("hermes-plugin symlinks (6/6 intact)")
 fi
 
+# 9. Codex TODO sweep cron (daily; allow 36h staleness — same as archaeology)
+F="${HOME}/.neural_memory/logs/codex-todo-sweep.stdout.log"
+A=$(mtime_age "$F")
+if [ "$A" -lt 0 ]; then
+    HEALTHY+=("codex-todo-sweep (not yet fired — first run pending)")
+elif [ "$A" -gt 129600 ]; then
+    ISSUES+=("STALE: codex-todo-sweep last fired ${A}s ago (>36h)")
+else
+    HEALTHY+=("codex-todo-sweep (${A}s ago)")
+fi
+
+# 10. Codex resolver activity (info-only — no heartbeat expected unless escalations)
+RESOLVER_DIR="${HOME}/.neural_memory/codex-resolutions/nm-builder"
+if [ -d "$RESOLVER_DIR" ]; then
+    RESOLVER_COUNT=$(ls "$RESOLVER_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    HEALTHY+=("codex-resolver (${RESOLVER_COUNT} proposals on disk)")
+fi
+
 # 8. Codex orchestrator daemon (always-on; check it's running)
 ORCH_LOG="${HOME}/.neural_memory/logs/codex-orchestrator-nm-builder.log"
 A=$(mtime_age "$ORCH_LOG")
