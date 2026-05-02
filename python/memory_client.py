@@ -1842,16 +1842,19 @@ class NeuralMemory:
         # percentile work. AccessLogger now sees true end-to-end ms.
         _hybrid_recall_t0 = time.time()
 
-        # Spanish→English query translation (opt-in via NM_SPANISH_TRANSLATE=1).
-        # Substrate is mostly English; Spanish queries against English memories
-        # scored R@5=0.0 on the AE-domain bench. Translating before retrieval
-        # lets all channels (dense+sparse+graph) hit English memories directly.
+        # Spanish→English query translation (default ON 2026-05-02; opt-out via
+        # NM_SPANISH_TRANSLATE=0). Substrate is mostly English; Spanish queries
+        # against English memories scored R@5=0.0 on AE-domain bench. Translating
+        # before retrieval lets all channels (dense+sparse+graph) hit English
+        # memories directly. Verified +0.045 R@5 lift on cable-doce query.
         # Per Tito 2026-05-02: AE only needs English+Spanish (mainly English).
-        # Conservative: dict-based translation, unknown tokens pass through.
+        # Detection layer (_should_skip_rerank) is conservative: 1 Spanish word
+        # alone doesn't trigger; needs 2+ indicator words OR non-ASCII char.
+        # English queries with no Spanish content pass through unchanged.
         # Original query preserved in _trace.original_query for debugging.
         import os as _os_st
         _original_query_for_trace = query
-        if _os_st.environ.get("NM_SPANISH_TRANSLATE", "0") == "1":
+        if _os_st.environ.get("NM_SPANISH_TRANSLATE", "1") != "0":
             if self._should_skip_rerank(query):
                 # Spanish detected — translate before any channel runs
                 query = self._translate_spanish_to_english(query)

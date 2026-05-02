@@ -1,8 +1,13 @@
-"""Tests for Spanish→English query translator + opt-in env var wiring.
+"""Tests for Spanish→English query translator + env var wiring.
 
 Per 2026-05-02 ship: dict-based translator gives +0.045 R@5 on AE-domain
 bench by translating Spanish queries to English so they hit English-content
-substrate. Opt-in via NM_SPANISH_TRANSLATE=1.
+substrate. Default ON since 2026-05-02 (was opt-in NM_SPANISH_TRANSLATE=1).
+Opt out via NM_SPANISH_TRANSLATE=0.
+
+Detection layer (_should_skip_rerank) is conservative — needs 2+ Spanish
+indicator words OR a non-ASCII char to flag. English queries pass through
+unchanged. Verified by test_english_with_one_spanish_word_not_flagged.
 
 Locks in the contract so future "improvements" don't silently regress
 the cable-doce hit (which I demonstrated could happen — see commit
