@@ -60,6 +60,16 @@ _STOPWORDS: frozenset[str] = frozenset({
     "Type", "Kind", "Class", "Mode",
     "Default", "Auto", "Manual",
     "Block", "Step", "Item", "Entry", "Record",
+    # Round-2 reviewer 2026-05-01: 38 confirmed junk entities still in top-60
+    # by mention frequency. Added the high-mention ones: project meta-vocab
+    # ("Phase", "Session", "Sprint"), protocol acronyms ("API", "URL", "RPC",
+    # "OAuth", "HTTP", "POST", "GET", "SET", "CDP", "SQL"), workflow noise
+    # ("CHECKPOINT", "MEMORY", "EOD"), single-char ("UI", "DB", "OR").
+    "Phase", "Session", "Sprint", "CHECKPOINT", "MEMORY", "EOD",
+    "API", "URL", "RPC", "OAuth", "HTTP", "POST", "GET", "SET",
+    "CDP", "SQL", "UI", "DB", "JSON", "YAML", "TOML",
+    "Commit", "Branch", "Tag", "PR", "Pull",
+    "Test", "Tests", "Bench", "Audit", "Review",
 })
 
 

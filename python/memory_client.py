@@ -150,6 +150,7 @@ def _migrate_bitemporal(conn: sqlite3.Connection) -> None:
 
 class SQLiteStore:
     def __init__(self, db_path: str | Path = DB_PATH):
+        self.db_path = str(db_path)
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent read perf
