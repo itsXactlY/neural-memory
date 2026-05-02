@@ -626,6 +626,16 @@ class NeuralMemory:
         self._rerank = bool(rerank)
         self._rerank_model_name = rerank_model
         self._rerank_model = None  # lazy
+        # Spanish/multilingual rerank path (2026-05-02 dual-reranker).
+        # English ms-marco mis-ranks Spanish content; mMARCO-MiniLMv2-L12
+        # was trained on MS MARCO translated to 14 langs (incl. es).
+        # Set NM_RERANK_ES_DISABLE=1 to fall back to skip-rerank behavior.
+        self._rerank_es_disabled = os.environ.get("NM_RERANK_ES_DISABLE") == "1"
+        self._rerank_model_es_name = os.environ.get(
+            "NM_RERANK_MODEL_ES",
+            "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        )
+        self._rerank_model_es = None  # lazy
 
         # H5: Salience opt-out. Default True preserves shipped Phase B behavior
         # (Bucket-C default shift). Set False to get pre-Phase-B recall ordering.
@@ -1740,20 +1750,34 @@ class NeuralMemory:
         # nm_recall_mcp.py shares that mutable field across concurrent MCP
         # calls. Now request-local via kwarg from hybrid_recall.
         skip_query = original_query or query
-        if self._should_skip_rerank(skip_query):
-            return candidates
+        # Dual-reranker (2026-05-02): when query is Spanish/non-ASCII, route to
+        # multilingual mMARCO-MiniLMv2-L12 instead of skipping rerank entirely.
+        # Escape hatch: NM_RERANK_ES_DISABLE=1 restores skip-rerank floor.
+        is_es_path = self._should_skip_rerank(skip_query)
+        use_es_model = is_es_path and not self._rerank_es_disabled
         try:
-            if self._rerank_model is None:
-                from sentence_transformers import CrossEncoder
-                self._rerank_model = CrossEncoder(self._rerank_model_name)
+            if use_es_model:
+                if self._rerank_model_es is None:
+                    from sentence_transformers import CrossEncoder
+                    self._rerank_model_es = CrossEncoder(self._rerank_model_es_name)
+                model = self._rerank_model_es
+            else:
+                if is_es_path:
+                    # ES disabled via env: preserve legacy skip behavior
+                    return candidates
+                if self._rerank_model is None:
+                    from sentence_transformers import CrossEncoder
+                    self._rerank_model = CrossEncoder(self._rerank_model_name)
+                model = self._rerank_model
             pairs = [(query, c.get('content') or c.get('label') or '') for c in candidates]
-            scores = self._rerank_model.predict(pairs)
+            scores = model.predict(pairs)
             for c, s in zip(candidates, scores):
                 c['rerank_score'] = float(s)
             candidates.sort(key=lambda x: -x.get('rerank_score', 0.0))
         except Exception as exc:
             import logging
-            logging.getLogger(__name__).debug("rerank skipped: %s", exc)
+            logging.getLogger(__name__).debug(
+                "rerank skipped (es=%s): %s", use_es_model, exc)
         return candidates
 
     @staticmethod
@@ -3065,6 +3089,8 @@ class NeuralMemory:
             'lazy_graph': self._lazy_graph,
             'louvain_available': nx_ok,
             'reranker_loaded': self._rerank_model is not None,
+            'reranker_loaded_es': self._rerank_model_es is not None,
+            'reranker_es_disabled': self._rerank_es_disabled,
             'rerank_enabled': self._rerank,
             'salience_multiply': self._salience_multiply,
         }
