@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from neural_memory import Memory
+from schema_upgrade import SchemaUpgrade
 
 EXPORT_DIR = Path(os.environ.get("HONCHO_EXPORT_DIR", Path.home() / "honcho_export"))
 DB_PATH = Path(os.environ.get(
@@ -227,11 +228,17 @@ def main():
     
     t_total = time.time()
     
-    # Clear existing DB
+    # Clear existing DB. Per resolver-082439: also clear memories_fts so
+    # zombie FTS rows don't survive the rebuild. Schema_upgrade.upgrade()
+    # call after import_messages backfills FTS from the new memories.
     print("\n[1/3] Clearing DB...")
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("DELETE FROM memories")
     conn.execute("DELETE FROM connections")
+    try:
+        conn.execute("DELETE FROM memories_fts")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     
@@ -245,7 +252,11 @@ def main():
     import_sessions(mem)
     import_documents(mem)
     import_messages(mem, batch_size=256)
-    
+
+    # Backfill FTS from the imported memories — direct SQL bulk insert
+    # bypasses the per-remember FTS sync hook in memory_client.
+    SchemaUpgrade(str(DB_PATH)).upgrade()
+
     # Build connections
     print("\n[3/3] Building graph connections...")
     build_connections(mem, sample_size=5000, threshold=0.15)
