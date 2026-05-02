@@ -1450,6 +1450,71 @@ class NeuralMemory:
         )
         return spanish_hits >= 2
 
+    def _mmr_select(self, scored: list[tuple],
+                    k: int, lambda_diversity: float) -> list[tuple]:
+        """Maximal Marginal Relevance (Carbonell-Goldstein 1998) greedy
+        re-selection. Mazemaker-inspired diversity pattern.
+
+        Each iteration picks the candidate maximizing:
+            lambda * relevance_score
+            - (1 - lambda) * max_similarity_to_already_selected
+
+        Where similarity is cosine on stored embeddings. Lambda 0.0 = pure
+        relevance (no diversity), 1.0 = pure novelty (irrelevant). Sweet
+        spot 0.5-0.7 for top-5 results that aren't all near-duplicates.
+
+        scored: list of (cid, final_score, meta, features) tuples
+        Returns: same shape, top-k with diversity applied.
+        """
+        if k <= 0 or len(scored) <= 1:
+            return scored
+        # Pre-fetch embeddings for the candidate pool (cheap if pool is
+        # already < 50 items; would batch otherwise)
+        emb_cache: dict[int, list[float]] = {}
+        for cid, _f, _m, _feat in scored:
+            row = self.store.get(cid)
+            if row and row.get("embedding"):
+                emb_cache[cid] = row["embedding"]
+        # Normalize relevance scores into [0, 1] so they're comparable
+        # to cosine similarities.
+        max_score = max(t[1] for t in scored) or 1.0
+        rel_norm = {t[0]: t[1] / max_score for t in scored}
+        # Greedy selection
+        selected: list[tuple] = []
+        remaining = list(scored)
+        while remaining and len(selected) < k:
+            best = None
+            best_mmr = -1e9
+            for cand in remaining:
+                cid = cand[0]
+                rel = rel_norm.get(cid, 0.0)
+                if not selected:
+                    mmr = lambda_diversity * rel
+                else:
+                    cand_emb = emb_cache.get(cid)
+                    if cand_emb is None:
+                        max_sim = 0.0
+                    else:
+                        max_sim = max(
+                            self._cosine_similarity(
+                                cand_emb, emb_cache.get(s[0], [])
+                            )
+                            for s in selected
+                            if emb_cache.get(s[0])
+                        ) if selected else 0.0
+                    mmr = (lambda_diversity * rel
+                           - (1.0 - lambda_diversity) * max_sim)
+                if mmr > best_mmr:
+                    best_mmr = mmr
+                    best = cand
+            if best is None:
+                break
+            selected.append(best)
+            remaining.remove(best)
+        # Append any remaining candidates (in original order) as tail —
+        # MMR re-ordered top k, the rest stay as-was.
+        return selected + remaining
+
     def _maybe_rerank(self, query: str, candidates: list[dict],
                       force: bool = False) -> list[dict]:
         """Cross-encoder rerank of a candidate set. No-op if disabled or model unavailable.
@@ -1571,7 +1636,9 @@ class NeuralMemory:
                      kind: Optional[str] = None,
                      hops: int = 2,
                      pool_per_channel: int = 25,
-                     rerank: Optional[bool] = None) -> list[dict[str, Any]]:
+                     rerank: Optional[bool] = None,
+                     mmr_lambda: float = 0.0,
+                     percentile_floor: float = 0.0) -> list[dict[str, Any]]:
         """Multi-channel hybrid retrieval. Borrowed Hindsight's pool-union
         shape (dense + sparse + graph + temporal candidates) but applied
         the salience-weighted continuous scoring law instead of pure RRF.
@@ -1894,6 +1961,26 @@ class NeuralMemory:
                 ordered_ids = reranked_ids + tail_ids
                 id_to_meta = {t[0]: t for t in scored}
                 scored = [id_to_meta[i] for i in ordered_ids if i in id_to_meta]
+
+        # ---- Mazemaker-inspired Pattern A: percentile floor ------------
+        # Drop the bottom (1 - percentile_floor) fraction by RANK, not by
+        # raw score. Scale-invariant — survives weight changes / corpus
+        # shifts that would invalidate a hard score threshold. Default 0.0
+        # = no-op. AE-side opt-in; bench A/B should set it.
+        if percentile_floor > 0.0 and len(scored) > 0:
+            keep_n = max(1, int(round(len(scored) * (1.0 - percentile_floor))))
+            scored = scored[:keep_n]
+
+        # ---- Mazemaker-inspired Pattern C: MMR diversity ---------------
+        # Maximal Marginal Relevance — Carbonell-Goldstein. Trades marginal
+        # relevance for non-redundancy by penalizing high-similarity to
+        # already-selected items. Default lambda=0.0 = pure relevance
+        # (no MMR). Higher lambda = more diversity.
+        # Useful when top-K has near-duplicate Lennar-lot memories crowding
+        # out one Spanish-crew or financial answer (observed in AE bench).
+        # O(k * pool); cheap for k<=20.
+        if mmr_lambda > 0.0 and len(scored) > k:
+            scored = self._mmr_select(scored, k=k, lambda_diversity=mmr_lambda)
 
         # ---- Materialize top-k full memory rows ------------------------
         # Mazemaker-inspired (2026-05-01): activation trace as first-class
