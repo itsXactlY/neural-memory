@@ -548,18 +548,28 @@ class NeuralMemory:
 
         # Cross-encoder reranker (opt-in, lazy-loaded).
         # Keeps default behavior identical when rerank=False.
+        #
         # Caught 2026-05-01 in AE-domain bench: English-trained MiniLM
-        # MUST_marco model regressed Spanish queries (R@5 0.33 → 0.0).
+        # ms-marco model regressed Spanish queries (R@5 0.33 → 0.0)
+        # because cross-encoder mis-ranks across intent categories on
+        # Spanish content. Per Tito 2026-05-02: AE only needs English
+        # + Spanish (mainly English); full multilingual model is overkill.
+        #
+        # Strategy: keep English-trained ms-marco as default (proven good
+        # for English — pulled R@5 from 0.26 to 0.74). Skip rerank
+        # automatically when query has non-ASCII chars (Spanish/accented),
+        # falling back to dense+sparse channels (R@5=0.33 baseline for
+        # Spanish vs 0.0 with English-rerank). See _should_skip_rerank.
+        #
         # Resolution chain for the model name:
         #   1. constructor kwarg `rerank_model` (highest)
         #   2. NM_RERANK_MODEL env var
-        #   3. multilingual default (handles AE Spanish + English)
-        # Original English-only default kept available via env override.
+        #   3. English-trained ms-marco default
         import os
         if rerank_model is None:
             rerank_model = os.environ.get(
                 "NM_RERANK_MODEL",
-                "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+                "cross-encoder/ms-marco-MiniLM-L-6-v2",
             )
         self._rerank = bool(rerank)
         self._rerank_model_name = rerank_model
@@ -1379,6 +1389,67 @@ class NeuralMemory:
         
         return False
     
+    # Spanish-language detector for the rerank-skip heuristic.
+    # Two layers:
+    #   1. Non-ASCII chars (Spanish accents: ñ, á, é, í, ó, ú, ¿, ¡)
+    #   2. Common Spanish words that have no English collision risk
+    # Only English+Spanish are in scope for AE per Tito 2026-05-02.
+    # Caught empirically 2026-05-01: SPA-003 query "Encuentra la
+    # conversacion sobre material que no llego" was written WITHOUT
+    # diacritics, so pure-ASCII heuristic missed it.
+    _SPANISH_INDICATORS: frozenset[str] = frozenset({
+        # Articles + connectors not used in English
+        "la", "el", "los", "las", "un", "una", "unos", "unas",
+        "del", "al", "que", "qué", "como", "cómo", "donde", "dónde",
+        "cuando", "cuándo", "porque", "porqué",
+        # Verbs / actions common in queries
+        "encuentra", "busca", "muestra", "dame", "hay",
+        "esta", "está", "estan", "están", "fue", "fueron",
+        "hace", "tiene", "tienen", "puede", "pueden",
+        "trae", "llego", "llegó", "llega",
+        # Common nouns specific to AE crew context
+        "material", "materiales", "trabajo", "trabajos",
+        "casa", "casas", "lote", "lotes",
+        "patron", "patrón", "jefe",
+        # Negation
+        "no", "ningun", "ningún", "nada",
+        # Possessives common
+        "mi", "su", "sus", "tu", "tus",
+        # Prepositions / connectors
+        "sobre", "para", "por", "con", "sin", "entre",
+        # Question words English doesn't share
+        "cuanto", "cuánto", "cuantos", "cuántos",
+    })
+
+    @staticmethod
+    def _should_skip_rerank(query: str) -> bool:
+        """Return True if query is likely Spanish, in which case the
+        English-trained cross-encoder will mis-rank. Caught empirically
+        2026-05-01: Spanish queries went R@5=0.33 → 0.0 with English-
+        rerank but stayed at 0.33 without. Per Tito 2026-05-02: AE
+        only needs English+Spanish, mainly English.
+
+        Two-layer detection:
+          1. Non-ASCII chars (Spanish accents)
+          2. >=2 common Spanish words present (heuristic, low false-positive)
+        """
+        if not query:
+            return False
+        # Layer 1: any non-ASCII → skip
+        try:
+            query.encode("ascii")
+        except UnicodeEncodeError:
+            return True
+        # Layer 2: count Spanish-indicator words. Threshold of 2+ keeps
+        # English queries that happen to contain "la" or "no" (very
+        # common English words) from triggering false positives.
+        words = query.lower().split()
+        spanish_hits = sum(
+            1 for w in words
+            if w.strip(".,!?;:'\"()[]{}#@") in NeuralMemory._SPANISH_INDICATORS
+        )
+        return spanish_hits >= 2
+
     def _maybe_rerank(self, query: str, candidates: list[dict],
                       force: bool = False) -> list[dict]:
         """Cross-encoder rerank of a candidate set. No-op if disabled or model unavailable.
@@ -1390,10 +1461,15 @@ class NeuralMemory:
         callers passing rerank=True per-call (like the AE-domain bench
         harness) had their kwarg silently ignored. force=True overrides
         the instance flag and lets per-call rerank requests through.
+
+        Auto-skip for non-English queries: the English-trained ms-marco
+        cross-encoder mis-ranks Spanish content. See _should_skip_rerank.
         """
         if not candidates:
             return candidates
         if not (force or self._rerank):
+            return candidates
+        if self._should_skip_rerank(query):
             return candidates
         try:
             if self._rerank_model is None:

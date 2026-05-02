@@ -208,6 +208,38 @@ class ScoringFormulaWiringTests(unittest.TestCase):
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
+    def test_spanish_detector_skips_rerank_correctly(self) -> None:
+        # Per-query Spanish detection for rerank-skip. Caught empirically
+        # 2026-05-01: English-trained ms-marco cross-encoder regressed
+        # Spanish queries 0.33 → 0.0. Heuristic: skip rerank for queries
+        # containing >=2 unambiguous Spanish words OR any non-ASCII chars.
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from memory_client import NeuralMemory
+
+        # Should SKIP (Spanish detected)
+        for q in [
+            "Encuentra la conversacion sobre material que no llego.",
+            "Que se dijo sobre comprar breakers?",
+            "Busca mensaje de WhatsApp sobre cable numero doce.",
+            "Did José call yesterday?",  # non-ASCII fallback
+        ]:
+            self.assertTrue(NeuralMemory._should_skip_rerank(q),
+                            f"should skip: {q!r}")
+
+        # Should NOT skip (English / ambiguous)
+        for q in [
+            "Find all memories for Lennar lot 12.",
+            "How does Tito want estimates handled?",
+            "What is the QBO refresh issue?",
+            "La Quinta Inn invoice",  # 'la' alone insufficient
+            "No new orders today",  # 'no' alone insufficient
+            "",
+        ]:
+            self.assertFalse(NeuralMemory._should_skip_rerank(q),
+                             f"should NOT skip: {q!r}")
+
     def test_extreme_values_produce_finite_score(self) -> None:
         # Per round-4 reviewer: the formula has no clamp. Verify all
         # CandidateFeatures fields at extreme values still produce a
