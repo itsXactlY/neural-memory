@@ -31,7 +31,7 @@ CANONICAL_DB = str(Path.home() / ".neural_memory" / "memory.db")
 
 def reembed(db_path: str, batch_size: int = 256) -> dict:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
-    from embed_provider import EmbeddingProvider
+    from embed_provider import DIMENSION, EmbeddingProvider
     provider = EmbeddingProvider(backend="sentence-transformers")
     print(f"[reembed] backend dim = {provider.dim}")
     print(f"[reembed] model = {provider.backend.__class__.__name__}")
@@ -71,6 +71,11 @@ def reembed(db_path: str, batch_size: int = 256) -> dict:
         # Pack into binary format (matches existing storage)
         update_rows = []
         for mid, emb in zip(ids, embeddings):
+            if len(emb) != DIMENSION:
+                raise ValueError(
+                    f"Refusing to write memory {mid}: embedding dim {len(emb)} "
+                    f"!= DIMENSION ({DIMENSION}). Substrate is fixed-width."
+                )
             packed = struct.pack(f"{len(emb)}f", *emb)
             update_rows.append((packed, mid))
 

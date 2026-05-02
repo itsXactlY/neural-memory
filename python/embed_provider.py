@@ -80,7 +80,18 @@ class SentenceTransformerBackend:
                 device=device,
                 local_files_only=is_cached
             )
-            self.dim = 384
+            # Per resolver-080730: NM_EMBED_MODEL can override MODEL_NAME, but
+            # the substrate is fixed at DIMENSION (384). Fail fast if a model
+            # produces a different dim — silent dim-mismatch would corrupt
+            # vectors. Caught by per-commit reviewer of bcb480f.
+            loaded_dim = self.model.get_sentence_embedding_dimension()
+            if loaded_dim != DIMENSION:
+                raise ValueError(
+                    f"NM_EMBED_MODEL={self.MODEL_NAME!r} produced {loaded_dim}d "
+                    f"embeddings; neural-memory substrate expects {DIMENSION}d. "
+                    f"Substrate-side dim migration required before swapping."
+                )
+            self.dim = loaded_dim
             SentenceTransformerBackend._shared_model = self.model
             SentenceTransformerBackend._shared_dim = self.dim
             
