@@ -58,8 +58,15 @@ while true; do
 
     SHOULD_FIRE=0
     REASON=""
-    if [ "$FIRST_RUN" = "1" ]; then
+    # Per resolver patch 2026-05-02: distinguish true first-run (LAST_FIRE=0)
+    # from retry-after-failed-first-run (FIRST_RUN still true because failure
+    # didn't update LAST_HEAD, but LAST_FIRE was written to gate retries).
+    # Without this distinction, failed first-runs refire every $POLL bypassing
+    # $MIN_INTERVAL.
+    if [ "$FIRST_RUN" = "1" ] && [ "$LAST_FIRE" = "0" ]; then
         SHOULD_FIRE=1; REASON="first-run-bootstrap"
+    elif [ "$FIRST_RUN" = "1" ] && [ "$SINCE_FIRE" -ge "$MIN_INTERVAL" ]; then
+        SHOULD_FIRE=1; REASON="first-run-retry (${SINCE_FIRE}s ≥ ${MIN_INTERVAL}s)"
     elif [ "$SINCE_FIRE" -ge "$MAX_INTERVAL" ]; then
         SHOULD_FIRE=1; REASON="max-interval (${SINCE_FIRE}s ≥ ${MAX_INTERVAL}s)"
     elif [ "$HEAD_CHANGED" = "1" ] && [ "$SINCE_FIRE" -ge "$MIN_INTERVAL" ]; then

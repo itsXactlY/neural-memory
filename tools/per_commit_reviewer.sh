@@ -102,13 +102,16 @@ After your review, if the commit added new BEHAVIOR (function, branch, edge case
         CODEX_RC=$?
     fi
 
-    # Header alone is ~150 bytes; require >500 bytes to count as real review body
-    if [ "$CODEX_RC" = "0" ] && [ "$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)" -gt 500 ]; then
+    # Header is 4 lines; accept terse clean PASS if codex wrote ANY body line.
+    # Bug caught by resolver 2026-05-02 — old >500 bytes guard rejected
+    # legitimate "PASS" one-liners as failures, marking clean commits as broken.
+    REVIEW_BODY_LINES=$(tail -n +5 "${OUT}.partial" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+    if [ "$CODEX_RC" = "0" ] && [ "$REVIEW_BODY_LINES" -gt 0 ]; then
         mv "${OUT}.partial" "$OUT"
-        echo "[$(date)] Review for $SHORT landed at $OUT" >> "$LOG_FILE"
+        echo "[$(date)] Review for $SHORT landed at $OUT (body_lines=$REVIEW_BODY_LINES)" >> "$LOG_FILE"
         REVIEWED=$((REVIEWED + 1))
     else
-        echo "[$(date)] FAILED review for $SHORT (codex_rc=$CODEX_RC, body=$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)b) — keeping .partial for diagnosis" >> "$LOG_FILE"
+        echo "[$(date)] FAILED review for $SHORT (codex_rc=$CODEX_RC, body_lines=$REVIEW_BODY_LINES) — keeping .partial for diagnosis" >> "$LOG_FILE"
         FAILED=1
     fi
 done

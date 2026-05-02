@@ -56,15 +56,30 @@ list_proposals() {
     done
 }
 
+resolve_proposal_path() {
+    # Accept: absolute path, basename in PROPOSAL_DIR, or basename without .md.
+    # Bug caught by resolver 2026-05-02 — list output shows basenames but
+    # --show/--check/--apply subcommands required full paths.
+    local f="$1"
+    if [ -f "$f" ]; then
+        echo "$f"; return 0
+    elif [ -f "${PROPOSAL_DIR}/${f}" ]; then
+        echo "${PROPOSAL_DIR}/${f}"; return 0
+    elif [ "${f%.md}" = "$f" ] && [ -f "${PROPOSAL_DIR}/${f}.md" ]; then
+        echo "${PROPOSAL_DIR}/${f}.md"; return 0
+    fi
+    return 1
+}
+
 extract_diff() {
     # Pull all ```diff ... ``` blocks out of a proposal markdown file
     awk '/^```diff$/{flag=1; next} /^```$/{if (flag) {flag=0; print "---NEXT---"}} flag' "$1"
 }
 
 show_proposal() {
-    local f="$1"
-    if [ ! -f "$f" ]; then
-        echo "ERROR: file not found: $f" >&2
+    local f
+    if ! f=$(resolve_proposal_path "$1"); then
+        echo "ERROR: file not found: $1" >&2
         exit 2
     fi
     echo "=== Full proposal: $f ==="
@@ -75,9 +90,9 @@ show_proposal() {
 }
 
 check_proposal() {
-    local f="$1"
-    if [ ! -f "$f" ]; then
-        echo "ERROR: file not found: $f" >&2
+    local f
+    if ! f=$(resolve_proposal_path "$1"); then
+        echo "ERROR: file not found: $1" >&2
         exit 2
     fi
     local tmp
@@ -104,9 +119,9 @@ check_proposal() {
 }
 
 apply_proposal() {
-    local f="$1"
-    if [ ! -f "$f" ]; then
-        echo "ERROR: file not found: $f" >&2
+    local f
+    if ! f=$(resolve_proposal_path "$1"); then
+        echo "ERROR: file not found: $1" >&2
         exit 2
     fi
     cd "$REPO" || exit 1

@@ -191,13 +191,16 @@ echo "[$(date)] type=${SAMPLE_TYPE} dispatching codex ${MODEL} reconciliation re
     >> "${OUT}.partial" 2>> "$LOG_FILE"
 CODEX_RC=$?
 
-if [ "$CODEX_RC" = "0" ] && [ "$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)" -gt 500 ]; then
+# Header is 4 lines; accept terse clean PASS if codex wrote ANY body line.
+# Bug caught by resolver 2026-05-02 — old >500 bytes guard rejected legit PASS.
+REVIEW_BODY_LINES=$(tail -n +5 "${OUT}.partial" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+if [ "$CODEX_RC" = "0" ] && [ "$REVIEW_BODY_LINES" -gt 0 ]; then
     mv "${OUT}.partial" "$OUT"
-    echo "[$(date)] reconciliation review landed at ${OUT}" >> "$LOG_FILE"
+    echo "[$(date)] reconciliation review landed at ${OUT} (body_lines=$REVIEW_BODY_LINES)" >> "$LOG_FILE"
     exit 0
 else
     # Surface failure to launchd via nonzero exit (was masking failures with
     # unconditional exit 0). Caught by codex-resolver 2026-05-02.
-    echo "[$(date)] FAILED reconciliation review (codex_rc=$CODEX_RC, body=$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)b) — keeping .partial for diagnosis" >> "$LOG_FILE"
+    echo "[$(date)] FAILED reconciliation review (codex_rc=$CODEX_RC, body_lines=$REVIEW_BODY_LINES) — keeping .partial for diagnosis" >> "$LOG_FILE"
     exit 1
 fi
