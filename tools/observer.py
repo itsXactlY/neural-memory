@@ -188,14 +188,20 @@ def write_events(events: list[dict]) -> tuple[int, int]:
     failed = 0
     for e in events:
         try:
-            # Reviewer-round-6 fix 2026-05-02: bumped timeout 20s → 90s.
-            # Each remember call cold-loads sentence-transformers (5-15s)
-            # + writes to substrate. Under contention (bench, plugin) all
-            # 30+ events were silently failing observer-side. Bench killed,
-            # but headroom matters for plugin-reuse + cron-overlap windows.
+            # Holistic-reviewer-round-2 followup 2026-05-02: bumped timeout
+            # 90s → 180s after observation that ~67% of events were still
+            # timing out at 90s post-bench-kill. Root cause is deeper —
+            # each remember call cold-loads sentence-transformers (5-15s)
+            # + writes to substrate. Defensive bump reduces failure rate.
+            #
+            # PROPER FIX (deferred): replace per-call cold-load with a
+            # long-lived embedder server that observer pipes events to.
+            # Would eliminate the cold-load tax + bring per-event latency
+            # under 1s. ~200 LOC, requires daemon + IPC. Tracked in
+            # project_observer_cold_load_fix backlog.
             subprocess.run(
                 [REMEMBER_BIN, e["claim"], "--label", e["label"], "--source", e["source"]],
-                check=False, timeout=90, capture_output=True,
+                check=False, timeout=180, capture_output=True,
             )
             written += 1
         except Exception as exc:
