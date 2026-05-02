@@ -1484,14 +1484,26 @@ class NeuralMemory:
                returns up to `pool_per_channel` items).
             2. Per-channel ranks → RRF feature (one of many features,
                NOT the final authority).
-            3. Build CandidateFeatures(semantic, sparse, graph, temporal,
-               salience, confidence, rrf_feature).
+            3. Build CandidateFeatures with all 12 fields populated (per
+               Phase 7.5 α/β/γ/δ/ε wiring):
+                 - Channel scores: semantic, sparse, graph, temporal
+                 - Entity boost (β): entity_score from mentions_entity edges
+                 - Procedural boost (α): procedural_score from memories col
+                 - Locus boost (ε): locus_score from located_in edges
+                 - Memory bias: salience, confidence
+                 - Rank-based: rrf_feature
+                 - Penalties (γ, δ): stale_penalty (last_accessed age),
+                   contradiction_penalty (contradicts edge count × 0.05)
             4. Final score via scoring.score_candidate() with intent-aware
                edge weights for the graph channel.
             5. Optional cross-encoder rerank on top-N (uses self._rerank
                flag if set; can override via rerank kwarg).
             6. Apply kind/as_of post-filters if requested.
-            7. Return top k.
+            7. Return top k. Each result carries:
+                 - 'combined' (final score)
+                 - 'channels' (which channels surfaced this candidate)
+                 - '_trace' (per-feature contribution dict;
+                   mazemaker-inspired explainability — Phase 7.5)
 
         Path to Hindsight 0.92+ R@5 from current 0.53 baseline:
             - Install FlagEmbedding for BGE-M3 hybrid embedding (~1GB)
