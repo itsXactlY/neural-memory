@@ -595,6 +595,313 @@ def recall_recent_leads(
     return out[:k]
 
 
+# =============================================================================
+# AEEvidenceIngest v0 — Theme 8 typed evidence record contract
+# Per codex-prescriptive-redesigner Day 4 (2026-05-02). NO LIVE INGESTION
+# until Tito approves WA path + sent Gmail/PDF scope. Helpers are designed
+# as read-only contract definitions; live ingest is gated separately.
+#
+# Cross-system contract (per redesigner Section D):
+#   {capability_id, source_system, source_path, source_record_id,
+#    valid_from, valid_to, confidence, privacy_class, consumer_hint}
+#
+# Privacy classes (gate live ingest by these):
+#   - public        — no restriction
+#   - internal      — internal AE ops only
+#   - pii_low       — names, public phones, work addresses
+#   - pii_high      — SSN, payment cards, home addresses (do NOT ingest without redaction)
+#   - financial     — QBO, invoice amounts, P&L (separate retention policy)
+# =============================================================================
+
+EVIDENCE_PRIVACY_CLASSES = {"public", "internal", "pii_low", "pii_high", "financial"}
+EVIDENCE_TYPES = {
+    "wa_crew_message",      # WA crew chat snippet (Theme 8 P0)
+    "sent_pdf",             # PDF the dashboard sent to a customer
+    "estimate_event",       # estimate creation/approval/scheduling
+    "material_price",       # supplier price quote / order
+    "appscript_row",        # AppScript sheet row
+    "blueprint_excerpt",    # blueprint snippet for BOM extraction
+    "qbo_transaction",      # QBO transaction record
+    "calendar_event",       # GCal event we want to remember
+}
+
+
+def _validate_privacy_class(privacy_class: str) -> str:
+    if privacy_class not in EVIDENCE_PRIVACY_CLASSES:
+        raise ValueError(
+            f"privacy_class={privacy_class!r} not in "
+            f"{sorted(EVIDENCE_PRIVACY_CLASSES)}"
+        )
+    return privacy_class
+
+
+def _validate_evidence_type(evidence_type: str) -> str:
+    if evidence_type not in EVIDENCE_TYPES:
+        raise ValueError(
+            f"evidence_type={evidence_type!r} not in {sorted(EVIDENCE_TYPES)}"
+        )
+    return evidence_type
+
+
+def record_evidence_artifact(
+    mem: Any,
+    *,
+    evidence_type: str,
+    capability_id: str,
+    source_system: str,
+    source_path: str,
+    content: str,
+    privacy_class: str = "internal",
+    confidence: float = 0.9,
+    source_record_id: Optional[str] = None,
+    valid_from: Optional[float] = None,
+    valid_to: Optional[float] = None,
+    consumer_hint: Optional[str] = None,
+    extra_metadata: Optional[dict[str, Any]] = None,
+) -> int:
+    """Generic typed evidence record — base of the AEEvidenceIngest contract.
+
+    All specialized record_*_evidence helpers below delegate here. The
+    contract preserves provenance (source_system + source_path + source_record_id)
+    plus bi-temporal validity plus privacy classification, so any later
+    audit / privacy redaction / capability-runtime-proof query can reason
+    about it without re-parsing content.
+
+    Returns memory_id of the inserted row.
+
+    Per Theme 8 + Theme 9 of north-star: feeds typed normalized facts
+    into substrate without losing source-of-truth pointer.
+    """
+    _validate_evidence_type(evidence_type)
+    _validate_privacy_class(privacy_class)
+    if not (0.0 <= confidence <= 1.0):
+        raise ValueError(f"confidence={confidence} must be in [0.0, 1.0]")
+
+    metadata = {
+        "evidence_type": evidence_type,
+        "capability_id": capability_id,
+        "source_system": source_system,
+        "source_path": source_path,
+        "privacy_class": privacy_class,
+    }
+    if source_record_id is not None:
+        metadata["source_record_id"] = source_record_id
+    if consumer_hint is not None:
+        metadata["consumer_hint"] = consumer_hint
+    if extra_metadata:
+        # Caller-supplied keys cannot override contract keys above
+        for k, v in extra_metadata.items():
+            metadata.setdefault(k, v)
+
+    label = f"evidence:{evidence_type}:{capability_id}:{source_record_id or 'unkeyed'}"
+    return mem.remember(
+        content,
+        label=label,
+        kind="experience",
+        confidence=confidence,
+        source=source_system,
+        origin_system="ae",
+        valid_from=valid_from if valid_from is not None else _time.time(),
+        valid_to=valid_to,
+        metadata=metadata,
+    )
+
+
+def record_wa_crew_event(
+    mem: Any,
+    *,
+    capability_id: str,
+    thread_id: str,
+    sender: str,
+    raw_text: str,
+    ts: float,
+    lang: str = "es",
+    normalized_text: Optional[str] = None,
+    media_paths: Optional[list[str]] = None,
+    delivery_status: str = "delivered",
+    auth_proof: Optional[str] = None,
+    privacy_class: str = "internal",
+    consumer_hint: Optional[str] = None,
+) -> int:
+    """Record a WA crew chat event with full Theme 8 contract schema.
+
+    Per redesigner Section D: Hermes is canonical owner of WA delivery,
+    NM is canonical owner of WA recall + evidence typing. This helper is
+    the NM-side ingest target — Hermes batches WA into JSONL with this
+    shape and NM calls record_wa_crew_event per row.
+
+    Required: thread_id, sender, raw_text, ts. Optional: normalized_text
+    (translation/cleanup), media_paths (image/audio attachments),
+    auth_proof (delivery receipt / read receipt / signature).
+
+    Source path defaults to "wa_bridge:<thread_id>:<ts>" if no specific
+    file source. Bi-temporal: valid_from = ts; valid_to remains NULL
+    until message is corrected/superseded.
+    """
+    if not raw_text or not raw_text.strip():
+        raise ValueError("record_wa_crew_event: raw_text must be non-empty")
+    if delivery_status not in {"delivered", "pending", "failed", "read"}:
+        raise ValueError(
+            f"delivery_status={delivery_status!r} must be one of "
+            f"delivered/pending/failed/read"
+        )
+
+    content_parts = [raw_text]
+    if normalized_text and normalized_text != raw_text:
+        content_parts.append(f"\n[normalized:{lang}→en]\n{normalized_text}")
+    content = "".join(content_parts)
+
+    extra = {
+        "thread_id": thread_id,
+        "sender": sender,
+        "lang": lang,
+        "delivery_status": delivery_status,
+        "door": "wa",
+    }
+    if media_paths:
+        extra["media_paths"] = media_paths
+    if auth_proof:
+        extra["auth_proof"] = auth_proof
+    if normalized_text:
+        extra["normalized_text"] = normalized_text
+
+    return record_evidence_artifact(
+        mem,
+        evidence_type="wa_crew_message",
+        capability_id=capability_id,
+        source_system="hermes_wa_bridge",
+        source_path=f"wa_bridge:{thread_id}:{int(ts)}",
+        content=content,
+        privacy_class=privacy_class,
+        confidence=0.95 if delivery_status == "read" else 0.85,
+        source_record_id=f"{thread_id}:{int(ts)}",
+        valid_from=ts,
+        consumer_hint=consumer_hint,
+        extra_metadata=extra,
+    )
+
+
+def record_estimate_evidence(
+    mem: Any,
+    *,
+    capability_id: str,
+    estimate_id: str,
+    customer_id: str,
+    event_type: str,        # draft / sent / approved / scheduled / lost
+    pdf_path: Optional[str] = None,
+    amount_cents: Optional[int] = None,
+    sent_to: Optional[str] = None,
+    sent_at: Optional[float] = None,
+    privacy_class: str = "financial",
+    consumer_hint: Optional[str] = None,
+) -> int:
+    """Record an estimate-pipeline event with provenance to the PDF artifact.
+
+    For sent events: pdf_path points at /Users/tito/lWORKSPACEl/Projects/AngelsElectric/LangGraph/data/sent-estimates-pdfs/<file>.
+    For draft/approved/scheduled/lost: pdf_path optional; the event itself is the evidence.
+
+    The financial privacy class is default since estimates carry pricing
+    that's not internal-public. Override only with explicit Tito approval.
+    """
+    if event_type not in {"draft", "sent", "approved", "scheduled", "lost"}:
+        raise ValueError(
+            f"event_type={event_type!r} must be one of "
+            f"draft/sent/approved/scheduled/lost"
+        )
+
+    content_parts = [f"Estimate {estimate_id} for customer {customer_id}: {event_type}"]
+    if amount_cents is not None:
+        content_parts.append(f"\nAmount: ${amount_cents/100:.2f}")
+    if sent_to:
+        content_parts.append(f"\nSent to: {sent_to}")
+    if pdf_path:
+        content_parts.append(f"\nPDF: {pdf_path}")
+    content = "".join(content_parts)
+
+    extra = {
+        "estimate_id": estimate_id,
+        "customer_id": customer_id,
+        "event_type": event_type,
+    }
+    if amount_cents is not None:
+        extra["amount_cents"] = amount_cents
+    if sent_to:
+        extra["sent_to"] = sent_to
+    if sent_at is not None:
+        extra["sent_at"] = sent_at
+    if pdf_path:
+        extra["pdf_path"] = pdf_path
+
+    return record_evidence_artifact(
+        mem,
+        evidence_type="estimate_event" if not pdf_path else "sent_pdf",
+        capability_id=capability_id,
+        source_system="ae_dashboard",
+        source_path=pdf_path or f"estimate_pipeline:{estimate_id}:{event_type}",
+        content=content,
+        privacy_class=privacy_class,
+        confidence=0.95,
+        source_record_id=f"{estimate_id}:{event_type}",
+        valid_from=sent_at if sent_at is not None else _time.time(),
+        consumer_hint=consumer_hint,
+        extra_metadata=extra,
+    )
+
+
+def record_material_price_evidence(
+    mem: Any,
+    *,
+    capability_id: str,
+    sku: str,
+    vendor: str,
+    price_cents: int,
+    quoted_at: float,
+    quote_source_path: str,
+    unit: str = "ea",
+    valid_to: Optional[float] = None,
+    consumer_hint: Optional[str] = None,
+) -> int:
+    """Record a material/SKU price evidence with bi-temporal validity.
+
+    Use valid_to to mark price superseded (don't delete the prior — temporal
+    queries need to know what we believed before the supersede).
+
+    Vendor: amperage / gve / amazon / hd / supplyhouse / etc.
+    Privacy: 'internal' is default — prices aren't public, but not PII.
+    """
+    if price_cents < 0:
+        raise ValueError(f"price_cents={price_cents} must be non-negative")
+
+    content = (
+        f"{sku} from {vendor}: ${price_cents/100:.2f} per {unit} "
+        f"(quoted {_time.strftime('%Y-%m-%d', _time.localtime(quoted_at))})"
+    )
+
+    extra = {
+        "sku": sku,
+        "vendor": vendor,
+        "price_cents": price_cents,
+        "unit": unit,
+        "quoted_at": quoted_at,
+    }
+
+    return record_evidence_artifact(
+        mem,
+        evidence_type="material_price",
+        capability_id=capability_id,
+        source_system=f"vendor:{vendor}",
+        source_path=quote_source_path,
+        content=content,
+        privacy_class="internal",
+        confidence=0.95,
+        source_record_id=f"{sku}:{vendor}:{int(quoted_at)}",
+        valid_from=quoted_at,
+        valid_to=valid_to,
+        consumer_hint=consumer_hint,
+        extra_metadata=extra,
+    )
+
+
 __all__ = [
     "record_customer_interaction",
     "record_job_event",
@@ -613,4 +920,11 @@ __all__ = [
     "recall_template_for_job",
     "recall_estimates_for_customer",
     "recall_recent_leads",
+    # AEEvidenceIngest v0 (Theme 8 + 9, codex-redesigner Day 4 2026-05-02)
+    "record_evidence_artifact",
+    "record_wa_crew_event",
+    "record_estimate_evidence",
+    "record_material_price_evidence",
+    "EVIDENCE_PRIVACY_CLASSES",
+    "EVIDENCE_TYPES",
 ]
