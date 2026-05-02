@@ -45,8 +45,12 @@ BRIDGE_FYI="${NM_BRIDGE_FYI:-1}"
 
 # Type → default model selection. Override via CODEX_MODEL env var.
 # Available codex models (per CLI, 2026-05-02): gpt-5.5, gpt-5.4, gpt-5.4-mini,
-# gpt-5.3-codex, plus 3 others.
-#   gpt-5.5         — biggest reasoning, slow, expensive (cross-cutting audits)
+# gpt-5.3-codex, plus 3 others. Both gpt-5.5 and gpt-5.4 have identical
+# 1,050,000-token context windows + 128,000-token max output (per OpenAI docs
+# 2026-05-02, confirmed by tito) — so model choice is about REASONING DEPTH
+# and cost-per-call, NOT prompt-size fit. Even whole-module + callers fits
+# comfortably in either.
+#   gpt-5.5         — deeper reasoning, more expensive (cross-cutting audits)
 #   gpt-5.4         — general balanced default
 #   gpt-5.4-mini    — fast cheap (simple lookups, scans)
 #   gpt-5.3-codex   — code-specialized (refactor drafts, code-shape critique)
