@@ -164,6 +164,33 @@ class ScoringFormulaWiringTests(unittest.TestCase):
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
+    def test_extreme_values_produce_finite_score(self) -> None:
+        # Per round-4 reviewer: the formula has no clamp. Verify all
+        # CandidateFeatures fields at extreme values still produce a
+        # finite, non-NaN score. Defensive guard against future regressions
+        # that introduce log/sqrt/division operations.
+        import math
+        f = self._baseline()
+        f.semantic_score = 1.0
+        f.sparse_score = 1.0
+        f.graph_score = 1.0
+        f.temporal_score = 1.0
+        f.entity_score = 1.0
+        f.procedural_score = 1.0
+        f.locus_score = 1.0
+        f.rrf_feature = 1.0
+        f.salience = 2.0
+        f.confidence = 1.0
+        s = score_candidate(f, DEFAULT_WEIGHTS)
+        self.assertFalse(math.isnan(s), "score should not be NaN at extremes")
+        self.assertFalse(math.isinf(s), "score should not be inf at extremes")
+        self.assertGreater(s, 0, "all-positive features → positive score")
+        # Now test all-zero baseline: should produce 0 (or close to it)
+        f0 = CandidateFeatures(memory_id=1)  # all defaults
+        s0 = score_candidate(f0, DEFAULT_WEIGHTS)
+        self.assertAlmostEqual(s0, 0.0, places=6,
+                               msg="all-default features → ~0 score")
+
     def test_stale_penalty_threshold_at_30_days(self) -> None:
         # Phase 7.5-γ ramp: penalty starts at 30 days, caps at 0.3.
         # Verify the formula directly: stale_penalty = min(age_days/300, 0.3)
