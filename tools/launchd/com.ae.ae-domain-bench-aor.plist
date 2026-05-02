@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ae.ae-domain-bench-aor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/tito/lWORKSPACEl/research/neural-memory/tools/codex_always_on_runner.sh</string>
+    </array>
+
+    <!-- ALWAYS-ON. Fires on git HEAD change OR 24h max-interval guarantee.
+         Min interval 6h prevents bench-thrash from rapid-fire commits. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tito/.neural_memory/logs/aor-ae-domain-bench.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tito/.neural_memory/logs/aor-ae-domain-bench.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/tito/.hermes/hermes-agent/venv/bin</string>
+        <key>HOME</key>
+        <string>/Users/tito</string>
+        <key>NM_LANE</key>
+        <string>nm-builder</string>
+        <key>AOR_NAME</key>
+        <string>ae-domain-bench</string>
+        <key>AOR_SCRIPT</key>
+        <string>tools/ae_domain_bench_run.sh</string>
+        <!-- 10min poll, 6h min, 24h max — cycles after substrate or code shift -->
+        <key>AOR_POLL</key>
+        <string>600</string>
+        <key>AOR_MIN_INTERVAL</key>
+        <string>21600</string>
+        <key>AOR_MAX_INTERVAL</key>
+        <string>86400</string>
+    </dict>
+</dict>
+</plist>
