@@ -521,7 +521,7 @@ class NeuralMemory:
     def __init__(self, db_path: str | Path = DB_PATH, embedding_backend: str = "auto",
                  use_mssql: bool = False, use_cpp: bool = True,
                  rerank: bool = False,
-                 rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                 rerank_model: Optional[str] = None,
                  use_hnsw: bool = True,
                  lazy_graph: bool = False,
                  hnsw_ef_construction: int = 200,
@@ -548,6 +548,19 @@ class NeuralMemory:
 
         # Cross-encoder reranker (opt-in, lazy-loaded).
         # Keeps default behavior identical when rerank=False.
+        # Caught 2026-05-01 in AE-domain bench: English-trained MiniLM
+        # MUST_marco model regressed Spanish queries (R@5 0.33 → 0.0).
+        # Resolution chain for the model name:
+        #   1. constructor kwarg `rerank_model` (highest)
+        #   2. NM_RERANK_MODEL env var
+        #   3. multilingual default (handles AE Spanish + English)
+        # Original English-only default kept available via env override.
+        import os
+        if rerank_model is None:
+            rerank_model = os.environ.get(
+                "NM_RERANK_MODEL",
+                "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+            )
         self._rerank = bool(rerank)
         self._rerank_model_name = rerank_model
         self._rerank_model = None  # lazy
