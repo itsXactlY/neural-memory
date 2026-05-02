@@ -1616,6 +1616,44 @@ class NeuralMemory:
                 "entity_score wiring failed silently: %s", exc,
             )
 
+        # ---- Phase 7.5-ε: per-candidate locus_score ------------------
+        # If query mentions a locus name and a candidate has a located_in
+        # edge to that locus, boost via the locus channel. 0 locus rows
+        # in live DB today (deferred AE-domain wiring), but ready to fire
+        # once AE workflow seeds Lennar lots / customer addresses / job
+        # sites as kind='locus' nodes. Same batched-query pattern as
+        # entity_score.
+        locus_score_by_id: dict[int, float] = {}
+        try:
+            with self.store._lock:
+                locus_rows = self.store.conn.execute(
+                    "SELECT id, label FROM memories WHERE kind='locus'"
+                ).fetchall()
+            if locus_rows:
+                query_lower = query.lower()
+                matching_locus_ids = {
+                    lid for lid, label in locus_rows
+                    if label and label.lower() in query_lower
+                }
+                if matching_locus_ids:
+                    locus_placeholders = ",".join("?" * len(matching_locus_ids))
+                    with self.store._lock:
+                        loc_edge_rows = self.store.conn.execute(
+                            f"SELECT source_id FROM connections "
+                            f"WHERE edge_type='located_in' "
+                            f"  AND source_id IN ({placeholders}) "
+                            f"  AND target_id IN ({locus_placeholders})",
+                            tuple(sorted(candidate_ids))
+                            + tuple(sorted(matching_locus_ids)),
+                        ).fetchall()
+                    for (src_id,) in loc_edge_rows:
+                        locus_score_by_id[src_id] = 1.0
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug(
+                "locus_score wiring failed silently: %s", exc,
+            )
+
         # ---- Phase 7.5-δ: per-candidate contradicts-edge count -------
         # Wired even though contradicts edges currently have 0 rows,
         # so the contradiction-detection runner ships from D5 onward,
@@ -1706,6 +1744,7 @@ class NeuralMemory:
                 temporal_score=per_channel_scores.get("temporal", {}).get(cid, 0.0),
                 procedural_score=float(m.get("procedural_score") or 0.0),
                 entity_score=float(entity_score_by_id.get(cid, 0.0)),
+                locus_score=float(locus_score_by_id.get(cid, 0.0)),
                 stale_penalty=stale_penalty,
                 contradiction_penalty=contradiction_penalty,
                 rrf_feature=_rrf(cid),

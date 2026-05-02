@@ -32,17 +32,28 @@ MEMORY_KINDS: frozenset[str] = frozenset({
 
 
 # Edge types between nodes in the unified graph.
+# Round-3 reviewer 2026-05-01: registry was out of sync with code/DB.
+# - "similar" had 1.2M live rows but was missing from registry
+# - "applies_to" referenced by intent-weight maps + tests but missing
+# - "bridges" was canonical name; live DB used "rem_bridge" (1 row)
+# - 6 entries are aspirational (zero writers); kept as forward placeholders
+# is_valid_edge_type() is logging-only — does not gate writes (would
+# break the 1.2M `similar` default path mid-flight).
 EDGE_TYPES: frozenset[str] = frozenset({
-    "semantic_similar_to",   # cosine/embedding similarity
-    "mentions_entity",       # memory → entity reference
+    # Active in live DB (write paths exist):
+    "similar",               # auto-similar default (1.2M+ rows, the dominant edge)
+    "mentions_entity",       # memory → entity reference (~23K rows)
+    "rem_bridge",            # REM-bridging edge between weakly-linked nodes (legacy "bridges")
+    "summarizes",            # summary node → source memories (D5/Phase 7 Commit 9)
+    "derived_from",          # insight → supporting evidence (Phase 7 Commit 4)
+    "located_in",            # memory → locus / locus → wing (Phase 7 Commit 10)
+    "contradicts",           # one claim contradicts another (Phase 7 Commit 9)
+    "applies_to",            # used in intent-weight maps + tests
+    # Phase 7 spec — currently no writers but keep as forward placeholders:
+    "semantic_similar_to",   # cosine/embedding similarity (alias path)
     "happened_before",       # temporal ordering
     "caused_by",             # causal chain
     "supports",              # one claim supports another
-    "contradicts",           # one claim contradicts another
-    "summarizes",            # summary node → source memories
-    "derived_from",          # insight → supporting evidence
-    "located_in",            # memory → locus / locus → wing
-    "bridges",               # REM-bridging edge between weakly-linked nodes
     "promotes_to",           # working → durable promotion
     "decays_from",           # decay-chain provenance
     "validated_by",          # link confirmed by retrieval/dream reinforcement
