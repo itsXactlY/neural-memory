@@ -319,17 +319,12 @@ class LookupBeforeCreateHelpersTests(unittest.TestCase):
             contact={"name": "Bob Smith", "phone": "555-9999"},
             intent="bathroom",
         )
-        # duplicate_customer_id should be set (fuzzy match catches it)
-        # Note: hybrid_recall fuzzy may or may not match in this test substrate;
-        # at minimum the field exists in the result.
-        self.assertIn("duplicate_customer_id", result)
+        self.assertEqual(result["duplicate_customer_id"], cust_mid)
 
     def test_recall_customer_by_name_finds_seeded(self) -> None:
         cust_mid = record_customer(self.mem, name="Vibha Choudhury", source="qbo")
         results = recall_customer_by_name(self.mem, name="Vibha", k=5)
-        self.assertIsInstance(results, list)
-        for r in results:
-            self.assertIn("id", r)
+        self.assertIn(cust_mid, [r["id"] for r in results])
 
     def test_recall_customer_by_name_exact_mode_uses_label_equality(self) -> None:
         """fuzzy=False must use exact label match, not BM25 sparse_search.
@@ -347,8 +342,8 @@ class LookupBeforeCreateHelpersTests(unittest.TestCase):
         # Exact mode must return ONLY the customer entity, not the note
         self.assertEqual([r["id"] for r in results], [cust_mid])
 
-    def test_recall_template_for_job_returns_list(self) -> None:
-        record_template(
+    def test_recall_template_for_job_returns_seeded_template(self) -> None:
+        template_mid = record_template(
             self.mem,
             template_id="TPL-002",
             name="Service Call Standard",
@@ -356,7 +351,8 @@ class LookupBeforeCreateHelpersTests(unittest.TestCase):
             line_items=[{"sku": "BREAKER-20A", "qty": 1, "unit": "ea"}],
         )
         results = recall_template_for_job(self.mem, job_type="service")
-        self.assertIsInstance(results, list)
+        self.assertIn(template_mid, [r["id"] for r in results])
+        self.assertIn("template:TPL-002", [r["label"] for r in results])
 
     def test_recall_estimates_for_customer_metadata_filter(self) -> None:
         # Seed two estimates for different customers
@@ -374,11 +370,8 @@ class LookupBeforeCreateHelpersTests(unittest.TestCase):
         )
         # Filter for C1 — should not include C2
         results = recall_estimates_for_customer(self.mem, customer_id="C1", k=10)
-        for r in results:
-            import json
-            md = json.loads(r.get("metadata_json") or "{}")
-            if "customer_id" in md:
-                self.assertEqual(md["customer_id"], "C1")
+        self.assertEqual({r["label"] for r in results}, {"estimate:E1"})
+        self.assertEqual({r["metadata"]["customer_id"] for r in results}, {"C1"})
 
     def test_recall_recent_leads_filter_by_source(self) -> None:
         record_lead(self.mem, source="angi",
@@ -388,12 +381,8 @@ class LookupBeforeCreateHelpersTests(unittest.TestCase):
                     contact={"name": "Y"}, intent="quote",
                     auto_check_existing=False)
         results = recall_recent_leads(self.mem, source="angi", days=30)
-        self.assertIsInstance(results, list)
-        for r in results:
-            import json
-            md = json.loads(r.get("metadata_json") or "{}")
-            if "lead_source" in md:
-                self.assertEqual(md["lead_source"], "angi")
+        self.assertEqual({r["label"] for r in results}, {"lead:angi:X"})
+        self.assertEqual({r["metadata"]["lead_source"] for r in results}, {"angi"})
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ Uses the exact neural_memory.Memory API. No message_embeddings (9524d != 384d).
 """
 
 import json
+import os
 import sqlite3
 import struct
 import sys
@@ -15,7 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from neural_memory import Memory
 
 EXPORT_DIR = Path(os.environ.get("HONCHO_EXPORT_DIR", Path.home() / "honcho_export"))
-DB_PATH = Path.home() / ".neural_memory" / "memory.db"
+DB_PATH = Path(os.environ.get(
+    "NEURAL_MEMORY_DB_PATH",
+    Path.home() / ".neural_memory" / "memory.db",
+)).expanduser()
 
 def load_json(name: str):
     with open(EXPORT_DIR / name) as f:
@@ -231,7 +235,7 @@ def main():
     conn.commit()
     conn.close()
     
-    mem = Memory(use_cpp=False)  # Python backend (SQLite + embedder)
+    mem = Memory(db_path=str(DB_PATH), use_cpp=False)  # Python backend (SQLite + embedder)
     print(f"Backend: {mem.backend}, dim={mem.dim}")
     
     # Import

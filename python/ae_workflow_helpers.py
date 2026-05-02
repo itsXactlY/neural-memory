@@ -514,8 +514,10 @@ def recall_customer_by_name(
             if full:
                 out.append(full)
         return out
-    # Fallback (non-SQLite store): post-filter sparse results by exact label
-    return [r for r in mem.sparse_search(label, k=k) if r.get("label") == label]
+    raise NotImplementedError(
+        "recall_customer_by_name(fuzzy=False) requires SQLite store with .conn; "
+        "non-SQLite stores must implement direct label lookup."
+    )
 
 
 def recall_template_for_job(
