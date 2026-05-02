@@ -94,11 +94,21 @@ while true; do
             NM_LANE="$LANE" "$SYNTH" >> "$LOG" 2>&1
             RC=$?
             log "synth exit=${RC}"
+            # Always update synth-attempt timestamp (rate-limit must apply
+            # even to failed synths, otherwise rapid re-fires).
             echo "$NOW" > "$LAST_SYNTH_TS_F"
-            # Update tracking AFTER successful synth
-            echo "$CUR_HEAD" > "$LAST_HEAD_F"
-            echo "$NOW" > "$LAST_REVIEW_TS_F"
-            echo "$CUR_BRIDGE_COUNT" > "$LAST_BRIDGE_COUNT_F"
+            # Only consume change signals if synth actually succeeded —
+            # otherwise next change tick will re-fire to retry. Fix per
+            # orchestrator self-escalation 2026-05-02: was consuming
+            # signals regardless of RC, so failed synths "lost" change
+            # context that the next successful synth needed.
+            if [ "$RC" = "0" ]; then
+                echo "$CUR_HEAD" > "$LAST_HEAD_F"
+                echo "$NOW" > "$LAST_REVIEW_TS_F"
+                echo "$CUR_BRIDGE_COUNT" > "$LAST_BRIDGE_COUNT_F"
+            else
+                log "synth FAILED — preserving change signals for next tick to retry"
+            fi
         fi
     fi
 

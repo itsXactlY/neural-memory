@@ -175,22 +175,27 @@ esac
 PROMPT_NOFILE=$(echo "$PROMPT" | sed 's|Save full report to.*$|Output your report as markdown to stdout. Be terse, evidence-grounded, no manufactured findings.|; s|Save your full report to.*$|Output your report as markdown to stdout. Be terse, evidence-grounded, no manufactured findings.|')
 
 echo "[$(date)] type=${SAMPLE_TYPE} dispatching codex ${MODEL} reconciliation review → ${OUT}" >> "$LOG_FILE"
+# Write to .partial first; only finalize on codex exit 0 + meaningful body size.
+# Caught by orchestrator escalation 2026-05-02 — header-only files counted as landed.
 {
     echo "# Reconciliation review (type=${SAMPLE_TYPE})"
     echo "**Reviewer:** codex ${MODEL}"
     echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S %Z')"
     echo ""
-} > "$OUT"
+} > "${OUT}.partial"
 "$CODEX_BIN" exec \
     --model "$MODEL" \
     --sandbox read-only \
     --cd "$REPO_DIR" \
     "$PROMPT_NOFILE" \
-    >> "$OUT" 2>> "$LOG_FILE" \
-    || echo "[$(date)] WARN: reconciliation review exited non-zero" >> "$LOG_FILE"
+    >> "${OUT}.partial" 2>> "$LOG_FILE"
+CODEX_RC=$?
 
-if [ -s "$OUT" ]; then
+if [ "$CODEX_RC" = "0" ] && [ "$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)" -gt 500 ]; then
+    mv "${OUT}.partial" "$OUT"
     echo "[$(date)] reconciliation review landed at ${OUT}" >> "$LOG_FILE"
+else
+    echo "[$(date)] FAILED reconciliation review (codex_rc=$CODEX_RC, body=$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)b) — keeping .partial for diagnosis" >> "$LOG_FILE"
 fi
 
 exit 0

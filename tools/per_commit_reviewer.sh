@@ -76,23 +76,30 @@ Look for:
 Output your report as markdown to stdout. Begin with '# Review: ${SHORT} — ${SUBJECT}' as h1. Under 200 words. [verified-now] tag for confirmed issues. file_path:line cites. Be terse and evidence-grounded. Don't manufacture findings — if commit is clean, say PASS in one line."
 
     echo "[$(date)] Dispatching codex ${MODEL} review for $SHORT ($SUBJECT)" >> "$LOG_FILE"
+    # Write to .partial first; only finalize if codex exits 0 + produces meaningful
+    # body. Caught by orchestrator escalation 2026-05-02 — was treating header-only
+    # files (codex crash, transient errors) as landed reviews, masking continuity loss.
     {
         echo "# Review: $SHORT — $SUBJECT"
         echo "**Reviewer:** codex ${MODEL}"
         echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S %Z')"
         echo ""
-    } > "$OUT"
+    } > "${OUT}.partial"
     "$CODEX_BIN" exec \
         --model "$MODEL" \
         --sandbox read-only \
         --cd "$REPO_DIR" \
         "$PROMPT" \
-        >> "$OUT" 2>> "$LOG_FILE" \
-        || echo "[$(date)] WARN: review for $SHORT exited non-zero" >> "$LOG_FILE"
+        >> "${OUT}.partial" 2>> "$LOG_FILE"
+    CODEX_RC=$?
 
-    if [ -s "$OUT" ]; then
+    # Header alone is ~150 bytes; require >500 bytes to count as real review body
+    if [ "$CODEX_RC" = "0" ] && [ "$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)" -gt 500 ]; then
+        mv "${OUT}.partial" "$OUT"
         echo "[$(date)] Review for $SHORT landed at $OUT" >> "$LOG_FILE"
         REVIEWED=$((REVIEWED + 1))
+    else
+        echo "[$(date)] FAILED review for $SHORT (codex_rc=$CODEX_RC, body=$(wc -c < "${OUT}.partial" 2>/dev/null || echo 0)b) — keeping .partial for diagnosis" >> "$LOG_FILE"
     fi
 done
 
