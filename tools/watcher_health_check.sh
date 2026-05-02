@@ -64,13 +64,15 @@ record_count() {
     mv "${STATE_FILE}.tmp" "$STATE_FILE"
 }
 
-# 1. Per-commit reviewer (5min cadence; allow 3× = 15min staleness)
+# 1. Per-commit reviewer (5min cadence; allow 2× = 10min staleness)
+# Tightened from 900s to 600s per orchestrator-esc-064435: 900s let real
+# 772s lag pass as healthy despite 300s cadence.
 F="${HOME}/.neural_memory/logs/per-commit-reviewer.log"
 A=$(mtime_age "$F")
 if [ "$A" -lt 0 ]; then
     ISSUES+=("CRITICAL: per-commit-reviewer log missing at $F")
-elif [ "$A" -gt 900 ]; then
-    ISSUES+=("STALE: per-commit-reviewer last fired ${A}s ago (expected ≤ 900s)")
+elif [ "$A" -gt 600 ]; then
+    ISSUES+=("STALE: per-commit-reviewer last fired ${A}s ago (expected ≤ 600s)")
 else
     HEALTHY+=("per-commit-reviewer (${A}s ago)")
 fi

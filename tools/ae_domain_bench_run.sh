@@ -8,8 +8,11 @@
 # Tito META rule: "NOT NO TIME BASED THINGS" — wired as AOR (always-on
 # runner with min-interval), NOT StartCalendarInterval cron.
 #
-# Schedule: AOR fires on git HEAD change OR substrate db mtime change OR
-# 24h max-interval guarantee. See com.ae.ae-domain-bench-aor.plist.
+# Schedule: AOR fires on git HEAD change OR 24h max-interval guarantee.
+# (Earlier comment claimed substrate db mtime triggers — incorrect, the
+# AOR wrapper at tools/codex_always_on_runner.sh:49-74 only checks HEAD +
+# first-run + max-interval. Caught by per-commit reviewer of b0b71cf.)
+# See com.ae.ae-domain-bench-aor.plist.
 
 set -uo pipefail
 
@@ -45,11 +48,14 @@ if [ "$RC" -ne 0 ]; then
     exit "$RC"
 fi
 
-# Pull latest R@5 from the JSON report.
+# Pull latest R@5 from the JSON report. The bench writes result.global_r@5
+# (note the @ symbol — needs dict-key access, not attribute). Bug caught by
+# per-commit reviewer of b0b71cf: original 'overall.recall_at_5' lookup
+# returned NA every time so regression-alert never fired.
 LATEST_R5=$("$PY" -c "
-import json, sys
+import json
 d = json.load(open('${OUT}'))
-print(d.get('overall', {}).get('recall_at_5', 'NA'))
+print(d.get('result', {}).get('global_r@5', 'NA'))
 " 2>/dev/null)
 
 # Find previous AE-domain run for delta comparison.
@@ -59,7 +65,7 @@ if [ -n "$PREV" ] && [ "$LATEST_R5" != "NA" ]; then
     PREV_R5=$("$PY" -c "
 import json
 d = json.load(open('${PREV}'))
-print(d.get('overall', {}).get('recall_at_5', 'NA'))
+print(d.get('result', {}).get('global_r@5', 'NA'))
 " 2>/dev/null)
     log "R@5: latest=${LATEST_R5} prev=${PREV_R5} (prev=${PREV})"
 
