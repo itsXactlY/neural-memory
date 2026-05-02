@@ -341,7 +341,8 @@ def render_text(report: dict) -> str:
     lines.append(f"  β  entity_score from mentions_entity edges  SHIPPED 2026-05-01")
     lines.append(f"  γ  stale_penalty from age                   SHIPPED 2026-05-01")
     lines.append(f"  δ  contradiction_penalty from edges         SHIPPED 2026-05-01")
-    lines.append(f"  ε  locus_score / valid_to                   DEFERRED (AE-coordinated)")
+    lines.append(f"  ε  locus_score                              SHIPPED 2026-05-01")
+    lines.append(f"     valid_to / contradicts edge writers       DEFERRED (data-side wiring)")
     lines.append(f"  Coverage: integration test suite")
     lines.append(f"  python/test_phase7_5_wiring_integration.py  6 contracts")
 

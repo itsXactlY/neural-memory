@@ -211,7 +211,7 @@ def phase7_5_wiring_section() -> str:
         f"  β  entity SHIPPED   mentions_entity edges:           {ent_n}",
         f"  γ  stale  SHIPPED   computed at-query from age (no row count)",
         f"  δ  contra SHIPPED   contradicts edges:               {contradict_n}",
-        f"  ε  locus  DEFERRED  locus nodes:                     {locus_n}",
+        f"  ε  locus  SHIPPED   locus nodes:                     {locus_n}",
         f"  D5 (Valiendo lane):  dream_insight nodes:            {insight_n}",
     ]
     return "\n".join(lines)

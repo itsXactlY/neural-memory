@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.ae.neural-memory-per-commit-review.plist — per-commit sonnet reviewer
+
+  Runs every 60 min: checks git log on the active NM-lane branch for new
+  commits since last tick, dispatches a sonnet reviewer per commit, saves
+  findings to ~/.neural_memory/per-commit-reviews/<short-sha>-review.md.
+
+  Pattern adopted 2026-05-01 from AE-builder's archaeology-tick LaunchAgent.
+
+  Install:
+    cp com.ae.neural-memory-per-commit-review.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ae.neural-memory-per-commit-review.plist
+
+  Logs: ~/.neural_memory/logs/per-commit-reviewer.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ae.neural-memory-per-commit-review</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/tito/lWORKSPACEl/research/neural-memory/tools/per_commit_reviewer.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tito/.neural_memory/logs/per-commit-reviewer.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/tito/.neural_memory/logs/per-commit-reviewer.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Users/tito/.local/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/tito/lWORKSPACEl/research/neural-memory</string>
+</dict>
+</plist>
