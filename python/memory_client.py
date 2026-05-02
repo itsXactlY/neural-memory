@@ -1988,6 +1988,10 @@ class NeuralMemory:
         # contribution that produced its rank. Lets downstream UIs explain
         # "why did this rank?" without re-querying. See reference_mazemaker_
         # digest_2026-05-01.md for the pattern.
+        # Mazemaker-inspired Pattern D (2026-05-02): access logger captures
+        # every recall event as JSONL for future tuning + labeling-signal
+        # mining. Best-effort, never blocks retrieval. Disable via env.
+        _hybrid_recall_t0 = time.time()
         results: list[dict[str, Any]] = []
         for cid, final_score, _m, features in scored[:k]:
             row = self.store.get(cid)
@@ -2010,6 +2014,21 @@ class NeuralMemory:
                     "contradiction_penalty": round(features.contradiction_penalty, 4),
                 }
                 results.append(row)
+        # Mazemaker pass-2 Pattern D: append to access log
+        try:
+            from access_logger import default_logger
+            _logger = default_logger()
+            if _logger is not None:
+                _logger.log(
+                    query=query, k=k, results=results,
+                    latency_ms=(time.time() - _hybrid_recall_t0) * 1000.0,
+                    channels=list(per_channel_ranks.keys()),
+                    method="hybrid_recall",
+                    kind_filter=kind,
+                    rerank=use_rerank,
+                )
+        except Exception:
+            pass
         return results
 
     # ------------------------------------------------------------------
