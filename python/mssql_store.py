@@ -195,13 +195,14 @@ class MSSQLStore:
         )
         self.conn.commit()
     
-    def get_connections(self, node_id: int) -> list[dict]:
+    def get_connections(self, node_id: int, at_time=None,
+                        include_expired: bool = False) -> list[dict]:
         # Reconciliation-reviewer-round-1 fix 2026-05-02: align return
         # shape with SQLiteStore.get_connections (8 keys, not 4).
-        # Callers consuming the SQLite path expected event_time +
-        # ingestion_time + valid_from + valid_to. MSSQL silently
-        # truncated those — would cause downstream KeyError or
-        # wrong-scoring under hybrid_recall.
+        # Per-commit-reviewer-round-2 fix 2026-05-02: also accept + apply
+        # at_time + include_expired params (memory_client.py:2175 calls
+        # with include_expired=True; signature mismatch would TypeError).
+        import time as _time
         cursor = self.conn.cursor()
         cursor.execute(
             "SELECT source_id, target_id, weight, edge_type, "
@@ -210,12 +211,22 @@ class MSSQLStore:
             "ORDER BY weight DESC",
             node_id, node_id
         )
-        return [
-            {'source': r[0], 'target': r[1], 'weight': r[2], 'type': r[3],
-             'event_time': r[4], 'ingestion_time': r[5],
-             'valid_from': r[6], 'valid_to': r[7]}
-            for r in cursor.fetchall()
-        ]
+        now = at_time if at_time is not None else _time.time()
+        out = []
+        for r in cursor.fetchall():
+            vf, vt = r[6], r[7]
+            if not include_expired:
+                # Match SQLite implementation's Python-side temporal filter
+                if vf is not None and now < vf:
+                    continue
+                if vt is not None and now > vt:
+                    continue
+            out.append({
+                'source': r[0], 'target': r[1], 'weight': r[2], 'type': r[3],
+                'event_time': r[4], 'ingestion_time': r[5],
+                'valid_from': vf, 'valid_to': vt,
+            })
+        return out
 
     def get_connections_batch(
         self, node_ids, at_time=None, include_expired: bool = False,
@@ -224,9 +235,11 @@ class MSSQLStore:
         perf win shipped in commit b2bda67 against SQLiteStore.
 
         Reconciliation-reviewer-round-1 fix 2026-05-02: this method was
-        missing on MSSQLStore, causing the batched code path to silently
-        fall back to per-node get_connections (negating the perf fix).
+        missing on MSSQLStore. Per-commit-reviewer-round-2 fix 2026-05-02:
+        actually APPLY the at_time + include_expired params (was accepting
+        them but never applying — would have leaked dead edges into BFS).
         """
+        import time as _time
         node_ids = list(node_ids)
         if not node_ids:
             return {}
@@ -242,13 +255,21 @@ class MSSQLStore:
             f"ORDER BY weight DESC",
             *params
         )
+        now = at_time if at_time is not None else _time.time()
         out: dict = {nid: [] for nid in node_ids}
         node_set = set(node_ids)
         for r in cursor.fetchall():
+            vf, vt = r[6], r[7]
+            if not include_expired:
+                # Match SQLite implementation's Python-side temporal filter
+                if vf is not None and now < vf:
+                    continue
+                if vt is not None and now > vt:
+                    continue
             edge = {
                 'source': r[0], 'target': r[1], 'weight': r[2], 'type': r[3],
                 'event_time': r[4], 'ingestion_time': r[5],
-                'valid_from': r[6], 'valid_to': r[7],
+                'valid_from': vf, 'valid_to': vt,
             }
             if r[0] in node_set:
                 out[r[0]].append(edge)
