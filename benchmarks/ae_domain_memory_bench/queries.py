@@ -36,13 +36,13 @@ CATEGORY_THRESHOLDS = {
 
 
 def _q(qid, category, query, channels, temporal_mode="current_or_unspecified",
-       minimum_rank=5):
+       minimum_rank=5, ground_truth_ids=None):
     return {
         "id": qid, "category": category, "query": query,
         "expected_channels": channels,
         "minimum_rank": minimum_rank,
         "temporal_mode": temporal_mode,
-        "ground_truth_ids": [],  # fill via labeling
+        "ground_truth_ids": list(ground_truth_ids or []),
     }
 
 
@@ -50,7 +50,7 @@ def _q(qid, category, query, channels, temporal_mode="current_or_unspecified",
 # Electrical Contracting Jargon (40)
 # ---------------------------------------------------------------------------
 _ELC = [
-    _q("ELC-001", "electrical_contracting", "Which memories mention GFCI requirements for outdoor receptacles?", ["sparse","entity","dense"]),
+    _q("ELC-001", "electrical_contracting", "Which memories mention GFCI requirements for outdoor receptacles?", ["sparse","entity","dense"], ground_truth_ids=[277, 288]),
     _q("ELC-002", "electrical_contracting", "Find the service upgrade notes involving a 200 amp panel.", ["sparse","entity","temporal"]),
     _q("ELC-003", "electrical_contracting", "What did we say about conduit fill on the last commercial job?", ["sparse","temporal","dense"]),
     _q("ELC-004", "electrical_contracting", "Recall the job where AFCI nuisance tripping came up.", ["sparse","dense","graph"]),
@@ -60,9 +60,9 @@ _ELC = [
     _q("ELC-008", "electrical_contracting", "Which project involved EMT conduit and exposed garage wiring?", ["sparse","entity","graph"]),
     _q("ELC-009", "electrical_contracting", "Find memories about load calculation for a service upgrade.", ["sparse","dense","procedural"]),
     _q("ELC-010", "electrical_contracting", "What did we decide about replacing knob-and-tube wiring?", ["sparse","temporal","dense"]),
-    _q("ELC-011", "electrical_contracting", "Which memories mention bonding bushings?", ["sparse","dense"]),
+    _q("ELC-011", "electrical_contracting", "Which memories mention bonding bushings?", ["sparse","dense"], ground_truth_ids=[5961]),
     _q("ELC-012", "electrical_contracting", "Find the customer conversation about recessed lighting spacing.", ["dense","entity","temporal"]),
-    _q("ELC-013", "electrical_contracting", "What notes do we have about EV charger installation?", ["sparse","entity","procedural"]),
+    _q("ELC-013", "electrical_contracting", "What notes do we have about EV charger installation?", ["sparse","entity","procedural"], ground_truth_ids=[158]),
     _q("ELC-014", "electrical_contracting", "Which job had a failed inspection due to missing labels?", ["sparse","temporal","graph"]),
     _q("ELC-015", "electrical_contracting", "Find the memory about meter socket replacement.", ["sparse","entity"]),
     _q("ELC-016", "electrical_contracting", "What did we record about a subpanel neutral-ground bond issue?", ["sparse","dense","graph"]),
@@ -76,7 +76,7 @@ _ELC = [
     _q("ELC-024", "electrical_contracting", "Find memories about aluminum wiring remediation.", ["sparse","dense"]),
     _q("ELC-025", "electrical_contracting", "What did we say about smoke detector circuit requirements?", ["sparse","procedural"]),
     _q("ELC-026", "electrical_contracting", "Which job had a short circuit caused by damaged romex?", ["sparse","causal","temporal"]),
-    _q("ELC-027", "electrical_contracting", "Find panel schedule or labeling notes.", ["sparse","dense"]),
+    _q("ELC-027", "electrical_contracting", "Find panel schedule or labeling notes.", ["sparse","dense"], ground_truth_ids=[274, 286]),
     _q("ELC-028", "electrical_contracting", "What was the quote context for a detached garage subpanel?", ["entity","sparse","temporal"]),
     _q("ELC-029", "electrical_contracting", "Which memory mentions emergency electrical repair after storm damage?", ["sparse","temporal","entity"]),
     _q("ELC-030", "electrical_contracting", "Find memories about replacing cloth wiring.", ["sparse","dense"]),
@@ -99,14 +99,14 @@ _ELC = [
 _SPA = [
     _q("SPA-001", "spanish_whatsapp", "Busca el mensaje donde el crew dijo que faltaba conduit.", ["sparse","multilingual_dense","entity"]),
     _q("SPA-002", "spanish_whatsapp", "Que dijo el equipo sobre llegar tarde al job site?", ["temporal","multilingual_dense"]),
-    _q("SPA-003", "spanish_whatsapp", "Encuentra la conversacion sobre material que no llego.", ["sparse","entity","temporal"]),
+    _q("SPA-003", "spanish_whatsapp", "Encuentra la conversacion sobre material que no llego.", ["sparse","entity","temporal"], ground_truth_ids=[6671, 6674, 6700, 7363, 7365, 7377]),
     _q("SPA-004", "spanish_whatsapp", "Cual fue la instruccion en Espanol para apagar el breaker?", ["procedural","sparse","multilingual_dense"]),
     _q("SPA-005", "spanish_whatsapp", "Busca notas de WhatsApp sobre permiso de trabajo.", ["sparse","temporal"]),
     _q("SPA-006", "spanish_whatsapp", "Que crew member pidio mas cable?", ["entity","sparse"]),
     _q("SPA-007", "spanish_whatsapp", "Encuentra mensaje sobre panel en mal estado.", ["sparse","entity"]),
     _q("SPA-008", "spanish_whatsapp", "Donde hablamos de terminar manana?", ["temporal","multilingual_dense"]),
     _q("SPA-009", "spanish_whatsapp", "Busca mensaje sobre inspeccion fallida.", ["sparse","temporal","entity"]),
-    _q("SPA-010", "spanish_whatsapp", "Que se dijo sobre comprar breakers?", ["materials","sparse","temporal"]),
+    _q("SPA-010", "spanish_whatsapp", "Que se dijo sobre comprar breakers?", ["materials","sparse","temporal"], ground_truth_ids=[6700, 7377]),
     _q("SPA-011", "spanish_whatsapp", "Encuentra notas sobre escalera o ladder en el sitio.", ["sparse","multilingual_dense"]),
     _q("SPA-012", "spanish_whatsapp", "Quien dijo que el cliente no estaba en casa?", ["entity","temporal"]),
     _q("SPA-013", "spanish_whatsapp", "Busca mensaje sobre cerrar la electricidad.", ["procedural","dense"]),
@@ -131,7 +131,7 @@ _SPA = [
     _q("SPA-032", "spanish_whatsapp", "Quien confirmo que ya termino la instalacion?", ["entity","temporal"]),
     _q("SPA-033", "spanish_whatsapp", "Encuentra mensaje sobre falta de energia.", ["sparse","dense"]),
     _q("SPA-034", "spanish_whatsapp", "Que se dijo sobre recoger permit paperwork?", ["sparse","temporal"]),
-    _q("SPA-035", "spanish_whatsapp", "Busca mensaje de WhatsApp sobre cable numero doce.", ["sparse","materials"]),
+    _q("SPA-035", "spanish_whatsapp", "Busca mensaje de WhatsApp sobre cable numero doce.", ["sparse","materials"], ground_truth_ids=[6674, 7365]),
     _q("SPA-036", "spanish_whatsapp", "Quien dijo que el breaker no encajaba?", ["entity","materials"]),
     _q("SPA-037", "spanish_whatsapp", "Encuentra notas en Espanol sobre trabajar en el sotano.", ["entity","dense"]),
     _q("SPA-038", "spanish_whatsapp", "Que mensaje menciona inspeccion el viernes?", ["temporal","sparse"]),
@@ -149,7 +149,7 @@ _MAT = [
     _q("MAT-003", "materials_sku", "Find notes about 12/2 romex purchase.", ["sparse","materials"]),
     _q("MAT-004", "materials_sku", "What materials were needed for the panel upgrade?", ["entity","temporal","materials"]),
     _q("MAT-005", "materials_sku", "Which memory mentions EMT connectors?", ["sparse","materials"]),
-    _q("MAT-006", "materials_sku", "Find SKU context for GFCI outlets.", ["sparse","materials"]),
+    _q("MAT-006", "materials_sku", "Find SKU context for GFCI outlets.", ["sparse","materials"], ground_truth_ids=[4666]),
     _q("MAT-007", "materials_sku", "Which job required a meter socket?", ["sparse","entity","materials"]),
     _q("MAT-008", "materials_sku", "Find memories about wire nuts or connectors.", ["sparse","materials"]),
     _q("MAT-009", "materials_sku", "What did we buy for exterior lighting?", ["entity","temporal","materials"]),
@@ -158,18 +158,18 @@ _MAT = [
     _q("MAT-012", "materials_sku", "Which customer needed a surge protector?", ["entity","sparse","materials"]),
     _q("MAT-013", "materials_sku", "Find memory about load center brand.", ["sparse","materials"]),
     _q("MAT-014", "materials_sku", "What project needed weatherproof boxes?", ["sparse","entity","materials"]),
-    _q("MAT-015", "materials_sku", "Find the conversation about buying breakers at Home Depot.", ["materials","entity","temporal"]),
+    _q("MAT-015", "materials_sku", "Find the conversation about buying breakers at Home Depot.", ["materials","entity","temporal"], ground_truth_ids=[4917, 6267]),
     _q("MAT-016", "materials_sku", "Which job required a grounding rod?", ["sparse","entity"]),
     _q("MAT-017", "materials_sku", "Find material notes about PVC conduit.", ["sparse","materials"]),
     _q("MAT-018", "materials_sku", "What SKU or item did we use for dimmer switches?", ["sparse","materials"]),
     _q("MAT-019", "materials_sku", "Which quote included recessed cans?", ["sparse","entity","materials"]),
     _q("MAT-020", "materials_sku", "Find memory about AFCI breaker part.", ["sparse","materials"]),
-    _q("MAT-021", "materials_sku", "What materials were missing on the crew message?", ["materials","spanish","temporal"]),
+    _q("MAT-021", "materials_sku", "What materials were missing on the crew message?", ["materials","spanish","temporal"], ground_truth_ids=[6671, 6674, 6700, 7363, 7365, 7377]),
     _q("MAT-022", "materials_sku", "Find notes about a disconnect switch.", ["sparse","materials"]),
-    _q("MAT-023", "materials_sku", "Which project needed flex conduit?", ["sparse","entity"]),
+    _q("MAT-023", "materials_sku", "Which project needed flex conduit?", ["sparse","entity"], ground_truth_ids=[5955]),
     _q("MAT-024", "materials_sku", "Find materials for kitchen dedicated circuits.", ["procedural","materials","entity"]),
-    _q("MAT-025", "materials_sku", "What did we record about panel labels?", ["sparse","materials"]),
-    _q("MAT-026", "materials_sku", "Find memory about junction box size.", ["sparse","materials"]),
+    _q("MAT-025", "materials_sku", "What did we record about panel labels?", ["sparse","materials"], ground_truth_ids=[274, 286]),
+    _q("MAT-026", "materials_sku", "Find memory about junction box size.", ["sparse","materials"], ground_truth_ids=[5947, 5966]),
     _q("MAT-027", "materials_sku", "Which job required low voltage cable?", ["sparse","entity"]),
     _q("MAT-028", "materials_sku", "Find notes about LED fixture model.", ["sparse","materials"]),
     _q("MAT-029", "materials_sku", "What material was used for underground feed?", ["materials","dense","entity"]),
@@ -191,12 +191,12 @@ _MAT = [
 # Lennar Lot Lookups (40)
 # ---------------------------------------------------------------------------
 _LOT = [
-    _q("LOT-001", "lennar_lots", "Find all memories for Lennar lot 12.", ["entity","sparse","temporal"]),
-    _q("LOT-002", "lennar_lots", "What happened at lot 27 before the inspection?", ["entity","temporal","graph"]),
+    _q("LOT-001", "lennar_lots", "Find all memories for Lennar lot 12.", ["entity","sparse","temporal"], ground_truth_ids=[5179, 4914]),
+    _q("LOT-002", "lennar_lots", "What happened at lot 27 before the inspection?", ["entity","temporal","graph"], ground_truth_ids=[266, 281]),
     _q("LOT-003", "lennar_lots", "Which lot had the missing permit paperwork?", ["entity","sparse"]),
     _q("LOT-004", "lennar_lots", "Find notes about Lennar closeout punch list.", ["sparse","entity"]),
-    _q("LOT-005", "lennar_lots", "Which lot needed panel labels corrected?", ["entity","sparse"]),
-    _q("LOT-006", "lennar_lots", "Find memory about Sarah's Lennar contact update.", ["entity","temporal"]),
+    _q("LOT-005", "lennar_lots", "Which lot needed panel labels corrected?", ["entity","sparse"], ground_truth_ids=[274, 286]),
+    _q("LOT-006", "lennar_lots", "Find memory about Sarah's Lennar contact update.", ["entity","temporal"], ground_truth_ids=[264, 268, 280, 282]),
     _q("LOT-007", "lennar_lots", "What was the last action item for lot 44?", ["entity","temporal","procedural"]),
     _q("LOT-008", "lennar_lots", "Which lot had delayed material delivery?", ["entity","materials","temporal"]),
     _q("LOT-009", "lennar_lots", "Find notes for lot address with basement rough-in.", ["entity","dense"]),
@@ -213,7 +213,7 @@ _LOT = [
     _q("LOT-020", "lennar_lots", "Which Lennar lot had customer walkthrough notes?", ["entity","temporal"]),
     _q("LOT-021", "lennar_lots", "Find memory about garage subpanel in a Lennar lot.", ["entity","sparse"]),
     _q("LOT-022", "lennar_lots", "Which lot needed smoke detector corrections?", ["entity","sparse"]),
-    _q("LOT-023", "lennar_lots", "Find latest Lennar contact preference.", ["entity","temporal"]),
+    _q("LOT-023", "lennar_lots", "Find latest Lennar contact preference.", ["entity","temporal"], ground_truth_ids=[268, 282]),
     _q("LOT-024", "lennar_lots", "Which lot was rescheduled because of rain?", ["entity","temporal"]),
     _q("LOT-025", "lennar_lots", "Find notes about lot 40 inspection window.", ["entity","temporal"]),
     _q("LOT-026", "lennar_lots", "Which lot had change order discussion?", ["entity","financial","temporal"]),
@@ -229,7 +229,7 @@ _LOT = [
     _q("LOT-036", "lennar_lots", "Which lot needed crew to return tomorrow?", ["entity","spanish","temporal"]),
     _q("LOT-037", "lennar_lots", "Find latest status for lot 29.", ["entity","temporal"]),
     _q("LOT-038", "lennar_lots", "Which lot had unresolved electrical issue?", ["entity","graph","temporal"]),
-    _q("LOT-039", "lennar_lots", "Find notes connecting Lennar lot to invoice status.", ["entity","financial"]),
+    _q("LOT-039", "lennar_lots", "Find notes connecting Lennar lot to invoice status.", ["entity","financial"], ground_truth_ids=[5179, 4914, 5180, 5531]),
     _q("LOT-040", "lennar_lots", "Which lot had the customer signoff?", ["entity","temporal"]),
 ]
 
@@ -239,7 +239,7 @@ _LOT = [
 # ---------------------------------------------------------------------------
 _FIN = [
     _q("FIN-001", "financial_calendar", "Which jobs have unpaid invoices this week?", ["financial","temporal","entity"]),
-    _q("FIN-002", "financial_calendar", "Find memories about job-cost overruns for materials.", ["financial","materials","temporal"]),
+    _q("FIN-002", "financial_calendar", "Find memories about job-cost overruns for materials.", ["financial","materials","temporal"], ground_truth_ids=[2628, 2659]),
     _q("FIN-003", "financial_calendar", "Which quote was approved but not scheduled?", ["financial","temporal","entity"]),
     _q("FIN-004", "financial_calendar", "What was the payment status before the latest update?", ["temporal","financial"]),
     _q("FIN-005", "financial_calendar", "Find notes about QuickBooks refresh or QBO token issue.", ["sparse","temporal","procedural"]),
@@ -263,7 +263,7 @@ _FIN = [
     _q("FIN-023", "financial_calendar", "Find memories about sales tax or material markup.", ["financial","procedural"]),
     _q("FIN-024", "financial_calendar", "Which customer paid cash versus card?", ["financial","entity"]),
     _q("FIN-025", "financial_calendar", "Find notes about quote revision after scope changed.", ["financial","temporal","causal"]),
-    _q("FIN-026", "financial_calendar", "Which unpaid invoice relates to Lennar?", ["financial","entity"]),
+    _q("FIN-026", "financial_calendar", "Which unpaid invoice relates to Lennar?", ["financial","entity"], ground_truth_ids=[4596]),
     _q("FIN-027", "financial_calendar", "Find memories about accounting closeout for April.", ["financial","temporal"]),
     _q("FIN-028", "financial_calendar", "Which job is profitable after material costs?", ["financial","materials","graph"]),
     _q("FIN-029", "financial_calendar", "Find notes about resending an invoice.", ["financial","temporal"]),
@@ -276,7 +276,7 @@ _FIN = [
     _q("FIN-036", "financial_calendar", "Which job had materials bought before customer approval?", ["financial","materials","temporal"]),
     _q("FIN-037", "financial_calendar", "Find memories about insurance or certificate paperwork.", ["financial","sparse"]),
     _q("FIN-038", "financial_calendar", "Which invoices need aging report attention?", ["financial","temporal"]),
-    _q("FIN-039", "financial_calendar", "Find memory about job-cost split between labor and materials.", ["financial","materials"]),
+    _q("FIN-039", "financial_calendar", "Find memory about job-cost split between labor and materials.", ["financial","materials"], ground_truth_ids=[5875, 2785]),
     _q("FIN-040", "financial_calendar", "Which customer had payment terms changed?", ["financial","temporal","entity"]),
 ]
 
