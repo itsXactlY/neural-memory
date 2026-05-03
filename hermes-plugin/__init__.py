@@ -535,6 +535,31 @@ class NeuralMemoryProvider(MemoryProvider):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True)
         self._prefetch_thread.start()
 
+    @staticmethod
+    def _normalize_score_keys(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Expose a single `similarity` key on every result row.
+
+        `recall()` returns rows keyed `similarity`; `hybrid_recall()` returns
+        rows keyed `combined` (or `_combined` on rerank intermediates). Downstream
+        consumers (queue_prefetch formatter, _handle_recall LLM payload, dashboard
+        UIs) all read `similarity`. This is additive — original keys are
+        preserved so callers that DO read `combined` (e.g. dashboards) keep
+        working. Mutates rows in-place and returns the same list for caller
+        chaining convenience.
+        """
+        if not results:
+            return results
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            if "similarity" in row:
+                continue
+            if "combined" in row:
+                row["similarity"] = row["combined"]
+            elif "_combined" in row:
+                row["similarity"] = row["_combined"]
+        return results
+
     def _queue_prefetch_results(self, query: str, limit: int) -> List[Dict[str, Any]]:
         """Recall queue_prefetch results with optional hybrid recall.
 
@@ -561,7 +586,7 @@ class NeuralMemoryProvider(MemoryProvider):
                 elapsed,
             )
             return self._memory.recall(query, k=limit)
-        return results
+        return self._normalize_score_keys(results)
 
     def _is_garbage(self, text: str) -> bool:
         """Check if text is meta-reflection garbage, not real content."""
@@ -970,7 +995,7 @@ class NeuralMemoryProvider(MemoryProvider):
         try:
             query = args["query"]
             limit = int(args.get("limit", 5))
-            results = self._memory.recall(query, k=limit)
+            results = self._recall_with_optional_hybrid(query, limit)
             # Strip embedding vectors and connections — only send useful fields to LLM
             clean = []
             for r in results:
@@ -985,6 +1010,43 @@ class NeuralMemoryProvider(MemoryProvider):
             return tool_error(f"Missing required argument: {exc}")
         except Exception as exc:
             return tool_error(str(exc))
+
+    def _recall_with_optional_hybrid(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """LIVE_FEED #10: route _handle_recall through bench-validated
+        hybrid_recall(rerank=True) when NM_HERMES_HYBRID_RECALL=1.
+
+        Same env-var single-source-of-truth as queue_prefetch. Differences
+        from queue_prefetch path:
+          - rerank=True (queue_prefetch uses rerank=False — bench shows
+            rerank is the dominant ranking signal but is heavier; opt-in
+            here matches the explicit-recall use case where the user is
+            asking for an answer, not a background prefetch).
+          - Same 2.0s latency guard + exception fallback to plain recall().
+          - Same `similarity` key normalization for downstream consumers.
+
+        Default (env unset) preserves existing behavior — plain recall().
+        """
+        if os.environ.get("NM_HERMES_HYBRID_RECALL") != "1":
+            return self._memory.recall(query, k=limit)
+
+        started = time.perf_counter()
+        try:
+            results = self._memory.hybrid_recall(query, k=limit, rerank=True)
+        except Exception as e:
+            logger.warning(
+                "Neural _handle_recall hybrid_recall failed; falling back to recall: %s",
+                e,
+            )
+            return self._memory.recall(query, k=limit)
+
+        elapsed = time.perf_counter() - started
+        if elapsed > 2.0:
+            logger.warning(
+                "Neural _handle_recall hybrid_recall took %.2fs; falling back to recall",
+                elapsed,
+            )
+            return self._memory.recall(query, k=limit)
+        return self._normalize_score_keys(results)
 
     def _handle_think(self, args: dict) -> str:
         try:
