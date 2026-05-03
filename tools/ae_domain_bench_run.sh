@@ -42,12 +42,25 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 log "AE-domain bench START → ${OUT}"
 cd "$REPO"
 
+# F9 Bug B fix: pick the most recent prior bench-history artifact (excluding
+# the file we are about to write — OUT does not exist yet, so a plain
+# `ls -t` of ae-domain-*.json gives us the latest pre-existing run).
+PREV_FOR_GATE=$(ls -t "${HIST}"/ae-domain-*.json 2>/dev/null | head -1)
+PREV_ARG=()
+if [ -n "${PREV_FOR_GATE}" ] && [ -f "${PREV_FOR_GATE}" ]; then
+    PREV_ARG=(--prev-results "${PREV_FOR_GATE}")
+    log "per-category regression gate: prev=${PREV_FOR_GATE}"
+else
+    log "per-category regression gate: no prior artifact (first run)"
+fi
+
 # Run bench. --mode scored uses ground_truth_ids in queries.py (33 labeled
 # as of HEAD f6f9193). Reranker is enabled (production retrieval profile).
 "$PY" benchmarks/ae_domain_memory_bench/run_ae_domain_bench.py \
     --mode scored \
     --rerank \
-    --out "$OUT" >> "$LOG" 2>&1
+    --out "$OUT" \
+    "${PREV_ARG[@]}" >> "$LOG" 2>&1
 RC=$?
 
 # rc=0  → all categories passed threshold

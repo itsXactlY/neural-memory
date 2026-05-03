@@ -96,7 +96,18 @@ def _substrate_counts(db_path: str | None) -> dict:
 
 
 def _model_provenance(mem) -> dict:
-    """Best-effort: pull embedder + reranker identifiers from the live store."""
+    """Best-effort: pull embedder + reranker identifiers from the live store.
+
+    Reads PUBLIC attributes per memory_client.py: ``mem.embedder`` (set at
+    line 592) and ``mem.dim`` (set at line 604). Falls back to private
+    ``_embedder`` only if the public name is absent — earlier code read
+    ``_embedder`` first, which was always None on the live NeuralMemory
+    instance, so embedding_model/embedding_dim were silently null.
+
+    On EmbeddingProvider the model name lives on ``backend.MODEL_NAME``
+    (see embed_provider.py:34) — try the provider directly first, then
+    fall through to ``provider.backend``.
+    """
     out = {
         "embedding_model": None,
         "embedding_dim": None,
@@ -104,16 +115,38 @@ def _model_provenance(mem) -> dict:
         "reranker_es": None,
     }
     try:
-        emb = getattr(mem, "_embedder", None)
+        emb = getattr(mem, "embedder", None)
+        if emb is None:
+            # Defensive fallback: pre-2026-05 code may have used the private name.
+            emb = getattr(mem, "_embedder", None)
         if emb is not None:
-            out["embedding_model"] = (
+            model_name = (
                 getattr(emb, "model_name", None)
                 or getattr(emb, "MODEL_NAME", None)
             )
-            out["embedding_dim"] = getattr(emb, "dim", None)
+            if model_name is None:
+                backend = getattr(emb, "backend", None)
+                if backend is not None:
+                    model_name = (
+                        getattr(backend, "model_name", None)
+                        or getattr(backend, "MODEL_NAME", None)
+                    )
+            out["embedding_model"] = model_name
+            # Prefer the top-level mem.dim (public on NeuralMemory), fall
+            # back to the embedder's own dim.
+            out["embedding_dim"] = (
+                getattr(mem, "dim", None)
+                or getattr(emb, "dim", None)
+            )
+        else:
+            # No embedder at all — still surface mem.dim if NeuralMemory has one.
+            out["embedding_dim"] = getattr(mem, "dim", None)
     except Exception:
         pass
     try:
+        # Reranker model names live on the NeuralMemory instance directly
+        # (memory_client.py:633 sets self._rerank_model_name). Verified by
+        # grep — no public alias, so the underscore-name read stays.
         out["reranker_en"] = getattr(mem, "_rerank_model_name", None)
         out["reranker_es"] = getattr(mem, "_rerank_model_es_name", None)
     except Exception:

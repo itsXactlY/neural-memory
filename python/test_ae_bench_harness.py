@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent
 from run_ae_domain_bench import (  # noqa: E402
     _category_regression_gate,
     _collect_provenance,
+    _model_provenance,
     _PROVENANCE_ENV_KEYS,
     run_scored,
 )
@@ -222,6 +223,56 @@ class BenchHarnessTests(unittest.TestCase):
         gate = _category_regression_gate({"per_category": {}}, None)
         self.assertFalse(gate["enabled"])
         self.assertEqual(gate["regressions"], [])
+
+    def test_model_provenance_reads_public_attributes(self) -> None:
+        """Bug A fix: _model_provenance must read public mem.embedder /
+        mem.dim per memory_client.py (lines 592, 604), not the private
+        _embedder name. Earlier code read _embedder which was always None
+        on the live NeuralMemory instance, so embedding_model came back
+        null in every bench artifact."""
+
+        class _FakeBackend:
+            MODEL_NAME = "all-MiniLM-L6-v2"
+            dim = 384
+
+        class _FakeEmbedder:
+            backend = _FakeBackend()
+            # Some embedder shapes expose model_name / MODEL_NAME directly;
+            # we deliberately omit those here to force the .backend lookup.
+            dim = 384
+
+        class _FakeMemPublicOnly:
+            """Exposes ONLY the public attribute names — no _embedder."""
+            embedder = _FakeEmbedder()
+            dim = 384
+            _rerank_model_name = "ms-marco-MiniLM-L-6-v2"
+            _rerank_model_es_name = "bge-reranker-v2-m3"
+            _db_path = "/tmp/fake.db"
+
+        mem = _FakeMemPublicOnly()
+        # Sanity: the private attribute must NOT exist on this fake.
+        self.assertFalse(hasattr(mem, "_embedder"))
+
+        prov = _model_provenance(mem)
+        self.assertEqual(prov["embedding_model"], "all-MiniLM-L6-v2")
+        self.assertEqual(prov["embedding_dim"], 384)
+        self.assertEqual(prov["reranker_en"], "ms-marco-MiniLM-L-6-v2")
+        self.assertEqual(prov["reranker_es"], "bge-reranker-v2-m3")
+
+        # Also verify direct-on-embedder model_name path (alternate shape).
+        class _FakeEmbedderDirectName:
+            model_name = "direct-name-model"
+            dim = 768
+
+        class _FakeMemDirectName:
+            embedder = _FakeEmbedderDirectName()
+            dim = 768
+            _rerank_model_name = None
+            _rerank_model_es_name = None
+
+        prov2 = _model_provenance(_FakeMemDirectName())
+        self.assertEqual(prov2["embedding_model"], "direct-name-model")
+        self.assertEqual(prov2["embedding_dim"], 768)
 
 
 if __name__ == "__main__":
