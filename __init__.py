@@ -8,9 +8,9 @@ client (memory_client.py + embed_provider.py).
 
 Config (in ~/.hermes/config.yaml):
   memory:
-    provider: neural
-    neural:
-      db_path: ~/.neural_memory/hermes.db
+    provider: mazemaker
+    mazemaker:
+      db_path: ~/.mazemaker/bin/memory.db
       embedding_backend: auto
       consolidation_interval: 300
       max_episodic: 50000

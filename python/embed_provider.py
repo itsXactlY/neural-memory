@@ -1132,7 +1132,21 @@ class EmbeddingProvider:
                                                      self._CACHE_MAX_DEFAULT)))
         self.cache: "OrderedDict[str, list[float]]" = OrderedDict()
         self._load_cache()
-        
+
+        # EMBED_BACKEND env always wins, regardless of what the caller passed.
+        # Some callers (like the v2 mcp container) pass placeholder strings
+        # ("http") expecting their own dispatch layer; the env lets the
+        # operator force a specific in-process backend without code changes.
+        forced = os.environ.get('EMBED_BACKEND', '').strip().lower()
+        if forced in ('sentence-transformers', 'st', 'sbert'):
+            self.backend = SentenceTransformerBackend()
+            print(f"Embedding backend: {self.backend.__class__.__name__} ({self.backend.dim}d) [forced via EMBED_BACKEND={forced}]")
+            return
+        if forced == 'fastembed':
+            self.backend = FastEmbedBackend()
+            print(f"Embedding backend: {self.backend.__class__.__name__} ({self.backend.dim}d) [forced via EMBED_BACKEND={forced}]")
+            return
+
         if backend == "auto":
             self.backend = self._auto_detect()
         elif backend == "fastembed":
