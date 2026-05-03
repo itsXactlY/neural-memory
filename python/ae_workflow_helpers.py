@@ -266,10 +266,12 @@ def recall_for_dashboard(
 ) -> list[dict]:
     """Bench-validated recall config for AE dashboard surfaces (/m2 etc.).
 
-    Encapsulates the configuration empirically validated 2026-05-01 to
-    produce R@5=0.82 on the AE-domain bench (passing the 0.76 threshold).
-    Drop-in replacement for raw mem.recall() / mem.hybrid_recall() in
-    dashboard-side code.
+    Encapsulates the multi-channel hybrid_recall configuration tracked by
+    the F9 AE-domain bench. Live R@5 figures are reported by each scored
+    bench artifact under ``~/.neural_memory/bench-history/ae-domain-*.json``
+    (top-level ``global_r@5``) — see ``tools/nm_recall_mcp.py``
+    ``_bench_authority`` for the canonical reader. Drop-in replacement for
+    raw mem.recall() / mem.hybrid_recall() in dashboard-side code.
 
     Config:
       - hybrid_recall (multi-channel: dense + sparse + graph + temporal

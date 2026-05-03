@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -52,26 +53,84 @@ _mem = None
 # bench harness. Overridable for tests via _bench_authority(bench_dir=...).
 _DEFAULT_BENCH_DIR = Path.home() / ".neural_memory" / "bench-history"
 
+# Strict timestamp pattern for pre-provenance artifacts (older than commit
+# bfd3b70 which added the provenance block). Format: ae-domain-YYYY-MM-DD-HHMMSS.json
+# Names that don't match this pattern AND lack provenance are treated as
+# untrusted (e.g. ``ae-domain-bge-small-clean-073802.json`` is a copy-ablation
+# tag, not a production timestamp).
+_STRICT_TIMESTAMP_RE = re.compile(r"^ae-domain-\d{4}-\d{2}-\d{2}-\d{6}\.json$")
+
+# Canonical production substrate path — artifacts whose ``provenance.db_path``
+# does not end with this are copy-ablation runs against a non-production DB
+# and must be excluded from authority selection.
+_CANONICAL_DB_SUFFIX = "/.neural_memory/memory.db"
+
+
+def _is_eligible_artifact(path: Path) -> bool:
+    """Return True if ``path`` is a production AE-domain bench artifact.
+
+    Selection rules (in order):
+      1. If the artifact has a top-level ``provenance.db_path`` (post bfd3b70
+         format), accept iff that path ends with the canonical substrate
+         suffix (``/.neural_memory/memory.db``). This filters out
+         copy-ablation runs that point at a non-canonical DB even if their
+         filename is timestamp-shaped.
+      2. If the artifact lacks a ``provenance`` block (pre-bfd3b70 legacy),
+         fall back to the strict timestamp filename regex. This excludes
+         filenames carrying tags like ``bge-small`` / ``clean`` / ``mpnet``
+         that mark experimental ablation copies.
+      3. Read errors / malformed JSON / missing keys → not eligible.
+    """
+    name = path.name
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    prov = data.get("provenance")
+    if isinstance(prov, dict):
+        db_path = prov.get("db_path")
+        if isinstance(db_path, str) and db_path.endswith(_CANONICAL_DB_SUFFIX):
+            return True
+        return False
+    # No provenance block → legacy artifact. Trust only strict-timestamp names.
+    return bool(_STRICT_TIMESTAMP_RE.match(name))
+
 
 def _bench_authority(bench_dir: Path | None = None) -> tuple[str, str]:
-    """Return current AE-domain bench R@5 from the most recent artifact.
+    """Return current AE-domain bench R@5 from the most recent eligible artifact.
 
-    Reads the latest ``ae-domain-*.json`` under ``bench_dir`` (default
-    ``~/.neural_memory/bench-history/``) and extracts the top-level
-    ``global_r@5`` field per the F9 artifact format.
+    Selects the most-recently-modified (mtime) ``ae-domain-*.json`` under
+    ``bench_dir`` (default ``~/.neural_memory/bench-history/``) that passes
+    :func:`_is_eligible_artifact` (production substrate path / strict
+    timestamp filename), then extracts the top-level ``global_r@5`` field
+    per the F9 artifact format.
+
+    Why mtime + provenance instead of lex-sort:
+      Lex-sort placed ``ae-domain-bge-small-clean-073802.json`` (copy
+      ablation, R@5 0.6061, non-canonical DB) AFTER
+      ``ae-domain-2026-05-02-124730.json`` (production, R@5 0.5758) because
+      letters > digits in ASCII. Sorting by mtime + filtering on
+      ``provenance.db_path`` ensures the authority always reflects the
+      latest production-substrate run.
 
     Returns a ``(r_at_5, artifact_name)`` tuple of strings. Both values
-    fall back to ``"unknown"`` if no artifact is present, the file cannot
-    be read, the JSON is malformed, or the expected key is missing.
-    Stringly-typed by design so the value can be safely interpolated
-    into prose without per-call float-format guards.
+    fall back to ``"unknown"`` if no eligible artifact is present, the
+    file cannot be read, the JSON is malformed, or the expected key is
+    missing. Stringly-typed by design so the value can be safely
+    interpolated into prose without per-call float-format guards.
     """
     bench_dir = bench_dir or _DEFAULT_BENCH_DIR
     try:
-        artifacts = sorted(bench_dir.glob("ae-domain-*.json"))
-        if not artifacts:
+        candidates = list(bench_dir.glob("ae-domain-*.json"))
+        if not candidates:
             return ("unknown", "unknown")
-        latest = artifacts[-1]
+        eligible = [p for p in candidates if _is_eligible_artifact(p)]
+        if not eligible:
+            return ("unknown", "unknown")
+        latest = max(eligible, key=lambda p: p.stat().st_mtime)
         with latest.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
         val = data.get("global_r@5")

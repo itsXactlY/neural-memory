@@ -3,8 +3,9 @@
   com.ae.neural-memory-snapshot.plist — daily backup of ~/.neural_memory/
 
   Pattern adopted 2026-05-02 from AE-builder peer's daily-snapshot daemon.
-  Substrate is now valuable enough (3.18 GB, 7.5K mems, R@5=0.82) to deserve
-  a never-lose policy.
+  Substrate is now valuable enough (multi-GB, thousands of memories, see
+  latest bench-history artifact for current R@5) to deserve a never-lose
+  policy.
 
   Backs up memory.db (gzipped) + bench-history/ to ~/.neural_memory/backups/
   with 14-day retention.

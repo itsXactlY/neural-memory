@@ -2,8 +2,8 @@
 # neural-memory-snapshot-daily.sh — daily backup of ~/.neural_memory/
 #
 # Per Tito's "no manual steps" META rule + AE-builder peer's daily-snapshot
-# pattern: substrate is now valuable enough (3.18 GB, 7.5K mems, R@5=0.82)
-# to be worth never losing.
+# pattern: substrate is now valuable enough (multi-GB, thousands of memories,
+# see latest bench-history artifact for current R@5) to be worth never losing.
 #
 # Backs up:
 #   ~/.neural_memory/memory.db           — primary substrate (gzipped)
