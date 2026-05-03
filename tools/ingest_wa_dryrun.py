@@ -448,7 +448,7 @@ def to_typed_record(row: dict) -> dict:
     }
     if row.get("media_paths"):
         metadata["media_paths"] = row["media_paths"]
-    if row.get("auth_proof"):
+    if "auth_proof" in row and row["auth_proof"] is not None:
         metadata["auth_proof"] = row["auth_proof"]
     if row.get("normalized_text"):
         metadata["normalized_text"] = row["normalized_text"]

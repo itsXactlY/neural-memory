@@ -375,6 +375,45 @@ class ToTypedRecordBackCompatTests(unittest.TestCase):
         self.assertRegex(rec["evidence_id"], r"^[0-9a-f]{16}$")
 
 
+class S5cAuthProofParityTests(unittest.TestCase):
+    """S5c: auth_proof key-presence/is-not-None semantics in to_typed_record.
+
+    Explicit empty auth_proof={} must be preserved in metadata (was dropped
+    because `if row.get('auth_proof')` evaluates {} as falsy).
+    """
+
+    def test_empty_auth_proof_preserved(self) -> None:
+        """auth_proof={} must survive into metadata — key present, value {}."""
+        row = _good_row()
+        row["auth_proof"] = {}
+        rec = wa.to_typed_record(row)
+        self.assertIn("auth_proof", rec["metadata"],
+                      "empty auth_proof={} must be preserved in metadata")
+        self.assertEqual(rec["metadata"]["auth_proof"], {})
+
+    def test_none_auth_proof_dropped(self) -> None:
+        """auth_proof=null must be excluded from metadata."""
+        row = _good_row()
+        row["auth_proof"] = None
+        rec = wa.to_typed_record(row)
+        self.assertNotIn("auth_proof", rec["metadata"],
+                         "null auth_proof must be excluded from metadata")
+
+    def test_non_empty_auth_proof_preserved(self) -> None:
+        """Non-empty auth_proof={"receipt": "abc"} is preserved as before."""
+        row = _good_row()
+        row["auth_proof"] = {"receipt": "abc123"}
+        rec = wa.to_typed_record(row)
+        self.assertIn("auth_proof", rec["metadata"])
+        self.assertEqual(rec["metadata"]["auth_proof"], {"receipt": "abc123"})
+
+    def test_absent_auth_proof_dropped(self) -> None:
+        """Row with no auth_proof key must produce no auth_proof in metadata."""
+        row = {k: v for k, v in _good_row().items() if k != "auth_proof"}
+        rec = wa.to_typed_record(row)
+        self.assertNotIn("auth_proof", rec["metadata"])
+
+
 class CLIExitCodeTests(unittest.TestCase):
     """End-to-end CLI invocation in a tempdir to verify exit-code semantics."""
 
