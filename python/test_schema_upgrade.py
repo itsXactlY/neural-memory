@@ -323,7 +323,7 @@ class SchemaUpgradeTests(unittest.TestCase):
 
     def test_evidence_ledger_table_columns_and_indexes(self) -> None:
         """Ledger table has all required columns + 2 UNIQUE indexes after
-        upgrade. Schema must match the S2 contract exactly."""
+        upgrade. Schema must match the v2 contract (S2b 2026-05-03)."""
         _create_legacy_schema(self.db)
         SchemaUpgrade(str(self.db)).upgrade()
 
@@ -353,13 +353,19 @@ class SchemaUpgradeTests(unittest.TestCase):
                          "source_record_id NOT NULL")
         self.assertEqual(cols["status"][3], 1, "status NOT NULL")
 
-        # 2 UNIQUE indexes per S2 contract
+        # 2 UNIQUE indexes per v2 contract (S2b 2026-05-03):
+        #   • idx_evidence_ledger_source              — (system, record_id)
+        #   • idx_evidence_ledger_type_source_record  — (type, system, record_id)
+        # The legacy v1 index (idx_evidence_ledger_type_record) was migrated
+        # away to drop the global-uniqueness assumption — see S2b packet.
         index_names = {row[0] for row in indexes}
         self.assertIn("idx_evidence_ledger_source", index_names)
-        self.assertIn("idx_evidence_ledger_type_record", index_names)
+        self.assertIn("idx_evidence_ledger_type_source_record", index_names)
+        self.assertNotIn("idx_evidence_ledger_type_record", index_names,
+                         "legacy v1 index must be absent after v2 migration")
         for name, sql in indexes:
             if name in ("idx_evidence_ledger_source",
-                        "idx_evidence_ledger_type_record"):
+                        "idx_evidence_ledger_type_source_record"):
                 self.assertIn("UNIQUE", sql.upper(),
                               f"index {name} must be UNIQUE: {sql}")
 
@@ -393,8 +399,19 @@ class SchemaUpgradeTests(unittest.TestCase):
                 )
 
     def test_evidence_ledger_unique_indexes_enforce(self) -> None:
-        """Two unique indexes block duplicate (source_system, source_record_id)
-        and (evidence_type, source_record_id) tuples."""
+        """v2 contract (S2b 2026-05-03):
+          • idx_evidence_ledger_source: (source_system, source_record_id) UNIQUE
+            — blocks the same source from inserting the same record_id twice.
+          • idx_evidence_ledger_type_source_record:
+            (evidence_type, source_system, source_record_id) UNIQUE
+            — blocks the same triple twice.
+        Crucially, the v1 assumption that source_record_id is globally unique
+        across source_systems is RELAXED. Two different source_systems may
+        emit the same source_record_id under the same evidence_type
+        (e.g., evidence_type='sent_pdf' from both
+        'sent_estimate_pdf_miner' and 'ae_dashboard') — they get distinct
+        evidence_ids and distinct rows.
+        """
         _create_legacy_schema(self.db)
         SchemaUpgrade(str(self.db)).upgrade()
         with sqlite3.connect(str(self.db)) as conn:
@@ -404,7 +421,9 @@ class SchemaUpgradeTests(unittest.TestCase):
                 "VALUES (?, ?, ?, ?)",
                 ("aaa", "wa_crew_message", "hermes_wa_bridge", "rec-1"),
             )
-            # Same (source_system, source_record_id) but different evidence_id
+            # Same (source_system, source_record_id) — blocked by per-source
+            # identity index (correct: same source can't claim same record id
+            # twice).
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
                     "INSERT INTO evidence_ledger "
@@ -412,14 +431,192 @@ class SchemaUpgradeTests(unittest.TestCase):
                     "VALUES (?, ?, ?, ?)",
                     ("bbb", "sent_pdf", "hermes_wa_bridge", "rec-1"),
                 )
-            # Same (evidence_type, source_record_id) but different source_system
+            # Same (evidence_type, source_record_id) but DIFFERENT source_system
+            # — ALLOWED in v2. v1 would have blocked this; v2 explicitly
+            # allows it because each source_system owns its own namespace.
+            conn.execute(
+                "INSERT INTO evidence_ledger "
+                "(evidence_id, evidence_type, source_system, source_record_id) "
+                "VALUES (?, ?, ?, ?)",
+                ("ccc", "wa_crew_message", "ae_dashboard", "rec-1"),
+            )
+            # ...but the same (evidence_type, source_system, source_record_id)
+            # triple twice IS blocked by the wider v2 index.
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
                     "INSERT INTO evidence_ledger "
                     "(evidence_id, evidence_type, source_system, source_record_id) "
                     "VALUES (?, ?, ?, ?)",
-                    ("ccc", "wa_crew_message", "ae_dashboard", "rec-1"),
+                    ("ddd", "wa_crew_message", "ae_dashboard", "rec-1"),
                 )
+
+    # ----- v1 → v2 migration (S2b 2026-05-03) ---------------------------------
+    def _create_v1_ledger(self) -> None:
+        """Recreate the v1-shape ledger by hand: legacy index name +
+        user_version=1. Used to validate v1→v2 in-place migration on a DB
+        that originally received the v1 layout."""
+        _create_legacy_schema(self.db)
+        with sqlite3.connect(str(self.db)) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS evidence_ledger (
+                    evidence_id      TEXT PRIMARY KEY,
+                    memory_id        INTEGER,
+                    evidence_type    TEXT NOT NULL,
+                    source_system    TEXT NOT NULL,
+                    source_record_id TEXT NOT NULL,
+                    status           TEXT NOT NULL DEFAULT 'inserted'
+                                       CHECK (status IN ('inserted','superseded','retracted')),
+                    inserted_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                    metadata_hash    TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_ledger_source
+                    ON evidence_ledger (source_system, source_record_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_ledger_type_record
+                    ON evidence_ledger (evidence_type, source_record_id);
+                PRAGMA user_version = 1;
+                """
+            )
+
+    def test_v1_to_v2_migration_drops_legacy_creates_replacement(self) -> None:
+        """Applying upgrade to an existing v1 ledger: drops
+        idx_evidence_ledger_type_record, creates
+        idx_evidence_ledger_type_source_record, bumps user_version 1→2."""
+        self._create_v1_ledger()
+
+        with sqlite3.connect(str(self.db)) as conn:
+            uv_before = conn.execute("PRAGMA user_version").fetchone()[0]
+            idx_before = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name='evidence_ledger' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        self.assertEqual(uv_before, 1)
+        self.assertIn("idx_evidence_ledger_type_record", idx_before)
+        self.assertNotIn("idx_evidence_ledger_type_source_record", idx_before)
+
+        result = SchemaUpgrade(str(self.db)).upgrade()
+        self.assertEqual(result["user_version_before"], 1)
+        self.assertEqual(result["user_version_after"],
+                         _EVIDENCE_LEDGER_TARGET_USER_VERSION)
+
+        with sqlite3.connect(str(self.db)) as conn:
+            uv_after = conn.execute("PRAGMA user_version").fetchone()[0]
+            idx_after = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='index' AND tbl_name='evidence_ledger' "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+        self.assertEqual(uv_after, 2)
+        self.assertNotIn("idx_evidence_ledger_type_record", idx_after,
+                         "legacy v1 index must be dropped")
+        self.assertIn("idx_evidence_ledger_type_source_record", idx_after,
+                      "v2 replacement index must exist")
+        self.assertIn("idx_evidence_ledger_source", idx_after,
+                      "per-source index must survive migration")
+
+    def test_v1_to_v2_migration_idempotent(self) -> None:
+        """Re-running upgrade after v1→v2 migration is a no-op (already at
+        target version, no schema churn)."""
+        self._create_v1_ledger()
+        first = SchemaUpgrade(str(self.db)).upgrade()
+        self.assertEqual(first["user_version_after"], 2)
+        schema_after_first = _dump_schema(self.db)
+
+        second = SchemaUpgrade(str(self.db)).upgrade()
+        self.assertEqual(second["user_version_before"], 2)
+        self.assertEqual(second["user_version_after"], 2)
+        self.assertEqual(second["ledger_indexes_created"], 0,
+                         "post-migration re-run must touch zero indexes")
+        schema_after_second = _dump_schema(self.db)
+        self.assertEqual(schema_after_first, schema_after_second,
+                         "v2 schema diverged on second run — not idempotent")
+
+    def test_v1_to_v2_migration_preserves_pre_existing_ledger_rows(self) -> None:
+        """A v1 ledger with some rows must keep them all after v1→v2 migration.
+        Wider replacement index has strict-superset semantics — anything
+        unique under (evidence_type, source_record_id) is also unique under
+        (evidence_type, source_system, source_record_id), so existing rows
+        cannot violate the new constraint."""
+        self._create_v1_ledger()
+        with sqlite3.connect(str(self.db)) as conn:
+            for i in range(5):
+                conn.execute(
+                    "INSERT INTO evidence_ledger "
+                    "(evidence_id, evidence_type, source_system, source_record_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (f"v1-id-{i}", "wa_crew_message", "hermes_wa_bridge",
+                     f"v1-rec-{i}"),
+                )
+            conn.commit()
+            before = conn.execute(
+                "SELECT evidence_id, evidence_type, source_system, "
+                "source_record_id FROM evidence_ledger ORDER BY evidence_id"
+            ).fetchall()
+
+        SchemaUpgrade(str(self.db)).upgrade()
+
+        with sqlite3.connect(str(self.db)) as conn:
+            after = conn.execute(
+                "SELECT evidence_id, evidence_type, source_system, "
+                "source_record_id FROM evidence_ledger ORDER BY evidence_id"
+            ).fetchall()
+        self.assertEqual(before, after,
+                         "v1→v2 migration lost or mutated pre-existing rows")
+        self.assertEqual(len(after), 5)
+
+    def test_v1_to_v2_migration_unblocks_multi_source_collision(self) -> None:
+        """The whole point of v1→v2: after migration, two rows with same
+        (evidence_type, source_record_id) but DIFFERENT source_system
+        coexist. Pre-migration this would have raised IntegrityError; post-
+        migration it succeeds."""
+        self._create_v1_ledger()
+        # In v1, this pair would collide. Insert only the first row so the
+        # ledger is non-empty when we migrate; the colliding partner goes in
+        # AFTER the upgrade.
+        with sqlite3.connect(str(self.db)) as conn:
+            conn.execute(
+                "INSERT INTO evidence_ledger "
+                "(evidence_id, evidence_type, source_system, source_record_id) "
+                "VALUES (?, ?, ?, ?)",
+                ("first", "sent_pdf", "sent_estimate_pdf_miner", "shared-key"),
+            )
+            conn.commit()
+            # Sanity: the v1 (evidence_type, source_record_id) index would
+            # block the partner today.
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO evidence_ledger "
+                    "(evidence_id, evidence_type, source_system, source_record_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    ("would-collide", "sent_pdf", "ae_dashboard", "shared-key"),
+                )
+                conn.commit()
+
+        SchemaUpgrade(str(self.db)).upgrade()
+
+        with sqlite3.connect(str(self.db)) as conn:
+            # Same insert NOW succeeds — different source_system, same
+            # (evidence_type, source_record_id), allowed under v2.
+            conn.execute(
+                "INSERT INTO evidence_ledger "
+                "(evidence_id, evidence_type, source_system, source_record_id) "
+                "VALUES (?, ?, ?, ?)",
+                ("partner", "sent_pdf", "ae_dashboard", "shared-key"),
+            )
+            conn.commit()
+            count = conn.execute(
+                "SELECT COUNT(*) FROM evidence_ledger "
+                "WHERE source_record_id = 'shared-key'"
+            ).fetchone()[0]
+        self.assertEqual(count, 2,
+                         "v2 must allow per-source-system namespacing of the "
+                         "same source_record_id under the same evidence_type")
 
     def test_evidence_ledger_preserves_existing_records(self) -> None:
         """Applying ledger upgrade to a DB with seeded rows must not lose

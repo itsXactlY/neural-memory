@@ -67,10 +67,23 @@ _CONNECTION_COLUMNS: list[tuple[str, str]] = [
 # indexes guard against the same source row being inserted under conflicting
 # evidence_id derivations.
 #
-# user_version protocol: legacy DBs ship at 0; this migration bumps to 1.
+# user_version protocol:
+#   0 → legacy DBs (no ledger)
+#   1 → ledger created with
+#         (a) UNIQUE (source_system, source_record_id)
+#         (b) UNIQUE (evidence_type, source_record_id)
+#       Index (b) ASSUMED globally-unique source_record_id across source_systems.
+#   2 → migrated index (b) to UNIQUE (evidence_type, source_system,
+#       source_record_id). Drops the global-uniqueness assumption — matches the
+#       deterministic evidence_id derivation sha256(evidence_type|source_system|
+#       source_record_id). Multi-source producers (sent_pdf already produced by
+#       BOTH ingest_sent_pdf_sidecars and record_estimate_evidence with
+#       different source_systems; future appscript_row / blueprint_excerpt /
+#       qbo_transaction / calendar_event helpers will follow) can no longer
+#       structurally collide. See S2b packet (2026-05-03).
 # Future schema migrations bump by 1 each — read current value before bumping.
 # Idempotent: applying an already-current DB is a no-op.
-_EVIDENCE_LEDGER_TARGET_USER_VERSION = 1
+_EVIDENCE_LEDGER_TARGET_USER_VERSION = 2
 
 _EVIDENCE_LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS evidence_ledger (
@@ -87,11 +100,28 @@ CREATE TABLE IF NOT EXISTS evidence_ledger (
 )
 """
 
+# v1 indexes (target shape when first creating the table). Two UNIQUE indexes:
+#   (a) per-source-system identity guard
+#   (b) per-evidence-type identity guard, INCLUDING source_system (v2-aligned)
+# A v0→v2 fresh creation skips the v1→v2 migration path entirely; the v1-shape
+# index name is removed in the v2 path below.
 _EVIDENCE_LEDGER_INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS "
     "idx_evidence_ledger_source ON evidence_ledger (source_system, source_record_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS "
-    "idx_evidence_ledger_type_record ON evidence_ledger (evidence_type, source_record_id)",
+    "idx_evidence_ledger_type_source_record "
+    "ON evidence_ledger (evidence_type, source_system, source_record_id)",
+]
+
+# v1→v2 migration: drop the legacy index that assumed global source_record_id
+# uniqueness, replace with a (type, system, record_id) index that mirrors the
+# deterministic evidence_id derivation. Idempotent — DROP IF EXISTS + CREATE
+# IF NOT EXISTS so re-runs of an already-v2 DB are no-ops.
+_EVIDENCE_LEDGER_V1_TO_V2_MIGRATION = [
+    "DROP INDEX IF EXISTS idx_evidence_ledger_type_record",
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "idx_evidence_ledger_type_source_record "
+    "ON evidence_ledger (evidence_type, source_system, source_record_id)",
 ]
 
 
@@ -177,15 +207,31 @@ class SchemaUpgrade:
 
     @staticmethod
     def _ensure_evidence_ledger(conn: sqlite3.Connection) -> dict[str, int]:
-        """S2 packet 2026-05-03: idempotent additive evidence ledger.
+        """S2 packet 2026-05-03 / S2b 2026-05-03: idempotent evidence ledger.
 
         Reads PRAGMA user_version. If already at or past target, no-op
-        (returns zero counters). Otherwise creates evidence_ledger table +
-        UNIQUE indexes and bumps user_version to target.
+        (returns zero counters). Otherwise applies the migration path needed
+        to reach target:
 
-        Additive only — no DROP/ALTER on existing tables. Safe to apply
-        repeatedly; safe to apply on a DB that already has the ledger
-        (CREATE IF NOT EXISTS handles partial-prior-runs cleanly).
+          v0 → v2 (fresh install): CREATE TABLE + create v2-shape indexes.
+          v1 → v2 (existing install with legacy
+            idx_evidence_ledger_type_record): DROP legacy index, CREATE the
+            (evidence_type, source_system, source_record_id) replacement.
+            Pre-existing data is preserved (the new index is strictly
+            wider — any rows that satisfied (evidence_type, source_record_id)
+            uniqueness also satisfy the wider tuple).
+
+        All paths additive in the "preserve data" sense (no row rewrites);
+        v1→v2 is additive-friendly because:
+          • The replacement index is wider than the legacy one (every row
+            unique under the legacy 2-column index is also unique under the
+            3-column index — strict superset semantics).
+          • At the time of S2b authoring (2026-05-03) the canonical ledger
+            held 0 rows, so even hypothetical pre-existing collisions are
+            structurally impossible — but the migration is correct in the
+            general case too.
+
+        Safe to apply repeatedly; safe to apply on a DB at any version 0/1/2.
         """
         current_version = conn.execute("PRAGMA user_version").fetchone()[0]
         if current_version >= _EVIDENCE_LEDGER_TARGET_USER_VERSION:
@@ -203,9 +249,21 @@ class SchemaUpgrade:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_ledger'"
         ).fetchone() is not None
 
+        # v0 → v2 fresh creation, OR v1 → v2 migration. Both paths converge
+        # on the same final shape: table + 2 v2-shape indexes.
         conn.execute(_EVIDENCE_LEDGER_DDL)
-        for ddl in _EVIDENCE_LEDGER_INDEXES:
-            conn.execute(ddl)
+
+        if current_version == 1:
+            # Existing v1 ledger — apply v1→v2 migration (drop legacy index,
+            # create wider replacement). DDL block is idempotent.
+            for ddl in _EVIDENCE_LEDGER_V1_TO_V2_MIGRATION:
+                conn.execute(ddl)
+            indexes_changed = len(_EVIDENCE_LEDGER_V1_TO_V2_MIGRATION)
+        else:
+            # v0 → v2 fresh creation: create both v2-shape indexes from scratch.
+            for ddl in _EVIDENCE_LEDGER_INDEXES:
+                conn.execute(ddl)
+            indexes_changed = len(_EVIDENCE_LEDGER_INDEXES)
 
         # Bump user_version. PRAGMA user_version doesn't accept '?' binding;
         # the value is a class-level constant so f-string is safe.
@@ -215,7 +273,7 @@ class SchemaUpgrade:
 
         return {
             "ledger_created": 0 if existed else 1,
-            "ledger_indexes_created": len(_EVIDENCE_LEDGER_INDEXES),
+            "ledger_indexes_created": indexes_changed,
             "user_version_before": current_version,
             "user_version_after": _EVIDENCE_LEDGER_TARGET_USER_VERSION,
         }
