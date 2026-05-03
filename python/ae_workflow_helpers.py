@@ -677,6 +677,12 @@ def _lookup_existing_evidence_memory_id(
     Falls back to substring match on metadata_json if json_extract isn't
     available (older SQLite). This mirrors the SQL-direct access pattern
     used by recall_customer_by_name(fuzzy=False).
+
+    NOTE (S2 packet 2026-05-03): superseded by the SQLite-backed
+    `evidence_ledger` table installed via SchemaUpgrade. record_evidence_artifact
+    now consults the ledger first; this JSON-scan path remains as a fallback
+    for stores where the ledger table doesn't exist (legacy DBs that haven't
+    run SchemaUpgrade yet, or non-SQLite stores).
     """
     if not hasattr(mem, "store") or not hasattr(mem.store, "conn"):
         return None
@@ -702,6 +708,96 @@ def _lookup_existing_evidence_memory_id(
         return int(row[0]) if row else None
     except Exception:
         return None
+
+
+def _ledger_table_exists(conn: Any) -> bool:
+    """Cheap probe — does this DB carry the evidence_ledger table yet?
+    Used so record_evidence_artifact can transparently fall back to the
+    legacy json_extract dedup path on un-upgraded stores."""
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='evidence_ledger'"
+        ).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _ledger_lookup(
+    conn: Any, evidence_id: str
+) -> Optional[tuple[int, str]]:
+    """Return (memory_id, status) for evidence_id, or None if not present.
+    memory_id may be None in the DB (rare race window between ledger insert
+    and mem.remember); the caller is responsible for treating that as 'still
+    inserting' and skipping the dedup."""
+    try:
+        row = conn.execute(
+            "SELECT memory_id, status FROM evidence_ledger "
+            "WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    mem_id, status = row[0], row[1]
+    if mem_id is None:
+        return None
+    return (int(mem_id), str(status))
+
+
+def _ledger_reserve(
+    conn: Any,
+    *,
+    evidence_id: str,
+    evidence_type: str,
+    source_system: str,
+    source_record_id: str,
+) -> bool:
+    """Attempt to claim the ledger row for this evidence_id. Returns True
+    if THIS call won the race (we should now mem.remember() and update the
+    row). Returns False if a concurrent process already owns the row.
+
+    Uses INSERT OR IGNORE so the second writer silently no-ops; the
+    second writer then re-reads the ledger to discover the winning
+    memory_id."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO evidence_ledger "
+        "(evidence_id, memory_id, evidence_type, source_system, "
+        " source_record_id, status) "
+        "VALUES (?, NULL, ?, ?, ?, 'inserted')",
+        (evidence_id, evidence_type, source_system, source_record_id),
+    )
+    return cur.rowcount == 1
+
+
+def _ledger_set_memory_id(
+    conn: Any, *, evidence_id: str, memory_id: int
+) -> None:
+    """Patch in the memory_id after mem.remember() succeeded for the
+    just-reserved ledger row."""
+    conn.execute(
+        "UPDATE evidence_ledger "
+        "SET memory_id = ?, updated_at = datetime('now') "
+        "WHERE evidence_id = ?",
+        (memory_id, evidence_id),
+    )
+
+
+def _ledger_release(conn: Any, *, evidence_id: str) -> None:
+    """Roll back a ledger reservation when mem.remember() fails. Caller
+    has already won the row via _ledger_reserve; this delete frees it so
+    the next call can retry. Best-effort: failures are swallowed because
+    the row will still be junk (memory_id NULL) and a retry will re-claim.
+    """
+    try:
+        conn.execute(
+            "DELETE FROM evidence_ledger WHERE evidence_id = ? "
+            "AND memory_id IS NULL",
+            (evidence_id,),
+        )
+    except Exception:
+        pass
 
 
 def record_evidence_artifact(
@@ -752,14 +848,65 @@ def record_evidence_artifact(
 
     evidence_id = _compute_evidence_id(evidence_type, source_system, source_record_id)
 
-    # Replay-authority lookup: keyed records (source_record_id present)
-    # dedupe on evidence_id; unkeyed records (source_record_id is None)
-    # always insert because there's no stable identity to match against.
-    if source_record_id is not None:
-        existing = _lookup_existing_evidence_memory_id(mem, evidence_id)
-        if existing is not None:
+    # Replay-authority + race-safety (S2 packet 2026-05-03):
+    # When the SQLite-backed evidence_ledger is available AND we have a
+    # stable source_record_id, claim the ledger row first via INSERT OR
+    # IGNORE. The winner of the race calls mem.remember() and patches the
+    # ledger row with the resulting memory_id; losers re-read the ledger to
+    # find the winning memory_id. When source_record_id is None we always
+    # insert (unkeyed evidence has no stable identity).
+    #
+    # Fallback: stores without an SQLite conn (or DBs that haven't run
+    # SchemaUpgrade yet) drop back to the legacy json_extract scan.
+    use_ledger = (
+        source_record_id is not None
+        and hasattr(mem, "store") and hasattr(mem.store, "conn")
+    )
+    if use_ledger:
+        store = mem.store
+        with store._lock:
+            if not _ledger_table_exists(store.conn):
+                use_ledger = False
+
+    if use_ledger:
+        store = mem.store
+        with store._lock:
+            won = _ledger_reserve(
+                store.conn,
+                evidence_id=evidence_id,
+                evidence_type=evidence_type,
+                source_system=source_system,
+                source_record_id=source_record_id,  # type: ignore[arg-type]
+            )
+            store.conn.commit()
+        if not won:
+            # Lost the race. Winner is mid-flight calling mem.remember();
+            # poll the ledger until memory_id is patched in (or budget
+            # expires). Lock is released between polls so the winner can
+            # complete. Without this wait, mem.remember() is non-thread-safe
+            # under concurrent load (HNSW/connection-graph dict iteration).
+            existing = None
+            for _ in range(40):
+                with store._lock:
+                    existing = _ledger_lookup(store.conn, evidence_id)
+                if existing is not None:
+                    break
+                _time.sleep(0.025)
+            if existing is not None:
+                return {
+                    "memory_id": existing[0],
+                    "evidence_id": evidence_id,
+                    "inserted": False,
+                }
+            # Budget exhausted — winner is wedged or extremely slow. Fall
+            # through to a fresh mem.remember(); accept potential duplicate
+            # rather than block forever.
+    elif source_record_id is not None:
+        # Legacy / pre-upgrade path: JSON-scan dedup.
+        existing_id = _lookup_existing_evidence_memory_id(mem, evidence_id)
+        if existing_id is not None:
             return {
-                "memory_id": existing,
+                "memory_id": existing_id,
                 "evidence_id": evidence_id,
                 "inserted": False,
             }
@@ -787,18 +934,37 @@ def record_evidence_artifact(
     # explicit caller decision, not an implicit conflict-detection side-effect.
     # Caught by per-commit reviewer of d410019. Matches record_invoice_status_change
     # pattern (also bi-temporal, also detect_conflicts=False).
-    memory_id = mem.remember(
-        content,
-        label=label,
-        kind="experience",
-        confidence=confidence,
-        source=source_system,
-        origin_system="ae",
-        valid_from=valid_from if valid_from is not None else _time.time(),
-        valid_to=valid_to,
-        metadata=metadata,
-        detect_conflicts=False,
-    )
+    try:
+        memory_id = mem.remember(
+            content,
+            label=label,
+            kind="experience",
+            confidence=confidence,
+            source=source_system,
+            origin_system="ae",
+            valid_from=valid_from if valid_from is not None else _time.time(),
+            valid_to=valid_to,
+            metadata=metadata,
+            detect_conflicts=False,
+        )
+    except Exception:
+        # mem.remember failed AFTER we won the ledger reservation — release
+        # the row so a retry can succeed. Then re-raise.
+        if use_ledger:
+            store = mem.store
+            with store._lock:
+                _ledger_release(store.conn, evidence_id=evidence_id)
+                store.conn.commit()
+        raise
+
+    if use_ledger:
+        store = mem.store
+        with store._lock:
+            _ledger_set_memory_id(
+                store.conn, evidence_id=evidence_id, memory_id=memory_id
+            )
+            store.conn.commit()
+
     return {
         "memory_id": memory_id,
         "evidence_id": evidence_id,

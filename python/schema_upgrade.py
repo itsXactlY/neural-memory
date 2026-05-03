@@ -57,6 +57,44 @@ _CONNECTION_COLUMNS: list[tuple[str, str]] = [
 ]
 
 
+# -----------------------------------------------------------------------------
+# Evidence ledger (S2 packet 2026-05-03)
+# -----------------------------------------------------------------------------
+# Additive SQLite-backed identity authority for AEEvidenceIngest. Replaces the
+# JSON-scan dedup in record_evidence_artifact with a real UNIQUE-constrained
+# ledger row. Keyed by deterministic evidence_id (sha256 of
+# (evidence_type, source_system, source_record_id), 16 hex chars). Two unique
+# indexes guard against the same source row being inserted under conflicting
+# evidence_id derivations.
+#
+# user_version protocol: legacy DBs ship at 0; this migration bumps to 1.
+# Future schema migrations bump by 1 each — read current value before bumping.
+# Idempotent: applying an already-current DB is a no-op.
+_EVIDENCE_LEDGER_TARGET_USER_VERSION = 1
+
+_EVIDENCE_LEDGER_DDL = """
+CREATE TABLE IF NOT EXISTS evidence_ledger (
+    evidence_id      TEXT PRIMARY KEY,
+    memory_id        INTEGER,
+    evidence_type    TEXT NOT NULL,
+    source_system    TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'inserted'
+                       CHECK (status IN ('inserted','superseded','retracted')),
+    inserted_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    metadata_hash    TEXT
+)
+"""
+
+_EVIDENCE_LEDGER_INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "idx_evidence_ledger_source ON evidence_ledger (source_system, source_record_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "idx_evidence_ledger_type_record ON evidence_ledger (evidence_type, source_record_id)",
+]
+
+
 class SchemaUpgrade:
     """Idempotent additive schema upgrade.
 
@@ -137,6 +175,51 @@ class SchemaUpgrade:
         )
         return cur.rowcount or 0
 
+    @staticmethod
+    def _ensure_evidence_ledger(conn: sqlite3.Connection) -> dict[str, int]:
+        """S2 packet 2026-05-03: idempotent additive evidence ledger.
+
+        Reads PRAGMA user_version. If already at or past target, no-op
+        (returns zero counters). Otherwise creates evidence_ledger table +
+        UNIQUE indexes and bumps user_version to target.
+
+        Additive only — no DROP/ALTER on existing tables. Safe to apply
+        repeatedly; safe to apply on a DB that already has the ledger
+        (CREATE IF NOT EXISTS handles partial-prior-runs cleanly).
+        """
+        current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if current_version >= _EVIDENCE_LEDGER_TARGET_USER_VERSION:
+            return {
+                "ledger_created": 0,
+                "ledger_indexes_created": 0,
+                "user_version_before": current_version,
+                "user_version_after": current_version,
+            }
+
+        # Table existence pre-check so we can report whether THIS run created
+        # it (vs a partial prior run). CREATE IF NOT EXISTS still runs either
+        # way — this is informational only.
+        existed = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence_ledger'"
+        ).fetchone() is not None
+
+        conn.execute(_EVIDENCE_LEDGER_DDL)
+        for ddl in _EVIDENCE_LEDGER_INDEXES:
+            conn.execute(ddl)
+
+        # Bump user_version. PRAGMA user_version doesn't accept '?' binding;
+        # the value is a class-level constant so f-string is safe.
+        conn.execute(
+            f"PRAGMA user_version = {_EVIDENCE_LEDGER_TARGET_USER_VERSION}"
+        )
+
+        return {
+            "ledger_created": 0 if existed else 1,
+            "ledger_indexes_created": len(_EVIDENCE_LEDGER_INDEXES),
+            "user_version_before": current_version,
+            "user_version_after": _EVIDENCE_LEDGER_TARGET_USER_VERSION,
+        }
+
     def upgrade(self) -> dict[str, int]:
         """Apply all pending additive migrations. Returns stats dict."""
         with sqlite3.connect(self.db_path) as conn:
@@ -144,11 +227,13 @@ class SchemaUpgrade:
             mem_added = self._add_columns(conn, "memories", _MEMORY_COLUMNS)
             conn_added = self._add_columns(conn, "connections", _CONNECTION_COLUMNS)
             fts_backfilled = self._ensure_fts5(conn)
+            ledger_stats = self._ensure_evidence_ledger(conn)
             conn.commit()
         return {
             "memories_columns_added": mem_added,
             "connections_columns_added": conn_added,
             "fts_rows_backfilled": fts_backfilled,
+            **ledger_stats,
         }
 
 

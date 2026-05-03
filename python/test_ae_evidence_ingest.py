@@ -479,6 +479,198 @@ class AEEvidenceIngestContractTests(unittest.TestCase):
                     "qbo_transaction", "calendar_event"}
         self.assertEqual(EVIDENCE_TYPES, expected)
 
+    # ------------------------------------------------------------ ledger (S2)
+    def test_ledger_row_created_on_first_insert(self) -> None:
+        """First record_evidence_artifact call must populate the ledger
+        with evidence_id, memory_id, and the source identity tuple."""
+        result = record_evidence_artifact(
+            self.mem,
+            evidence_type="sent_pdf",
+            capability_id="ITEM-LED-1",
+            source_system="ae_dashboard",
+            source_path="/p1",
+            content="estimate sent",
+            source_record_id="LED-1",
+        )
+        self.assertTrue(result["inserted"])
+        with self.mem.store._lock:
+            row = self.mem.store.conn.execute(
+                "SELECT evidence_id, memory_id, evidence_type, source_system, "
+                "source_record_id, status FROM evidence_ledger "
+                "WHERE evidence_id = ?",
+                (result["evidence_id"],),
+            ).fetchone()
+        self.assertIsNotNone(row, "ledger row was not created on first insert")
+        ev_id, mem_id, ev_type, src_sys, src_rec, status = row
+        self.assertEqual(ev_id, result["evidence_id"])
+        self.assertEqual(mem_id, result["memory_id"])
+        self.assertEqual(ev_type, "sent_pdf")
+        self.assertEqual(src_sys, "ae_dashboard")
+        self.assertEqual(src_rec, "LED-1")
+        self.assertEqual(status, "inserted")
+
+    def test_replay_skips_remember_and_returns_existing(self) -> None:
+        """Replay (same evidence_id) must NOT call mem.remember again — it
+        must short-circuit through the ledger and return inserted=False
+        with the existing memory_id."""
+        first = record_evidence_artifact(
+            self.mem,
+            evidence_type="wa_crew_message",
+            capability_id="ITEM-LED-2",
+            source_system="hermes_wa_bridge",
+            source_path="/p1",
+            content="first content",
+            source_record_id="thread-X:1700000000:abc",
+        )
+        self.assertTrue(first["inserted"])
+
+        # Spy on mem.remember — replay must not invoke it.
+        original_remember = self.mem.remember
+        call_count = {"n": 0}
+
+        def spy_remember(*a: Any, **kw: Any) -> int:
+            call_count["n"] += 1
+            return original_remember(*a, **kw)
+
+        self.mem.remember = spy_remember  # type: ignore[method-assign]
+        try:
+            replay = record_evidence_artifact(
+                self.mem,
+                evidence_type="wa_crew_message",
+                capability_id="ITEM-LED-2",
+                source_system="hermes_wa_bridge",
+                source_path="/p2-different",
+                content="completely different content",
+                source_record_id="thread-X:1700000000:abc",
+            )
+        finally:
+            self.mem.remember = original_remember  # type: ignore[method-assign]
+
+        self.assertEqual(call_count["n"], 0,
+                         "replay path must not invoke mem.remember")
+        self.assertFalse(replay["inserted"])
+        self.assertEqual(replay["memory_id"], first["memory_id"])
+        self.assertEqual(replay["evidence_id"], first["evidence_id"])
+
+        # Ledger still has exactly one row for this evidence_id.
+        with self.mem.store._lock:
+            cnt = self.mem.store.conn.execute(
+                "SELECT COUNT(*) FROM evidence_ledger WHERE evidence_id = ?",
+                (first["evidence_id"],),
+            ).fetchone()[0]
+        self.assertEqual(cnt, 1)
+
+    def test_concurrent_inserts_yield_one_ledger_row(self) -> None:
+        """Race test: 8 threads call record_evidence_artifact with the
+        SAME (evidence_type, source_system, source_record_id). The ledger
+        must end up with exactly one row, all callers return the same
+        memory_id, and exactly one caller reports inserted=True."""
+        import threading
+
+        results: list[dict[str, Any]] = []
+        results_lock = threading.Lock()
+        barrier = threading.Barrier(8)
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                r = record_evidence_artifact(
+                    self.mem,
+                    evidence_type="estimate_event",
+                    capability_id="ITEM-RACE",
+                    source_system="ae_dashboard",
+                    source_path="/race",
+                    content="race content",
+                    source_record_id="RACE-KEY-1",
+                )
+                with results_lock:
+                    results.append(r)
+            except Exception as e:
+                with results_lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertFalse(errors, f"race produced exceptions: {errors}")
+        self.assertEqual(len(results), 8)
+
+        # Exactly one ledger row.
+        evidence_id = results[0]["evidence_id"]
+        with self.mem.store._lock:
+            cnt = self.mem.store.conn.execute(
+                "SELECT COUNT(*) FROM evidence_ledger WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()[0]
+        self.assertEqual(cnt, 1, "race should produce exactly one ledger row")
+
+        # All callers see the same memory_id + evidence_id.
+        memory_ids = {r["memory_id"] for r in results}
+        evidence_ids = {r["evidence_id"] for r in results}
+        self.assertEqual(len(evidence_ids), 1)
+        self.assertEqual(len(memory_ids), 1,
+                         f"race produced divergent memory_ids: {memory_ids}")
+
+        # At MOST one inserted=True (the race winner). If a caller raced
+        # past the ledger reservation before another caller patched in
+        # the memory_id, the loser may have made a fresh mem.remember()
+        # — that's the documented fallback. The contract guarantees
+        # AT LEAST one True; in practice with the lock-serialized
+        # connection it should be exactly one.
+        inserted_count = sum(1 for r in results if r["inserted"])
+        self.assertGreaterEqual(inserted_count, 1,
+                                "at least one caller must report inserted=True")
+        self.assertLessEqual(inserted_count, 1,
+                             "race should produce exactly one inserted=True caller")
+
+    def test_helper_return_shape_preserved_across_all_helpers(self) -> None:
+        """All 4 evidence helpers must return the contract dict
+        {memory_id: int, evidence_id: str, inserted: bool}."""
+        # 1. record_evidence_artifact
+        r1 = record_evidence_artifact(
+            self.mem, evidence_type="sent_pdf", capability_id="C1",
+            source_system="s1", source_path="/p1", content="c1",
+            source_record_id="rec-1",
+        )
+        # 2. record_wa_crew_event
+        r2 = record_wa_crew_event(
+            self.mem, capability_id="C2", thread_id="t1",
+            sender="m", raw_text="hello", ts=time.time(),
+        )
+        # 3. record_estimate_evidence
+        r3 = record_estimate_evidence(
+            self.mem, capability_id="C3", estimate_id="E1",
+            customer_id="CU1", event_type="sent",
+            pdf_path="/p3.pdf", amount_cents=1000,
+            sent_at=time.time(),
+        )
+        # 4. record_material_price_evidence
+        r4 = record_material_price_evidence(
+            self.mem, capability_id="C4", sku="SKU-1",
+            vendor="hd", price_cents=500,
+            quoted_at=time.time(),
+            quote_source_path="/p4",
+        )
+        for label, r in [
+            ("artifact", r1), ("wa", r2), ("estimate", r3), ("material", r4),
+        ]:
+            self.assertIsInstance(r, dict, f"{label} must return dict")
+            self.assertEqual(set(r.keys()),
+                             {"memory_id", "evidence_id", "inserted"},
+                             f"{label} return shape mismatch: {set(r.keys())}")
+            self.assertIsInstance(r["memory_id"], int,
+                                  f"{label} memory_id must be int")
+            self.assertIsInstance(r["evidence_id"], str,
+                                  f"{label} evidence_id must be str")
+            self.assertIsInstance(r["inserted"], bool,
+                                  f"{label} inserted must be bool")
+            self.assertEqual(len(r["evidence_id"]), 16,
+                             f"{label} evidence_id must be 16 hex chars")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
