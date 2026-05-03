@@ -514,9 +514,16 @@ def _gather_sources() -> list[dict]:
 
 
 def _existing_content_hashes(store) -> set[str]:
-    """Return set of content_hash values already ingested by this script."""
+    """Return set of content_hash values already ingested by this script.
+
+    NOTE: includes 'hermes' origin because bridge_mailbox chunks
+    (_gather_bridge_messages) write origin_system='hermes'. Excluding it
+    caused 1047 duplicate bridge rows on a substrate of 1793 / 746 distinct
+    msg_ids. Verified-now via Arch-2 audit 2026-05-03.
+    """
     rows = store.conn.execute(
-        "SELECT metadata_json FROM memories WHERE origin_system IN ('ae', 'claude_memory') "
+        "SELECT metadata_json FROM memories "
+        "WHERE origin_system IN ('ae', 'claude_memory', 'hermes') "
         "AND metadata_json IS NOT NULL"
     ).fetchall()
     hashes: set[str] = set()
