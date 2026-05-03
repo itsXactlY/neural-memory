@@ -181,7 +181,7 @@ fi
     --rerank \
     --db "$CANONICAL_DB" \
     --out "$OUT" \
-    "${PREV_ARG[@]}" >> "$LOG" 2>&1
+    ${PREV_ARG[@]+"${PREV_ARG[@]}"} >> "$LOG" 2>&1
 RC=$?
 
 # rc=0  → all categories passed threshold
