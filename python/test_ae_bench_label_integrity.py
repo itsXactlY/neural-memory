@@ -32,7 +32,16 @@ _SUBSTRATE_PATH = Path.home() / ".neural_memory" / "memory.db"
 # Floor: queries with non-empty ground_truth_ids as of HEAD when this test
 # was added. Any future label expansion increments this; any decrement
 # means a label was lost.
-_SCORED_QUERY_FLOOR = 38
+_SCORED_QUERY_FLOOR = 57
+
+# Cap: number of pairs of scored queries that may share an identical GT-set.
+# These collisions exist by design — the same memory can legitimately be the
+# answer to two queries asked from different lenses (e.g. a Lennar lot query
+# and a customer-temporal query about that lot's contact). The cap is a
+# CEILING: any new collision beyond this count means lazy labeling (someone
+# reused an existing GT-set instead of designing a query with disjoint
+# evidence). Raise this only with documented justification per new pair.
+_DUPLICATE_GT_SET_PAIR_CAP = 18
 
 
 class BenchLabelIntegrityTests(unittest.TestCase):
@@ -53,6 +62,37 @@ class BenchLabelIntegrityTests(unittest.TestCase):
         dupes = {qid for qid in ids if ids.count(qid) > 1}
         self.assertFalse(
             dupes, f"Duplicate query ids detected: {sorted(dupes)}",
+        )
+
+    def test_duplicate_ground_truth_set_pair_count_under_cap(self) -> None:
+        """No new GT-set collisions beyond the documented design cap.
+
+        Two queries sharing an identical sorted ground_truth_ids tuple is a
+        smell: it usually means the second query was lazily labeled with the
+        first query's GT instead of being designed against disjoint evidence.
+
+        Some collisions are legitimate (cross-category lenses on the same
+        memory). The cap captures the count at the time of the S6 expansion;
+        new collisions must either retire an old one or push the cap up with
+        a justifying comment.
+        """
+        scored = [q for q in ALL_QUERIES if q["ground_truth_ids"]]
+        seen: dict[tuple[int, ...], str] = {}
+        collisions: list[tuple[str, str, tuple[int, ...]]] = []
+        for q in scored:
+            key = tuple(sorted(q["ground_truth_ids"]))
+            if key in seen:
+                collisions.append((seen[key], q["id"], key))
+            else:
+                seen[key] = q["id"]
+        self.assertLessEqual(
+            len(collisions),
+            _DUPLICATE_GT_SET_PAIR_CAP,
+            f"Duplicate GT-set pair count {len(collisions)} exceeds cap "
+            f"{_DUPLICATE_GT_SET_PAIR_CAP}. New collisions: "
+            f"{collisions[_DUPLICATE_GT_SET_PAIR_CAP:]}. Either design "
+            f"queries against disjoint memory evidence or raise the cap "
+            f"with a documented justification.",
         )
 
     def test_every_ground_truth_id_exists_in_substrate(self) -> None:
