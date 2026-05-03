@@ -29,6 +29,7 @@ Cross-references (in claude-memory PRIVATE):
 
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json as _json
 import time as _time
 from typing import Any, Optional
@@ -643,6 +644,64 @@ def _validate_evidence_type(evidence_type: str) -> str:
     return evidence_type
 
 
+def _compute_evidence_id(
+    evidence_type: str,
+    source_system: str,
+    source_record_id: Optional[str],
+) -> str:
+    """Deterministic evidence_id derived from the (type, system, record_id)
+    triple. sha256 → first 16 hex chars (~64 bits). Same triple in any
+    process produces the same id; this is the replay-authority key the
+    upsert path keys on.
+
+    `source_record_id=None` is allowed (unkeyed evidence, e.g. ad-hoc
+    record_evidence_artifact calls). Such records share an id within the
+    triple but the upsert path skips the lookup for None — see
+    record_evidence_artifact — so multiple unkeyed rows still persist
+    independently. Only triples with an explicit source_record_id get
+    the dedup guarantee.
+    """
+    payload = f"{evidence_type}|{source_system}|{source_record_id or ''}"
+    return _hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _lookup_existing_evidence_memory_id(
+    mem: Any, evidence_id: str
+) -> Optional[int]:
+    """Find an existing memory whose metadata.evidence_id matches.
+    Returns the memory_id of the most-recent match (highest id), or None.
+
+    Uses SQLite JSON1 json_extract for an indexable scan over metadata_json.
+    Falls back to substring match on metadata_json if json_extract isn't
+    available (older SQLite). This mirrors the SQL-direct access pattern
+    used by recall_customer_by_name(fuzzy=False).
+    """
+    if not hasattr(mem, "store") or not hasattr(mem.store, "conn"):
+        return None
+    try:
+        with mem.store._lock:
+            try:
+                row = mem.store.conn.execute(
+                    "SELECT id FROM memories "
+                    "WHERE json_extract(metadata_json, '$.evidence_id') = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (evidence_id,),
+                ).fetchone()
+            except Exception:
+                # Fallback: substring match on metadata_json. Slower, but
+                # works on stores without JSON1. The token is unique enough
+                # (16 hex chars after a colon) to avoid false positives.
+                like_pat = f'%"evidence_id": "{evidence_id}"%'
+                row = mem.store.conn.execute(
+                    "SELECT id FROM memories WHERE metadata_json LIKE ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (like_pat,),
+                ).fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
 def record_evidence_artifact(
     mem: Any,
     *,
@@ -658,7 +717,7 @@ def record_evidence_artifact(
     valid_to: Optional[float] = None,
     consumer_hint: Optional[str] = None,
     extra_metadata: Optional[dict[str, Any]] = None,
-) -> int:
+) -> dict[str, Any]:
     """Generic typed evidence record — base of the AEEvidenceIngest contract.
 
     All specialized record_*_evidence helpers below delegate here. The
@@ -667,7 +726,19 @@ def record_evidence_artifact(
     audit / privacy redaction / capability-runtime-proof query can reason
     about it without re-parsing content.
 
-    Returns memory_id of the inserted row.
+    REPLAY AUTHORITY (P0-2 fix, S2 packet 2026-05-03):
+    Each row carries a deterministic `evidence_id` in metadata, computed
+    from (evidence_type, source_system, source_record_id). Before insert,
+    we look up an existing row with the same evidence_id; if found we
+    return the existing memory_id with `inserted=False`. This makes WA /
+    PDF / QBO ingest replay-safe — re-running the same batch produces no
+    duplicates.
+
+    Skipping condition: when `source_record_id is None`, we still compute
+    an evidence_id but DO NOT do the lookup — unkeyed records are treated
+    as always-new (they can't be reliably deduped without a stable key).
+
+    Returns: {"memory_id": int, "evidence_id": str, "inserted": bool}.
 
     Per Theme 8 + Theme 9 of north-star: feeds typed normalized facts
     into substrate without losing source-of-truth pointer.
@@ -677,12 +748,27 @@ def record_evidence_artifact(
     if not (0.0 <= confidence <= 1.0):
         raise ValueError(f"confidence={confidence} must be in [0.0, 1.0]")
 
+    evidence_id = _compute_evidence_id(evidence_type, source_system, source_record_id)
+
+    # Replay-authority lookup: keyed records (source_record_id present)
+    # dedupe on evidence_id; unkeyed records (source_record_id is None)
+    # always insert because there's no stable identity to match against.
+    if source_record_id is not None:
+        existing = _lookup_existing_evidence_memory_id(mem, evidence_id)
+        if existing is not None:
+            return {
+                "memory_id": existing,
+                "evidence_id": evidence_id,
+                "inserted": False,
+            }
+
     metadata = {
         "evidence_type": evidence_type,
         "capability_id": capability_id,
         "source_system": source_system,
         "source_path": source_path,
         "privacy_class": privacy_class,
+        "evidence_id": evidence_id,
     }
     if source_record_id is not None:
         metadata["source_record_id"] = source_record_id
@@ -699,7 +785,7 @@ def record_evidence_artifact(
     # explicit caller decision, not an implicit conflict-detection side-effect.
     # Caught by per-commit reviewer of d410019. Matches record_invoice_status_change
     # pattern (also bi-temporal, also detect_conflicts=False).
-    return mem.remember(
+    memory_id = mem.remember(
         content,
         label=label,
         kind="experience",
@@ -711,6 +797,11 @@ def record_evidence_artifact(
         metadata=metadata,
         detect_conflicts=False,
     )
+    return {
+        "memory_id": memory_id,
+        "evidence_id": evidence_id,
+        "inserted": True,
+    }
 
 
 def record_wa_crew_event(
@@ -728,7 +819,7 @@ def record_wa_crew_event(
     auth_proof: Optional[str] = None,
     privacy_class: str = "internal",
     consumer_hint: Optional[str] = None,
-) -> int:
+) -> dict[str, Any]:
     """Record a WA crew chat event with full Theme 8 contract schema.
 
     Per redesigner Section D: Hermes is canonical owner of WA delivery,
@@ -743,6 +834,10 @@ def record_wa_crew_event(
     Source path defaults to "wa_bridge:<thread_id>:<ts>" if no specific
     file source. Bi-temporal: valid_from = ts; valid_to remains NULL
     until message is corrected/superseded.
+
+    Returns: {"memory_id": int, "evidence_id": str, "inserted": bool}
+    (same contract as record_evidence_artifact — replay-safe via the
+    deterministic evidence_id key).
     """
     if not raw_text or not raw_text.strip():
         raise ValueError("record_wa_crew_event: raw_text must be non-empty")
@@ -808,7 +903,7 @@ def record_estimate_evidence(
     sent_at: Optional[float] = None,
     privacy_class: str = "financial",
     consumer_hint: Optional[str] = None,
-) -> int:
+) -> dict[str, Any]:
     """Record an estimate-pipeline event with provenance to the PDF artifact.
 
     For sent events: pdf_path points at /Users/tito/lWORKSPACEl/Projects/AngelsElectric/LangGraph/data/sent-estimates-pdfs/<file>.
@@ -816,6 +911,9 @@ def record_estimate_evidence(
 
     The financial privacy class is default since estimates carry pricing
     that's not internal-public. Override only with explicit Tito approval.
+
+    Returns: {"memory_id": int, "evidence_id": str, "inserted": bool}
+    (forwarded from record_evidence_artifact for replay safety).
     """
     if event_type not in {"draft", "sent", "approved", "scheduled", "lost"}:
         raise ValueError(
@@ -874,7 +972,7 @@ def record_material_price_evidence(
     unit: str = "ea",
     valid_to: Optional[float] = None,
     consumer_hint: Optional[str] = None,
-) -> int:
+) -> dict[str, Any]:
     """Record a material/SKU price evidence with bi-temporal validity.
 
     Use valid_to to mark price superseded (don't delete the prior — temporal
@@ -882,6 +980,9 @@ def record_material_price_evidence(
 
     Vendor: amperage / gve / amazon / hd / supplyhouse / etc.
     Privacy: 'internal' is default — prices aren't public, but not PII.
+
+    Returns: {"memory_id": int, "evidence_id": str, "inserted": bool}
+    (forwarded from record_evidence_artifact for replay safety).
     """
     if price_cents < 0:
         raise ValueError(f"price_cents={price_cents} must be non-negative")
@@ -941,4 +1042,6 @@ __all__ = [
     "record_material_price_evidence",
     "EVIDENCE_PRIVACY_CLASSES",
     "EVIDENCE_TYPES",
+    # Replay-authority key (S2 packet 2026-05-03)
+    "_compute_evidence_id",
 ]

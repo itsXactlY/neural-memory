@@ -40,6 +40,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Import the canonical evidence_id computation from ae_workflow_helpers
+# so this dry-run tool produces IDs identical to live ingest. Single
+# source of truth — a lockdown test in test_ae_evidence_ingest.py
+# asserts both call sites match if a future refactor diverges.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
+from ae_workflow_helpers import _compute_evidence_id  # noqa: E402
+
 DRYRUN_DIR = Path.home() / ".neural_memory" / "ingest-dryruns"
 
 REQUIRED_FIELDS = {"thread_id", "sender", "raw_text", "ts"}
@@ -103,12 +110,22 @@ def to_typed_record(row: dict) -> dict:
 
     confidence = 0.95 if delivery == "read" else 0.85
 
+    # Replay-authority key (S2 packet 2026-05-03): identical to what
+    # record_evidence_artifact will compute when this row is later live-ingested.
+    # Imported from ae_workflow_helpers so divergence is impossible by construction.
+    evidence_id = _compute_evidence_id(
+        evidence_type="wa_crew_message",
+        source_system="hermes_wa_bridge",
+        source_record_id=record_id,
+    )
+
     metadata = {
         "evidence_type": "wa_crew_message",
         "capability_id": row.get("capability_id", "ITEM-WA-UNTAGGED"),
         "source_system": "hermes_wa_bridge",
         "source_path": f"wa_bridge:{record_id}",
         "privacy_class": privacy,
+        "evidence_id": evidence_id,
         "source_record_id": record_id,
         "thread_id": thread_id,
         "sender": row["sender"],
@@ -134,6 +151,7 @@ def to_typed_record(row: dict) -> dict:
         "origin_system": "ae",
         "valid_from": ts,
         "valid_to": None,
+        "evidence_id": evidence_id,  # surfaced top-level for replay-replay tooling
         "metadata": metadata,
         # Note: detect_conflicts=False is enforced server-side by record_evidence_artifact
     }
