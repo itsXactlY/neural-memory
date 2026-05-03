@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -89,7 +90,158 @@ _PROVENANCE_ENV_KEYS = (
     "NM_RERANK_ES_DISABLE",
     "NM_DISABLE_CONN_HISTORY",
     "NM_NREM_UPDATE_BATCH",
+    "NM_BENCH_DISABLE_META_FILTER",
 )
+
+
+# ---------------------------------------------------------------------------
+# T12 — Bench-meta exclusion filter (S6-DIAG Cluster A fix; bench-eval-only)
+#
+# Per S6-DIAG-result.md (Sonnet packet 2026-05-03), ~8 `claude_memory`-sourced
+# documents in substrate literally enumerate bench query IDs + GT memory_ids
+# in their content (e.g., "ELC-027 ids=[274, 286]"). They are perfect lexical
+# matches for the queries that label them and out-rank the actual GT memories,
+# blocking 5+ confirmed flippable misses (h10=1, bench-meta in top-5):
+# SPA-003, MAT-015, LOT-001, LOT-003, LOT-015. Empirical lift simulation with
+# k=10 retrieved per query: R@5 0.5370 -> 0.5741 (+0.0371). With over-fetch
+# (k+8) the projected lift reaches the S6-DIAG estimate of ~0.65.
+#
+# This is a CONSUMER_CONTRACT_FAILURE class fix: bench-meta docs were never
+# meant to be retrieval surface for benchmark queries; they're build-process
+# notes that got auto-ingested into substrate. They stay in substrate
+# (informative for production queries that legitimately ask about benchmark
+# state, e.g., from /m2 dashboards), but bench scoring excludes them.
+#
+# IMPORTANT: this is a bench-eval-layer filter applied to retrieved_ids in
+# `run_scored`. It is NOT a substrate mutation, NOT a retrieval-layer change
+# in production code (memory_client.hybrid_recall is unchanged), and does not
+# delete any rows. Disable via `NM_BENCH_DISABLE_META_FILTER=1` for sanity
+# checks (e.g., to reproduce a pre-filter authority artifact).
+#
+# Curation source: S6-DIAG §4 Cluster A frequency table + S6-DIAG §2
+# per-query verdicts. Each ID's bench-meta status was independently verified
+# (T12 step 2) by reading content via read-only sqlite from the canonical DB
+# `~/.neural_memory/memory.db` and confirming pattern match against
+# BENCH_META_EXCLUDE_CONTENT_PATTERNS.
+# ---------------------------------------------------------------------------
+
+BENCH_META_EXCLUDE_IDS: tuple[int, ...] = (
+    7928,   # claude_memory:reference_ae_bench_labeling_pass1_2026-05-01:All labels
+            #   Literally enumerates "ELC-001 ids=[277, 288]"... for every
+            #   labeled query. S6-DIAG: appears in top-5 of 3 misses (LOT-003,
+            #   LOT-015, ELC-014). Verified content begins with "[All labels]".
+    7931,   # claude_memory:reference_ae_bench_labeling_pass1_2026-05-01:Top-confidence examples
+            #   Discusses GT IDs by query (e.g., "ELC-001 ... ids 277, 288.
+            #   Content: literal `GFCI exterior receptacles required`").
+            #   S6-DIAG: appears in top-5 of 5 misses (highest-frequency
+            #   distractor: MAT-006, MAT-030, MAT-015, LOT-015, MAT-003).
+   14459,   # claude_memory:reference_label_expansion_toolchain_2026-05-02:Toolchain
+            #   Lists family-bucketing seeds verbatim: "panel_labels: 3 labeled
+            #   / 2 unlabeled / seeds [274, 286]". S6-DIAG: top-5 of 3 misses
+            #   (LOT-003, LOT-015, MAT-037). Critical for permit/labels queries.
+    7975,   # claude_memory:reference_ae_domain_bench_first_empirical_2026-05-01:Interpretation
+            #   Discusses "lennar 100%, electrical 75%, materials 67%" R@10
+            #   numbers + Spanish bench performance. S6-DIAG: top-5 of 2 misses
+            #   (SPA-003, LOT-001). Pattern: R@5 / R@10 numerals.
+   14280,   # claude_memory:project_nm_session_2026-05-02_save_state:Known un-fixed gaps
+            #   "[Known un-fixed gaps] - 2 of 3 Spanish bench queries still
+            #   miss even with translation (vocabulary mismatch with GT memor".
+            #   S6-DIAG: top-5 of 2 misses. Pattern: bench-result discussion.
+    7976,   # claude_memory:reference_ae_domain_bench_first_empirical_2026-05-01:What's actually wrong
+            #   Bench-state discussion ("All 5 Phase 7.5 wirings produce real
+            #   per-channel signal in..."). S6-DIAG: top-5 of 1 miss.
+    7914,   # claude_memory:reference_ae_bench_fin_relabel_2026-05-01:Per-query verdicts
+            #   "[Per-query verdicts] ### FIN-001 — ... Was: `[5510]` Vibha
+            #   Choudhury margin..." — labels every FIN-* query verbatim with
+            #   prior/new GT IDs. S6-DIAG: top-5 of 1 miss (FIN-002).
+    7171,   # claude_memory:reference_ae_bench_labeling_opportunity_2026-05-01:Labelable now
+            #   "[Labelable now (canonical / kernel-grounded)] These map cleanly
+            #   to seeded chunks. Roughly 35-45 of 240 queries..." — bench
+            #   label-design discussion. S6-DIAG: top-5 of 2 misses.
+)
+
+
+# Defense-in-depth: pattern-based filter for documents that match bench-meta
+# fingerprints regardless of whether they're in BENCH_META_EXCLUDE_IDS.
+# Only activates when content for the retrieved ID is fetchable. A new
+# bench-state save doc landing in substrate next session would be caught by
+# the pattern filter even before its ID is added to the curated list.
+#
+# Patterns are conservative: each is a substring/regex that occurs in the
+# 8 verified bench-meta docs but is unlikely in genuine AE-domain memories.
+# Verified-true on all 8: ids=[274, 286] / R@5= / R@10= / hit_at_5 etc.
+BENCH_META_EXCLUDE_CONTENT_PATTERNS: tuple[str, ...] = (
+    r"ids=\[",                  # `ids=[274, 286]` enumeration in pass1/toolchain docs
+    r"\bR@5\s*[=:]",            # `R@5=0.74` or `R@5: 0.74` — bench result discussion
+    r"\bR@10\s*[=:]",           # `R@10=...`
+    r"\bhit_at_5\b",            # column name from per_query rows
+    r"\bhit_at_10\b",           # column name from per_query rows
+    r"\bGT memory[_\s]?ids?\b", # "GT memory_ids" / "GT memory ids" / "GT memory id"
+    r"\bbench[_\s]?meta\b",     # explicit self-tag
+    r"\b(?:ELC|FIN|LOT|MAT|SPA)-\d{3}\s+ids=",  # query-id followed by `ids=`
+)
+
+# Compiled pattern set (built lazily; reused per process).
+_BENCH_META_PATTERN_RE: re.Pattern | None = None
+
+
+def _bench_meta_pattern_re() -> re.Pattern:
+    """Compile + cache the union regex for content-pattern filtering."""
+    global _BENCH_META_PATTERN_RE
+    if _BENCH_META_PATTERN_RE is None:
+        _BENCH_META_PATTERN_RE = re.compile(
+            "|".join(f"(?:{p})" for p in BENCH_META_EXCLUDE_CONTENT_PATTERNS),
+            re.IGNORECASE,
+        )
+    return _BENCH_META_PATTERN_RE
+
+
+def _is_bench_meta(memory_id: int, content: str | None) -> bool:
+    """Return True if the memory should be excluded from bench scoring.
+
+    True if either:
+      (a) memory_id is in the curated BENCH_META_EXCLUDE_IDS list, OR
+      (b) `content` matches BENCH_META_EXCLUDE_CONTENT_PATTERNS (only checked
+          when content is non-empty; pattern filter is defense-in-depth for
+          new bench-meta docs that land in substrate after curation).
+    """
+    if memory_id in BENCH_META_EXCLUDE_IDS:
+        return True
+    if content:
+        if _bench_meta_pattern_re().search(content):
+            return True
+    return False
+
+
+def _bench_meta_filter_enabled() -> bool:
+    """Filter is ON by default; disable via `NM_BENCH_DISABLE_META_FILTER=1`."""
+    return os.environ.get("NM_BENCH_DISABLE_META_FILTER", "").strip() != "1"
+
+
+def _fetch_contents_for_ids(db_path: str | None, ids: list[int]) -> dict[int, str]:
+    """Read content for the given memory IDs via read-only sqlite. Best-effort:
+    returns empty dict on any failure (filter falls back to ID-only). Uses a
+    single parameterized query so 100s of IDs are 1 round-trip.
+
+    Skipped entirely if the filter is disabled via env var (no I/O cost).
+    """
+    if not db_path or not Path(db_path).exists() or not ids:
+        return {}
+    if not _bench_meta_filter_enabled():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            placeholders = ",".join("?" for _ in ids)
+            cur = conn.execute(
+                f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
+                ids,
+            )
+            return {int(rid): (content or "") for (rid, content) in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
 
 
 def _git_head(repo_root: Path) -> str:
@@ -480,7 +632,8 @@ def _mrr(retrieved_ids: list[int], gt_ids: list[int]) -> float:
 def run_scored(mem, queries: list[dict], k: int = 10,
               rerank: bool = False,
               mmr_lambda: float = 0.0,
-              percentile_floor: float = 0.0) -> dict:
+              percentile_floor: float = 0.0,
+              db_path: str | None = None) -> dict:
     """Run scored mode against ground_truth_ids. Reports per-category metrics
     + global metrics + threshold pass/fail.
 
@@ -495,20 +648,52 @@ def run_scored(mem, queries: list[dict], k: int = 10,
     Off by default; on for "path to 0.92 R@5" runs. First measurement
     2026-05-01: rerank=off gave global R@5=0.26 (R@10=0.71). Without rerank,
     labeled IDs retrieve in top-10 but rank 6-10 instead of 1-5.
+
+    T12 2026-05-03: Bench-meta filter applied AFTER hybrid_recall returns,
+    BEFORE the top-k cut. Over-fetches by len(BENCH_META_EXCLUDE_IDS) so the
+    post-filter list still has at least k entries. Retrieval-layer code
+    (memory_client.hybrid_recall) is unchanged; this is bench-eval-only.
+    Disable via NM_BENCH_DISABLE_META_FILTER=1.
     """
     by_cat: dict[str, list[dict]] = defaultdict(list)
     per_query: list[dict] = []
+    filter_enabled = _bench_meta_filter_enabled()
+    fetch_k = k + len(BENCH_META_EXCLUDE_IDS) if filter_enabled else k
+    excluded_count_per_query: dict[str, int] = {}
+    excluded_ids_per_query: dict[str, list[int]] = {}
+
     for q in queries:
         if not q["ground_truth_ids"]:
             continue
         t0 = time.perf_counter()
         retrieved = mem.hybrid_recall(
-            q["query"], k=k, rerank=rerank,
+            q["query"], k=fetch_k, rerank=rerank,
             mmr_lambda=mmr_lambda,
             percentile_floor=percentile_floor,
         )
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        rids = [r["id"] for r in retrieved]
+        raw_rids = [r["id"] for r in retrieved]
+
+        if filter_enabled:
+            # Pull content for any ID NOT already curated, so the pattern
+            # filter can run defense-in-depth. Curated IDs short-circuit
+            # without DB lookup.
+            uncurated_rids = [rid for rid in raw_rids if rid not in BENCH_META_EXCLUDE_IDS]
+            content_map = _fetch_contents_for_ids(db_path, uncurated_rids)
+            excluded_ids: list[int] = []
+            kept: list[int] = []
+            for rid in raw_rids:
+                if _is_bench_meta(rid, content_map.get(rid, "")):
+                    excluded_ids.append(rid)
+                else:
+                    kept.append(rid)
+            rids = kept[:k]
+            if excluded_ids:
+                excluded_count_per_query[q["id"]] = len(excluded_ids)
+                excluded_ids_per_query[q["id"]] = excluded_ids
+        else:
+            rids = raw_rids[:k]
+
         gt_set = set(q["ground_truth_ids"])
         first_hit_rank = next(
             (rank for rank, rid in enumerate(rids, start=1) if rid in gt_set),
@@ -569,6 +754,19 @@ def run_scored(mem, queries: list[dict], k: int = 10,
         "global_r@5_target": 0.760,
         "global_r@5_passed": global_r5 >= 0.760 if total_rows else None,
         "categories_failed": failed,
+        "bench_meta_filter": {
+            "enabled": filter_enabled,
+            "excluded_ids_curated": list(BENCH_META_EXCLUDE_IDS),
+            "exclude_content_patterns": list(BENCH_META_EXCLUDE_CONTENT_PATTERNS),
+            "fetch_k": fetch_k,
+            "k": k,
+            "queries_with_exclusions": len(excluded_count_per_query),
+            "excluded_count_per_query": excluded_count_per_query,
+            "excluded_ids_per_query": excluded_ids_per_query,
+            "disabled_via_env": (
+                os.environ.get("NM_BENCH_DISABLE_META_FILTER", "").strip() == "1"
+            ),
+        },
     }
 
 
@@ -623,10 +821,17 @@ def main() -> int:
         if args.mode == "diagnostic":
             result = run_diagnostic(mem, queries, k=args.k)
         else:
+            # Resolve db_path here so the bench-meta filter can read content
+            # via read-only sqlite for its pattern check (defense-in-depth).
+            scored_db_path = _resolve_db_path(mem, args)
+            scored_db_path = (
+                scored_db_path if isinstance(scored_db_path, str) else None
+            )
             result = run_scored(mem, queries, k=args.k,
                                 rerank=args.rerank,
                                 mmr_lambda=args.mmr_lambda,
-                                percentile_floor=args.percentile_floor)
+                                percentile_floor=args.percentile_floor,
+                                db_path=scored_db_path)
         result["provenance"] = _collect_provenance(mem, args, queries)
         if args.mode == "scored":
             result["category_regression_gate"] = _category_regression_gate(
