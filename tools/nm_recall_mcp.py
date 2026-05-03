@@ -10,7 +10,9 @@ Node.js precedent — but implemented in Python because memory_client
 imports directly.
 
 Tools exposed:
-  - nm_recall: hybrid_recall with bench-validated config (R@5=0.82)
+  - nm_recall: hybrid_recall with bench-validated config (current AE-domain
+    R@5 reported live by ``_bench_authority()`` from the most recent
+    ``~/.neural_memory/bench-history/ae-domain-*.json`` artifact)
   - nm_sparse_search: BM25 sparse-only (cheaper, no rerank load)
   - nm_remember: write a new memory
   - nm_status: substrate health snapshot (counts, sources)
@@ -46,14 +48,47 @@ sys.path.insert(0, str(_ROOT / "python"))
 # Lazy-import to avoid heavy embedder load at startup
 _mem = None
 
+# Default location of bench-history artifacts produced by the F9 AE-domain
+# bench harness. Overridable for tests via _bench_authority(bench_dir=...).
+_DEFAULT_BENCH_DIR = Path.home() / ".neural_memory" / "bench-history"
+
+
+def _bench_authority(bench_dir: Path | None = None) -> tuple[str, str]:
+    """Return current AE-domain bench R@5 from the most recent artifact.
+
+    Reads the latest ``ae-domain-*.json`` under ``bench_dir`` (default
+    ``~/.neural_memory/bench-history/``) and extracts the top-level
+    ``global_r@5`` field per the F9 artifact format.
+
+    Returns a ``(r_at_5, artifact_name)`` tuple of strings. Both values
+    fall back to ``"unknown"`` if no artifact is present, the file cannot
+    be read, the JSON is malformed, or the expected key is missing.
+    Stringly-typed by design so the value can be safely interpolated
+    into prose without per-call float-format guards.
+    """
+    bench_dir = bench_dir or _DEFAULT_BENCH_DIR
+    try:
+        artifacts = sorted(bench_dir.glob("ae-domain-*.json"))
+        if not artifacts:
+            return ("unknown", "unknown")
+        latest = artifacts[-1]
+        with latest.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        val = data.get("global_r@5")
+        if val is None:
+            return ("unknown", latest.name)
+        return (f"{float(val):.4f}", latest.name)
+    except Exception:
+        return ("unknown", "unknown")
+
 
 def _get_mem():
     global _mem
     if _mem is None:
         from memory_client import NeuralMemory
-        # Reviewer-round-6 fix 2026-05-02: use_hnsw=True is required for
-        # bench-validated R@5=0.82 perf. Without HNSW, every dense channel
-        # call linear-scans 12k+ memories per query, blowing up p50.
+        # Reviewer-round-6 fix 2026-05-02: use_hnsw=True is required to keep
+        # dense-channel latency under control. Without HNSW, every dense
+        # channel call linear-scans 12k+ memories per query, blowing up p50.
         _mem = NeuralMemory(
             embedding_backend="auto",
             use_cpp=False,
@@ -69,6 +104,8 @@ SERVER_NAME = "nm-recall"
 SERVER_VERSION = "0.1.0"
 
 
+_R5, _R5_ARTIFACT = _bench_authority()
+
 TOOLS = [
     {
         "name": "nm_recall",
@@ -78,7 +115,8 @@ TOOLS = [
             "temporal channels with cross-encoder rerank (auto-skip for "
             "Spanish queries to avoid English-rerank regression). "
             "Returns top-K memories with combined score, channel "
-            "breakdown, and per-feature trace."
+            f"breakdown, and per-feature trace. Current bench R@5: {_R5} "
+            f"(from {_R5_ARTIFACT})."
         ),
         "inputSchema": {
             "type": "object",
