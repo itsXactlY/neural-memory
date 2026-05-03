@@ -535,5 +535,73 @@ class TestBenchMetaFilter(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# S1h — Top-level threshold_failed + regression_detected boolean contracts
+#
+# The actual emission of `threshold_failed` and `regression_detected` happens
+# in main() after run_scored() and _category_regression_gate() return.  These
+# unit tests verify the upstream results those fields are derived from, making
+# the one-liner derivation in main() self-evidently correct.
+# ---------------------------------------------------------------------------
+
+class TestS1hThresholdBooleans(unittest.TestCase):
+    """S1h acceptance tests for the threshold_failed / regression_detected
+    boolean contracts introduced in 2026-05-03."""
+
+    def test_categories_failed_non_empty_on_miss(self):
+        """categories_failed must be non-empty when a category falls below
+        threshold → threshold_failed = bool(categories_failed) = True."""
+        queries = [_q("ELC-001", "ELC-001 query", [999])]
+        with mock.patch("run_ae_domain_bench._fetch_contents_for_ids", return_value={}):
+            result = run_scored(_FakeMemory({"ELC-001 query": []}), queries, k=5, rerank=False)
+        self.assertTrue(
+            bool(result.get("categories_failed")),
+            "categories_failed must be non-empty on miss → threshold_failed=True",
+        )
+
+    def test_categories_failed_empty_on_pass(self):
+        """categories_failed must be empty when all categories pass their
+        threshold → threshold_failed = False."""
+        queries = [_q("ELC-001", "ELC-001 query", [999])]
+        with mock.patch("run_ae_domain_bench._fetch_contents_for_ids", return_value={}):
+            result = run_scored(_FakeMemory({"ELC-001 query": [999]}), queries, k=5, rerank=False)
+        self.assertFalse(
+            bool(result.get("categories_failed")),
+            "categories_failed must be empty when all categories pass → threshold_failed=False",
+        )
+
+    def test_regression_detected_fires_on_drop(self):
+        """category_regression_gate.regression_detected must be True when a
+        category drops > 0.05 R@5 on the comparable intersect → this field is
+        hoisted to top-level regression_detected in main()."""
+        ids = ["ELC-001"]
+        prev_rows = [_make_pq_row(qid, "electrical_contracting", h5=1) for qid in ids]
+        cur_rows  = [_make_pq_row(qid, "electrical_contracting", h5=0) for qid in ids]
+        prev_path = _write_artifact({
+            "mode": "scored",
+            "per_query": prev_rows,
+            "per_category": {},
+            "category_regression_gate": {
+                "enabled": False, "regressions": [], "regression_detected": False,
+            },
+        })
+        current = _make_scored_result(cur_rows)
+        gate = _category_regression_gate(current, prev_path)
+        self.assertTrue(
+            gate["regression_detected"],
+            "regression_detected must be True on > 0.05 R@5 drop in intersect",
+        )
+
+    def test_regression_detected_false_without_prev(self):
+        """Without a --prev-results artifact the gate is disabled and
+        regression_detected must be False."""
+        current = _make_scored_result([_make_pq_row("ELC-001", "electrical_contracting")])
+        gate = _category_regression_gate(current, None)
+        self.assertFalse(
+            gate["regression_detected"],
+            "regression_detected must be False when no prior artifact is given",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

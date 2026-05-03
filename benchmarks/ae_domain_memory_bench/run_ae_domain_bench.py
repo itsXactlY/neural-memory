@@ -838,6 +838,10 @@ def main() -> int:
                 result, args.prev_results,
             )
             result["subsets"] = _build_subsets(result, result["provenance"])
+            result["threshold_failed"] = bool(result.get("categories_failed"))
+            result["regression_detected"] = result.get(
+                "category_regression_gate", {}
+            ).get("regression_detected", False)
     finally:
         try:
             mem.close()
