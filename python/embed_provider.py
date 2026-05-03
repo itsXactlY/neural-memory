@@ -1154,17 +1154,33 @@ class EmbeddingProvider:
     
     def _auto_detect(self):
         """Auto-detect best available backend.
-        
-        Priority: Shared Server (already running) > CUDA sentence-transformers > FastEmbed > 
+
+        Priority: Shared Server (already running) > CUDA sentence-transformers > FastEmbed >
                   MPS sentence-transformers > CPU sentence-transformers > TF-IDF > hash
-        
+
         The shared server is checked FIRST because it means another process already loaded
         the model. We do NOT reload it — we connect via socket.
+
+        Override via env EMBED_BACKEND={sentence-transformers,fastembed,hash}
+        — needed when the auto-pick conflicts with stored vectors (e.g. a DB
+        embedded under sentence-transformers can't be queried by FastEmbed even
+        though both are 1024d, since the vector spaces differ).
         """
         try:
             import torch
         except ImportError:
             torch = None
+
+        # -1. EXPLICIT OVERRIDE via env — bypasses the auto-select chain
+        forced = os.environ.get('EMBED_BACKEND', '').strip().lower()
+        if forced in ('sentence-transformers', 'st', 'sbert'):
+            backend = SentenceTransformerBackend()
+            print(f"[embed] Forced (env EMBED_BACKEND={forced}): sentence-transformers ({backend.dim}d)")
+            return backend
+        if forced == 'fastembed':
+            backend = FastEmbedBackend()
+            print(f"[embed] Forced (env EMBED_BACKEND={forced}): FastEmbed ({backend.dim}d)")
+            return backend
 
         # 0. SHARED SERVER FIRST — if socket exists and server is alive, USE IT
         # This is the whole point of the shared server architecture!
