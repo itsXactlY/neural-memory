@@ -93,6 +93,7 @@ class AEEvidenceIngestContractTests(unittest.TestCase):
                 capability_id="ITEM-9",
                 source_system="x", source_path="/x", content="x",
                 privacy_class="OBVIOUSLY_INVALID",
+                source_record_id="test-priv-check",  # satisfy S4b contract; test reaches privacy check
             )
         self.assertIn("privacy_class", str(ctx.exception))
 
@@ -103,6 +104,7 @@ class AEEvidenceIngestContractTests(unittest.TestCase):
                 evidence_type="not_a_real_type",
                 capability_id="ITEM-9",
                 source_system="x", source_path="/x", content="x",
+                source_record_id="test-type-check",  # satisfy S4b contract; test reaches type check
             )
         self.assertIn("evidence_type", str(ctx.exception))
 
@@ -112,6 +114,7 @@ class AEEvidenceIngestContractTests(unittest.TestCase):
                 self.mem, evidence_type="sent_pdf", capability_id="X",
                 source_system="x", source_path="/x", content="x",
                 confidence=1.5,
+                source_record_id="test-conf-check",  # satisfy S4b contract; test reaches confidence check
             )
 
     def test_caller_metadata_cannot_override_contract_keys(self) -> None:
@@ -126,6 +129,7 @@ class AEEvidenceIngestContractTests(unittest.TestCase):
             source_path="/real/path",
             content="content",
             privacy_class="internal",
+            source_record_id="OVERRIDE-TEST-1",  # S4b: stable key required
             extra_metadata={
                 "capability_id": "FAKE-CAP",
                 "privacy_class": "public",
@@ -670,6 +674,143 @@ class AEEvidenceIngestContractTests(unittest.TestCase):
                                   f"{label} inserted must be bool")
             self.assertEqual(len(r["evidence_id"]), 16,
                              f"{label} evidence_id must be 16 hex chars")
+
+
+    # ------------------------------------------------------------ S4b: source_record_id required (P0 contract)
+    def test_record_evidence_artifact_rejects_none_source_record_id_by_default(
+        self,
+    ) -> None:
+        """record_evidence_artifact must raise ValueError when source_record_id
+        is None and allow_unkeyed_nonprod is False (the default). This guards
+        production callers from accidentally creating replay-unkeyed rows."""
+        with self.assertRaises(ValueError) as ctx:
+            record_evidence_artifact(
+                self.mem,
+                evidence_type="sent_pdf",
+                capability_id="ITEM-KEY",
+                source_system="ae_dashboard",
+                source_path="/p",
+                content="c",
+                # source_record_id omitted (defaults to None)
+                # allow_unkeyed_nonprod omitted (defaults to False)
+            )
+        msg = str(ctx.exception)
+        self.assertIn("source_record_id", msg)
+        self.assertIn("allow_unkeyed_nonprod", msg)
+
+    def test_record_evidence_artifact_allows_unkeyed_with_opt_in(self) -> None:
+        """record_evidence_artifact with source_record_id=None and
+        allow_unkeyed_nonprod=True must succeed and return the standard
+        result dict (unkeyed ad-hoc path)."""
+        result = record_evidence_artifact(
+            self.mem,
+            evidence_type="sent_pdf",
+            capability_id="ITEM-UNKEYED",
+            source_system="ae_dashboard",
+            source_path="/p",
+            content="unkeyed test content",
+            allow_unkeyed_nonprod=True,
+            # source_record_id intentionally None
+        )
+        self.assertIsInstance(result, dict)
+        self.assertIn("memory_id", result)
+        self.assertIn("evidence_id", result)
+        self.assertIn("inserted", result)
+        self.assertTrue(result["inserted"])
+        self.assertIsInstance(result["memory_id"], int)
+
+    def test_ledger_loser_timeout_fails_closed_no_duplicate_insert(self) -> None:
+        """When the ledger loser's timeout expires (winner never patches
+        memory_id), record_evidence_artifact must return a pending/failure
+        result — NOT create a second row.
+
+        Simulated by: inserting a ledger row with NULL memory_id directly
+        (mimicking a mid-flight winner that stalled), then calling
+        record_evidence_artifact with the same evidence_id. The function
+        will lose the INSERT OR IGNORE race, poll, time out, and must
+        return status='pending_winner' without calling mem.remember().
+        """
+        import threading
+
+        evidence_type = "estimate_event"
+        source_system = "ae_dashboard"
+        source_record_id = "TIMEOUT-TEST-KEY-1"
+
+        from ae_workflow_helpers import _compute_evidence_id  # noqa: F401 (already imported)
+        evidence_id = _compute_evidence_id(evidence_type, source_system, source_record_id)
+
+        # Directly plant a ledger row with NULL memory_id — simulates a winner
+        # that claimed the row but hasn't called mem.remember() yet.
+        with self.mem.store._lock:
+            self.mem.store.conn.execute(
+                "INSERT OR IGNORE INTO evidence_ledger "
+                "(evidence_id, memory_id, evidence_type, source_system, "
+                " source_record_id, status) "
+                "VALUES (?, NULL, ?, ?, ?, 'inserted')",
+                (evidence_id, evidence_type, source_system, source_record_id),
+            )
+            self.mem.store.conn.commit()
+
+        # Confirm the planted row exists with NULL memory_id.
+        with self.mem.store._lock:
+            row = self.mem.store.conn.execute(
+                "SELECT memory_id FROM evidence_ledger WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0], "planted row should have NULL memory_id")
+
+        # Spy: mem.remember must NOT be called by the loser-timeout path.
+        original_remember = self.mem.remember
+        call_count = {"n": 0}
+
+        def spy_remember(*a, **kw):
+            call_count["n"] += 1
+            return original_remember(*a, **kw)
+
+        self.mem.remember = spy_remember  # type: ignore[method-assign]
+        try:
+            result = record_evidence_artifact(
+                self.mem,
+                evidence_type=evidence_type,
+                capability_id="ITEM-TIMEOUT",
+                source_system=source_system,
+                source_path="/timeout-test",
+                content="should not be inserted",
+                source_record_id=source_record_id,
+            )
+        finally:
+            self.mem.remember = original_remember  # type: ignore[method-assign]
+
+        # mem.remember must NOT have been invoked.
+        self.assertEqual(call_count["n"], 0,
+                         "loser-timeout path must not invoke mem.remember")
+
+        # Return shape must be pending/failure.
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result["inserted"])
+        self.assertIsNone(result["memory_id"])
+        self.assertEqual(result.get("status"), "pending_winner",
+                         "loser-timeout must return status='pending_winner'")
+        self.assertEqual(result["evidence_id"], evidence_id)
+
+        # Exactly one ledger row for this evidence_id (no duplicate insert).
+        with self.mem.store._lock:
+            cnt = self.mem.store.conn.execute(
+                "SELECT COUNT(*) FROM evidence_ledger WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()[0]
+        self.assertEqual(cnt, 1, "loser-timeout must not create a duplicate ledger row")
+
+        # Exactly zero memory rows referencing this evidence_id (no duplicate evidence).
+        with self.mem.store._lock:
+            mem_cnt = self.mem.store.conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE "
+                "json_extract(metadata_json, '$.evidence_id') = ?",
+                (evidence_id,),
+            ).fetchone()[0]
+        self.assertEqual(mem_cnt, 0,
+                         "loser-timeout must not insert a memory row")
 
 
 if __name__ == "__main__":

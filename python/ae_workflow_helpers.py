@@ -815,6 +815,7 @@ def record_evidence_artifact(
     valid_to: Optional[float] = None,
     consumer_hint: Optional[str] = None,
     extra_metadata: Optional[dict[str, Any]] = None,
+    allow_unkeyed_nonprod: bool = False,
 ) -> dict[str, Any]:
     """Generic typed evidence record — base of the AEEvidenceIngest contract.
 
@@ -832,15 +833,35 @@ def record_evidence_artifact(
     PDF / QBO ingest replay-safe — re-running the same batch produces no
     duplicates.
 
-    Skipping condition: when `source_record_id is None`, we still compute
-    an evidence_id but DO NOT do the lookup — unkeyed records are treated
-    as always-new (they can't be reliably deduped without a stable key).
+    SOURCE_RECORD_ID CONTRACT (P0 fix, S4b packet 2026-05-03):
+    Production callers MUST pass a stable `source_record_id` to ensure
+    replay authority. Passing `source_record_id=None` without also passing
+    `allow_unkeyed_nonprod=True` raises ValueError. Ad-hoc / non-production
+    callers that genuinely have no stable key must explicitly opt in with
+    `allow_unkeyed_nonprod=True` — unkeyed records are treated as always-new
+    (they can't be reliably deduped without a stable key).
+
+    LEDGER LOSER TIMEOUT (P0 fix, S4b packet 2026-05-03):
+    When this caller loses the ledger race and the timeout expires before
+    the winner patches in memory_id, this function returns a pending/failure
+    result instead of falling through to a fresh insert. A fresh insert
+    after timeout would create a duplicate row under the same evidence_id,
+    violating the unique-key invariant. Callers should retry.
 
     Returns: {"memory_id": int, "evidence_id": str, "inserted": bool}.
+    On ledger-loser timeout: {"memory_id": None, "evidence_id": str,
+    "inserted": False, "status": "pending_winner"}.
 
     Per Theme 8 + Theme 9 of north-star: feeds typed normalized facts
     into substrate without losing source-of-truth pointer.
     """
+    if source_record_id is None and not allow_unkeyed_nonprod:
+        raise ValueError(
+            "record_evidence_artifact: source_record_id is required for production "
+            "callers (replay authority contract). Pass a stable source_record_id, "
+            "or pass allow_unkeyed_nonprod=True for ad-hoc/non-production callers "
+            "that have no stable key."
+        )
     _validate_evidence_type(evidence_type)
     _validate_privacy_class(privacy_class)
     if not (0.0 <= confidence <= 1.0):
@@ -898,9 +919,19 @@ def record_evidence_artifact(
                     "evidence_id": evidence_id,
                     "inserted": False,
                 }
-            # Budget exhausted — winner is wedged or extremely slow. Fall
-            # through to a fresh mem.remember(); accept potential duplicate
-            # rather than block forever.
+            # Budget exhausted — winner is wedged or extremely slow. Fail
+            # closed: do NOT fall through to a fresh insert. A second
+            # mem.remember() call would create a duplicate row under the same
+            # (evidence_type, source_system, source_record_id) triple, violating
+            # replay-authority. Return a pending/failure result; the caller must
+            # retry. (S4b fix — replaces the previous "accept potential duplicate"
+            # fall-through.)
+            return {
+                "memory_id": None,
+                "evidence_id": evidence_id,
+                "inserted": False,
+                "status": "pending_winner",
+            }
     elif source_record_id is not None:
         # Legacy / pre-upgrade path: JSON-scan dedup.
         existing_id = _lookup_existing_evidence_memory_id(mem, evidence_id)
