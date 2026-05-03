@@ -43,6 +43,42 @@ from queries import (  # noqa: E402
 )
 
 
+# ---------------------------------------------------------------------------
+# Stable label-set anchors — derived from git history audits.
+#
+# PRESERVED_33_QUERY_IDS: IDs labeled at commit 03f4785
+#   "fix(bench): +11 GT labels (22→33) + 2 bugs caught by Sonnet hostile-reviewer"
+#   Derived by running:
+#     git show 03f4785:benchmarks/ae_domain_memory_bench/queries.py |
+#       python3 -c "... regex for non-empty ground_truth_ids ..."
+#   These 33 IDs are the first cohort with validated ground-truth labels.
+#
+# SUBSET_38_QUERY_IDS: IDs present in artifact ae-domain-2026-05-03-062619.json
+#   (per_query block, 38 rows). Five IDs added after commit 03f4785:
+#   ELC-009, ELC-040, LOT-010, LOT-027, MAT-004.
+# ---------------------------------------------------------------------------
+
+PRESERVED_33_QUERY_IDS: tuple[str, ...] = (
+    "ELC-001", "ELC-005", "ELC-011", "ELC-013", "ELC-014", "ELC-016", "ELC-027",
+    "FIN-002", "FIN-018", "FIN-026", "FIN-039",
+    "LOT-001", "LOT-002", "LOT-003", "LOT-005", "LOT-006", "LOT-015",
+    "LOT-023", "LOT-035", "LOT-039",
+    "MAT-006", "MAT-015", "MAT-016", "MAT-021", "MAT-023", "MAT-025",
+    "MAT-026", "MAT-030", "MAT-037",
+    "SPA-003", "SPA-010", "SPA-028", "SPA-035",
+)
+
+SUBSET_38_QUERY_IDS: tuple[str, ...] = (
+    "ELC-001", "ELC-005", "ELC-009", "ELC-011", "ELC-013", "ELC-014",
+    "ELC-016", "ELC-027", "ELC-040",
+    "FIN-002", "FIN-018", "FIN-026", "FIN-039",
+    "LOT-001", "LOT-002", "LOT-003", "LOT-005", "LOT-006", "LOT-010",
+    "LOT-015", "LOT-023", "LOT-027", "LOT-035", "LOT-039",
+    "MAT-004", "MAT-006", "MAT-015", "MAT-016", "MAT-021", "MAT-023",
+    "MAT-025", "MAT-026", "MAT-030", "MAT-037",
+    "SPA-003", "SPA-010", "SPA-028", "SPA-035",
+)
+
 # Provenance: env vars whose value affects retrieval ranking. Captured
 # verbatim into every scored artifact so future flips are attributable.
 _PROVENANCE_ENV_KEYS = (
@@ -199,36 +235,181 @@ def _collect_provenance(mem, args, queries) -> dict:
 
 def _category_regression_gate(current: dict, prev_path: str | None,
                               threshold: float = 0.05) -> dict:
-    """Compare current per_category R@5 vs a prior artifact; flag drops."""
+    """Compare current per_category R@5 vs a prior artifact on the comparable
+    label intersect only.
+
+    Label-expansion categories (current has more queries than prev due to new
+    GT labels being added) are reported separately and never trigger a
+    regression failure. Only categories whose R@5 dropped beyond `threshold`
+    on the comparable intersect fire ``regression_detected``.
+    """
     if not prev_path:
-        return {"enabled": False, "regressions": []}
+        return {"enabled": False, "regressions": [], "regression_detected": False}
     try:
         prev = json.loads(Path(prev_path).read_text())
     except Exception as e:
-        return {"enabled": True, "error": str(e), "regressions": []}
+        return {
+            "enabled": True,
+            "error": str(e),
+            "regressions": [],
+            "regression_detected": False,
+        }
+
+    # Build query_id → per_query row maps for intersect computation.
+    cur_pq: dict[str, dict] = {
+        r["id"]: r for r in (current.get("per_query") or [])
+    }
+    prev_pq: dict[str, dict] = {
+        r["id"]: r for r in (prev.get("per_query") or [])
+    }
+    comparable_ids = set(cur_pq.keys()) & set(prev_pq.keys())
+
+    # Per-category comparable-intersect R@5 for current and previous.
+    def _cat_r5_on_ids(pq_map: dict[str, dict], ids: set[str]) -> dict[str, dict]:
+        by_cat: dict[str, list[float]] = defaultdict(list)
+        for qid in ids:
+            row = pq_map.get(qid)
+            if row:
+                by_cat[row["category"]].append(float(row.get("hit_at_5", 0)))
+        return {
+            cat: {"r@5": round(sum(vs) / len(vs), 4), "n": len(vs)}
+            for cat, vs in by_cat.items() if vs
+        }
+
+    cur_intersect_cats = _cat_r5_on_ids(cur_pq, comparable_ids)
+    prev_intersect_cats = _cat_r5_on_ids(prev_pq, comparable_ids)
+
+    # Identify categories that gained queries (label expansion).
+    cur_all_cats: dict[str, int] = defaultdict(int)
+    prev_all_cats: dict[str, int] = defaultdict(int)
+    for qid, row in cur_pq.items():
+        cur_all_cats[row["category"]] += 1
+    for qid, row in prev_pq.items():
+        prev_all_cats[row["category"]] += 1
+    label_expansion_categories = sorted(
+        cat for cat in cur_all_cats
+        if cur_all_cats[cat] > prev_all_cats.get(cat, 0)
+    )
+
     regressions = []
-    cur_cats = current.get("per_category", {}) or {}
-    prev_cats = (prev.get("per_category") if isinstance(prev, dict) else {}) or {}
-    for cat, cur_row in cur_cats.items():
-        prev_row = prev_cats.get(cat)
+    for cat, cur_row in cur_intersect_cats.items():
+        prev_row = prev_intersect_cats.get(cat)
         if not prev_row:
             continue
-        cur_r5 = cur_row.get("r@5", 0.0)
-        prev_r5 = prev_row.get("r@5", 0.0)
-        delta = cur_r5 - prev_r5
+        # Skip regression check for label-expansion categories.
+        if cat in label_expansion_categories:
+            continue
+        delta = cur_row["r@5"] - prev_row["r@5"]
         if delta < -threshold:
             regressions.append({
                 "category": cat,
-                "prev_r@5": prev_r5,
-                "current_r@5": cur_r5,
+                "prev_r@5": prev_row["r@5"],
+                "current_r@5": cur_row["r@5"],
                 "delta": round(delta, 4),
+                "comparable_n": cur_row["n"],
             })
+
     return {
         "enabled": True,
         "prev_path": prev_path,
         "threshold": threshold,
+        "comparable_query_count": len(comparable_ids),
+        "label_expansion_categories": label_expansion_categories,
         "regressions": regressions,
+        "regression_detected": len(regressions) > 0,
     }
+
+
+def _build_subset(
+    label: str,
+    anchor_ids: tuple[str, ...] | list[str],
+    scored_result: dict,
+    provenance: dict,
+) -> dict:
+    """Slice a scored result to the queries in anchor_ids.
+
+    Returns a subset block with query_md5, label_count, per_category R@5,
+    per_query rows, and dropped_ids (anchor IDs not found in current run).
+    """
+    cur_pq_map = {r["id"]: r for r in (scored_result.get("per_query") or [])}
+    present = [qid for qid in anchor_ids if qid in cur_pq_map]
+    dropped = [qid for qid in anchor_ids if qid not in cur_pq_map]
+
+    by_cat: dict[str, list[dict]] = defaultdict(list)
+    for qid in present:
+        row = cur_pq_map[qid]
+        by_cat[row["category"]].append(row)
+
+    per_category: dict[str, dict] = {}
+    for cat, rows in by_cat.items():
+        n = len(rows)
+        r5 = sum(r["hit_at_5"] for r in rows) / n
+        r10 = sum(r["hit_at_10"] for r in rows) / n
+        mrr = sum(r["mrr"] for r in rows) / n
+        per_category[cat] = {
+            "n": n,
+            "r@5": round(r5, 4),
+            "r@10": round(r10, 4),
+            "mrr": round(mrr, 4),
+        }
+
+    total_rows = [cur_pq_map[qid] for qid in present]
+    global_r5 = (
+        sum(r["hit_at_5"] for r in total_rows) / len(total_rows)
+        if total_rows else 0.0
+    )
+
+    return {
+        "label": label,
+        "label_count": len(present),
+        "anchor_count": len(anchor_ids),
+        "dropped_ids": dropped,
+        "query_md5": provenance.get("query_file_md5"),
+        "git_head": provenance.get("git_head"),
+        "db_path": provenance.get("db_path"),
+        "substrate_counts": provenance.get("substrate_counts"),
+        "global_r@5": round(global_r5, 4),
+        "per_category_r@5": per_category,
+        "per_query": total_rows,
+    }
+
+
+def _build_subsets(scored_result: dict, provenance: dict) -> dict:
+    """Build the top-level ``subsets`` block for a scored artifact.
+
+    Produces up to four slices: preserved_33, subset_38, new_label_only
+    (queries in current run that are NOT in the 33-label anchor), and
+    full_57 (all currently-scored queries). Only slices with at least one
+    present query are included.
+    """
+    cur_pq_map = {r["id"]: r for r in (scored_result.get("per_query") or [])}
+    all_current_ids = list(cur_pq_map.keys())
+
+    subsets: dict[str, dict] = {}
+
+    s33 = _build_subset("preserved_33", PRESERVED_33_QUERY_IDS, scored_result, provenance)
+    if s33["label_count"] > 0:
+        subsets["preserved_33"] = s33
+
+    s38 = _build_subset("subset_38", SUBSET_38_QUERY_IDS, scored_result, provenance)
+    if s38["label_count"] > 0:
+        subsets["subset_38"] = s38
+
+    # new_label_only: queries in current run NOT in the 33-label anchor.
+    preserved_set = set(PRESERVED_33_QUERY_IDS)
+    new_ids = [qid for qid in all_current_ids if qid not in preserved_set]
+    if new_ids:
+        subsets["new_label_only"] = _build_subset(
+            "new_label_only", new_ids, scored_result, provenance
+        )
+
+    # full_57: all currently-scored queries (mirrors top-level but nested).
+    if all_current_ids:
+        subsets["full_57"] = _build_subset(
+            "full_57", all_current_ids, scored_result, provenance
+        )
+
+    return subsets
 
 
 def _load_neural_memory(db_path: str | None,
@@ -414,8 +595,19 @@ def main() -> int:
     parser.add_argument("--prev-results", default=None,
                         help="Optional path to a prior scored artifact; "
                              "enables per-category regression gate "
-                             "(flags drops > 0.05 R@5)")
+                             "(flags drops > 0.05 R@5 on comparable intersect)")
+    parser.add_argument("--enforce-regression", action="store_true",
+                        default=False,
+                        help="Exit non-zero (rc=3) when the comparable-label "
+                             "category regression gate fires. Off by default; "
+                             "set AE_BENCH_ENFORCE_REGRESSION=1 to enable via env.")
     args = parser.parse_args()
+
+    # Env-var override for --enforce-regression (lets AOR plist control it).
+    enforce_regression = (
+        args.enforce_regression
+        or os.environ.get("AE_BENCH_ENFORCE_REGRESSION", "").strip() == "1"
+    )
 
     queries = get_queries(args.category)
     if not queries:
@@ -440,6 +632,7 @@ def main() -> int:
             result["category_regression_gate"] = _category_regression_gate(
                 result, args.prev_results,
             )
+            result["subsets"] = _build_subsets(result, result["provenance"])
     finally:
         try:
             mem.close()
@@ -455,6 +648,15 @@ def main() -> int:
 
     if args.mode == "scored" and result.get("categories_failed"):
         return 2
+    if args.mode == "scored" and enforce_regression:
+        gate = result.get("category_regression_gate", {})
+        if gate.get("regression_detected"):
+            print(
+                f"REGRESSION DETECTED on comparable intersect: "
+                f"{gate.get('regressions')}",
+                file=sys.stderr,
+            )
+            return 3
     return 0
 
 

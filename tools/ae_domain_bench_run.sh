@@ -176,12 +176,20 @@ fi
 # --db pinned to canonical substrate so provenance.db_path is recorded
 # explicitly (was "(default)" before, which made the artifact ineligible
 # for self-comparison on the next cycle).
+#
+# --enforce-regression forwarded when AE_BENCH_ENFORCE_REGRESSION=1 (opt-in;
+# default off so AOR doesn't exit non-zero on the first eligible cycle).
+ENFORCE_REGRESSION_ARG=()
+if [ "${AE_BENCH_ENFORCE_REGRESSION:-0}" = "1" ]; then
+    ENFORCE_REGRESSION_ARG=(--enforce-regression)
+fi
 "$PY" benchmarks/ae_domain_memory_bench/run_ae_domain_bench.py \
     --mode scored \
     --rerank \
     --db "$CANONICAL_DB" \
     --out "$OUT" \
-    ${PREV_ARG[@]+"${PREV_ARG[@]}"} >> "$LOG" 2>&1
+    ${PREV_ARG[@]+"${PREV_ARG[@]}"} \
+    ${ENFORCE_REGRESSION_ARG[@]+"${ENFORCE_REGRESSION_ARG[@]}"} >> "$LOG" 2>&1
 RC=$?
 
 # rc=0  → all categories passed threshold
