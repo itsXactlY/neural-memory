@@ -238,6 +238,23 @@ class SQLiteStore:
         self.conn.execute("UPDATE connections SET edge_type = 'similar' WHERE edge_type IS NULL OR edge_type = ''")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_connections_valid_time ON connections(valid_from, valid_to)")
 
+        # Dream-engine schema was historically created lazily by the
+        # SQLiteDreamBackend the first time `mazemaker_dream` ran. On a
+        # fresh customer pod that's never run a dream cycle, the
+        # dream_sessions / connection_history / dream_insights tables
+        # don't exist — and the wonderland `/architect/manifest` +
+        # `/dream/*` endpoints 500'd as soon as the dashboard loaded.
+        # Run the dream schema as part of store init so it's there from
+        # minute 1, before any dashboard call.
+        try:
+            from dream_engine import _DREAM_SCHEMA  # type: ignore[import]
+            self.conn.executescript(_DREAM_SCHEMA)
+        except Exception:
+            # If dream_engine isn't importable for any reason, fall
+            # through silently — wonderland endpoints have a defensive
+            # `try ... OperationalError → []` fallback for this case.
+            pass
+
         # connection_history.dream_session_id — added 2026-05-06 so the
         # /dream/cycles/{id}/diff endpoint can resolve via FK instead of a
         # timestamp-window scan. Legacy rows stay NULL; new dream-engine
@@ -902,17 +919,20 @@ class Mazemaker:
                                 eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0,
                             )
                         else:
-                            _glog.error(
-                                "GPU recall STILL not loaded after build — recall WILL run on CPU/numpy"
+                            _glog.warning(
+                                "GPU recall not loaded after build (db likely empty on fresh install) — recall will run on CPU/numpy until first remember()"
                             )
-                    except Exception as exc_b:
-                        _glog.error(
-                            "GPU recall auto-build FAILED — recall WILL run on CPU/numpy: %s",
+                    except BaseException as exc_b:
+                        # BaseException catches SystemExit too — older
+                        # build_gpu_cache.py raised it on empty-db, which
+                        # killed engine startup on fresh customer pods.
+                        _glog.warning(
+                            "GPU recall auto-build skipped (recall will run on CPU/numpy): %s",
                             exc_b,
                         )
-            except Exception as exc:
-                _glog.error(
-                    "GPU recall init FAILED — recall WILL run on CPU/numpy: %s", exc
+            except BaseException as exc:
+                _glog.warning(
+                    "GPU recall init skipped (recall will run on CPU/numpy): %s", exc
                 )
 
         self._graph_nodes: dict[int, dict] = {}
