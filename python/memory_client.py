@@ -1457,7 +1457,20 @@ class Mazemaker:
     # -- retrieval channels ---------------------------------------------------
 
     def _semantic_candidates(self, query: str, query_vec: list[float], limit: int) -> list[dict]:
-        # HNSW ANN path when enabled and worthwhile.
+        # GPU recall path FIRST when armed — the customer paid for the GPU
+        # variant of the pod (or the host has CUDA), they expect it to be
+        # the path that actually runs. HNSW (CPU) is fast on small DBs but
+        # leaves the loaded GPU tensor idle, which is wasteful and breaks
+        # the strict-mode promise that device=cuda means cuda.
+        if self._gpu:
+            try:
+                gpu_results = self._gpu.recall(query, k=limit)
+                if gpu_results:
+                    return [{"id": int(r["id"]), "score": float(r.get("similarity", 0.0)), "similarity": float(r.get("similarity", 0.0)), "channel": "semantic"} for r in gpu_results]
+            except Exception:
+                pass
+
+        # HNSW ANN path when GPU isn't armed (or failed).
         if self._ensure_hnsw():
             try:
                 import numpy as np
@@ -1466,14 +1479,6 @@ class Mazemaker:
                 for mid, dist in zip(labels[0], distances[0]):
                     out.append({"id": int(mid), "score": max(0.0, 1.0 - float(dist)), "similarity": max(0.0, 1.0 - float(dist)), "channel": "semantic"})
                 return out
-            except Exception:
-                pass
-
-        if self._gpu:
-            try:
-                gpu_results = self._gpu.recall(query, k=limit)
-                if gpu_results:
-                    return [{"id": int(r["id"]), "score": float(r.get("similarity", 0.0)), "similarity": float(r.get("similarity", 0.0)), "channel": "semantic"} for r in gpu_results]
             except Exception:
                 pass
 

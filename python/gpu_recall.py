@@ -135,27 +135,24 @@ class GpuRecallEngine:
             return []
         q = torch.tensor(query_vec, device=self._device, dtype=torch.float32)
 
-        # Normalize if needed (check magnitude). For models that already
-        # emit unit-norm vectors (FastEmbed e5-large, sentence-transformers
-        # with normalize_embeddings=True), this branch is skipped and we
-        # use the cached tensor directly.
-        mag = torch.norm(q)
-        if mag > 2.0:  # Raw embedding, needs normalization
-            q = q / mag
-            # Cache the row-normalised tensor across calls so subsequent
-            # raw-embedding queries don't re-norm the entire (N, dim) matrix
-            # on every recall. Built once lazily; survives until the engine
-            # reloads (which clears it via clear_cache()).
-            if self._emb_tensor_normed is None:
-                norms = torch.norm(self._emb_tensor, dim=1, keepdim=True)
-                # Avoid divide-by-zero on any zero-row pathology.
-                norms = torch.clamp(norms, min=1e-12)
-                self._emb_tensor_normed = self._emb_tensor / norms
-            emb_normed = self._emb_tensor_normed
-        else:
-            emb_normed = self._emb_tensor
+        # Always row-normalise the stored tensor + the query before the
+        # matmul. The DB can carry mixed-magnitude rows (some written by
+        # an older engine that didn't pass normalize_embeddings=True; some
+        # from bulk imports that did). Without normalising both sides we
+        # get raw projection scores in arbitrary range — REM's filter of
+        # `0.3 < sim < 0.95` then drops every candidate. Cost is one-time
+        # per process: norms cached in self._emb_tensor_normed.
+        if self._emb_tensor_normed is None:
+            norms = torch.norm(self._emb_tensor, dim=1, keepdim=True)
+            norms = torch.clamp(norms, min=1e-12)
+            self._emb_tensor_normed = self._emb_tensor / norms
+        emb_normed = self._emb_tensor_normed
+        q_mag = torch.norm(q)
+        if q_mag > 1e-12:
+            q = q / q_mag
 
-        # Cosine similarity (dot product of normalized vectors)
+        # Cosine similarity (dot product of normalized vectors) — always
+        # in [-1, 1] now, so REM's similarity-window filter behaves.
         sims = torch.matmul(emb_normed, q)
 
         # Top-k
