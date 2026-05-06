@@ -27,7 +27,13 @@ def build(db_path: Path, out_dir: Path) -> None:
         "SELECT id, label, content, embedding FROM memories WHERE embedding IS NOT NULL"
     ).fetchall()
     if not rows:
-        raise SystemExit(f"no rows with embedding in {db_path}")
+        # Fresh customer pods have an empty memory.db at install time —
+        # the GPU recall cache simply can't be built yet. Return without
+        # creating any files; the next call (after first remember()) will
+        # have rows and succeed. Was raise SystemExit which propagated
+        # past `except Exception` blocks and killed engine startup.
+        print(f"  build_gpu_cache: no rows with embedding in {db_path} — skipping")
+        return
 
     sample = len(rows[0]["embedding"])
     if sample % 4 == 0:
