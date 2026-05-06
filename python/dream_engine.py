@@ -1112,8 +1112,19 @@ class DreamEngine:
 
     def _detect_communities(self, edges: List[Dict[str, Any]], nodes: set,
                             adj: Dict[int, List[Tuple[int, float]]]) -> List[List[int]]:
-        """Louvain community detection with deterministic BFS fallback."""
-        if HAS_NETWORKX:
+        """Louvain community detection with deterministic BFS fallback.
+
+        At scale (>~100k edges) NetworkX's pure-Python Louvain takes
+        minutes per cycle and starves the dream loop, leaving Insight
+        sessions hanging with finished_at=NULL while the next NREM/REM
+        already wants the lock. The BFS fallback below is O(V+E) and
+        finishes in ~1s for a 1M-edge graph, so we shortcut to it once
+        the graph crosses the threshold. Communities returned are
+        connected components rather than modularity-optimal — coarser,
+        but actionable for cluster/bridge insight emission.
+        """
+        LOUVAIN_EDGE_LIMIT = 100_000
+        if HAS_NETWORKX and len(edges) <= LOUVAIN_EDGE_LIMIT:
             try:
                 graph = nx.Graph()
                 graph.add_nodes_from(nodes)
@@ -1128,15 +1139,20 @@ class DreamEngine:
             except Exception:
                 pass
 
+        # collections.deque for O(1) popleft instead of list.pop(0) which
+        # is O(N) — the latter turns this BFS into O(V*E) on dense graphs
+        # and was making Insight phase stretch into the minutes once the
+        # graph crossed the LOUVAIN_EDGE_LIMIT threshold.
+        from collections import deque
         visited = set()
         communities: List[List[int]] = []
         for node in nodes:
             if node in visited:
                 continue
             component = []
-            queue = [node]
+            queue = deque([node])
             while queue:
-                curr = queue.pop(0)
+                curr = queue.popleft()
                 if curr in visited:
                     continue
                 visited.add(curr)
