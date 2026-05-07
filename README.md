@@ -291,7 +291,11 @@ reading here. Below this line everything gets progressively more technical.
 - **Dream Engine** — three-phase autonomous consolidation: NREM
   (strengthen activated edges + prune weak), REM (bridge isolated
   memories), Insight (Louvain communities + materialise `derived:cluster`
-  summary memories).
+  summary memories). NREM and REM use a **mixed sampling strategy**
+  (50% recent + 30% random across the entire memory table + 20%
+  lowest-salience) so a 100k+ memory corpus doesn't quietly recycle
+  the same recent surface forever. Old memories keep getting replayed
+  votes; orphans from six months ago can still get bridged.
 - **Conflict detection + supersession** — fuse-or-mark with revision
   history. `detect_conflicts=False` control arm proves the algorithm is
   doing real work, not just relying on recency.
@@ -533,7 +537,7 @@ flowchart LR
 
     subgraph NREM["Phase 1 — NREM"]
         direction TB
-        N1[Replay 100 recent memories] --> N2[Spreading activation]
+        N1[Mixed sample: recent + random + low-salience] --> N2[Spreading activation]
         N2 --> N3{Connection active?}
         N3 -->|Yes| N4[Strengthen +0.05]
         N3 -->|No| N5[Weaken -0.01]
@@ -542,7 +546,7 @@ flowchart LR
 
     subgraph REM["Phase 2 — REM"]
         direction TB
-        R1[Find 50 isolated memories] --> R2[Search similar unconnected]
+        R1[Mixed sample of isolated memories] --> R2[Search similar unconnected]
         R2 --> R3[Create bridge connections]
         R3 --> R4[weight = similarity × 0.3]
     end
@@ -561,6 +565,23 @@ flowchart LR
 - Automatic: every 50 new memories (configurable)
 - Manual: `neural_dream` tool
 - Standalone: `python python/dream_worker.py --daemon`
+
+### Sampling — beating the surface trap
+
+NREM and REM no longer pull `LIMIT N ORDER BY created_at DESC`. On a
+100k+ memory corpus that's the same recent surface every cycle: old
+memories never get replayed and quietly decay below the prune
+threshold. Both phases now use a three-slice mix:
+
+- **50%** most recent (`created_at DESC`)
+- **30%** random across the entire `memories` table (`ORDER BY RANDOM()`)
+- **20%** lowest-salience (`ORDER BY salience ASC`) — the rescue slice
+  for memories that would otherwise get pruned this cycle
+
+The random slice is what breaks the surface trap. Defaults:
+`max_memories_per_cycle=2000` (NREM), `max_isolated_per_cycle=800`
+(REM); both tunable via `DreamEngine` constructor args. Insight is
+unchanged — it already operates on the full edge graph.
 
 ---
 
