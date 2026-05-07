@@ -1072,6 +1072,18 @@ class DreamEngine:
             if not memories:
                 return stats
 
+            # Mark the GPU PPR adjacency cache stale so the FIRST think()
+            # rebuilds against the current connections table. Subsequent
+            # think() calls within this cycle share the same cached tensor
+            # — so we pay one upload per cycle, not one per memory.
+            if self._memory is not None and hasattr(
+                self._memory, "_invalidate_gpu_ppr_adjacency"
+            ):
+                try:
+                    self._memory._invalidate_gpu_ppr_adjacency()
+                except Exception:
+                    pass
+
             activated_edges: Set[Tuple[int, int]] = set()
 
             for mem in memories:

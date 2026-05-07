@@ -38,11 +38,16 @@ def _build_memory(db_path: str, embedding_backend: str, retrieval_mode: str,
     the Hermes plugin does. GPU is auto-selected when CUDA is available
     (sentence-transformers / GpuRecallEngine pick it up internally)."""
     from mazemaker import Memory
+    # lazy_graph=True is critical for the daemon: _load_from_store loads all
+    # ~190k embeddings (~750MB) into a Python dict at construction time,
+    # which can take many minutes on a big corpus and consume RAM the GPU
+    # PPR path doesn't need — it queries the connections table directly.
     return Memory(
         db_path=db_path,
         embedding_backend=embedding_backend,
         retrieval_mode=retrieval_mode,
         think_engine=think_engine,
+        lazy_graph=True,
     )
 
 
