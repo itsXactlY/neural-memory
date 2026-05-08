@@ -102,8 +102,14 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from dream_engine import DreamEngine, SQLiteDreamBackend
 
+    # Backend dispatch: MM_DB_BACKEND=postgres routes consolidation
+    # writes (dream_sessions / dream_insights / connection_history) to
+    # the pgvector mirror. Free-tier installs leave the env unset and
+    # keep using SQLiteDreamBackend as before.
+    backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
+
     db_path = args.db
-    if not Path(db_path).exists():
+    if backend_choice != "postgres" and not Path(db_path).exists():
         logger.error("memory.db not found at %s", db_path)
         return 2
 
@@ -157,7 +163,13 @@ def main():
         except Exception as exc:
             logger.warning("Recall-engine socket attach failed (non-fatal): %s", exc)
 
-    backend = SQLiteDreamBackend(db_path)
+    if backend_choice == "postgres":
+        from dream_postgres_store import DreamPostgresStore
+        backend = DreamPostgresStore()
+        logger.info("dream backend: postgres (pgvector)")
+    else:
+        backend = SQLiteDreamBackend(db_path)
+        logger.info("dream backend: sqlite (%s)", db_path)
     engine = DreamEngine(
         backend,
         neural_memory=memory,

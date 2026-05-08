@@ -828,6 +828,80 @@ class SQLiteStore:
         rev_count = self.conn.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0]
         return {"memories": mem_count, "connections": conn_count, "revisions": rev_count, "fts": self._fts_available}
 
+    # -- Backend-abstract helpers used by NeuralMemory hot paths ----------
+    # These were originally raw self.store.conn.execute(...) calls inside
+    # memory_client.py — refactored so the same call sites work against
+    # PostgresStore (Pro/Enterprise) without leaking SQLite specifics.
+
+    def get_max_id(self) -> int:
+        row = self.conn.execute("SELECT MAX(id) FROM memories").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def recent_semantic_pool(self, limit: int,
+                             exclude_label_prefix: Optional[str] = None) -> list[dict]:
+        """Top-N newest memories with embedding present, optionally
+        excluding labels with a given prefix.
+
+        Returns dicts with id, content, embedding (list[float]).
+        """
+        if exclude_label_prefix:
+            rows = self.conn.execute(
+                "SELECT id, content, embedding FROM memories "
+                "WHERE embedding IS NOT NULL "
+                "  AND (label IS NULL OR label NOT LIKE ?) "
+                "ORDER BY created_at DESC LIMIT ?",
+                (exclude_label_prefix + "%", int(limit)),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT id, content, embedding FROM memories "
+                "WHERE embedding IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": int(r["id"]),
+                "content": r["content"],
+                "embedding": self._unpack_embedding(r["embedding"]),
+            })
+        return out
+
+    def weighted_edges(self) -> list[tuple[int, int, float]]:
+        """Every edge with positive weight as (source, target, weight)
+        tuples — feeds the GPU PPR adjacency build."""
+        rows = self.conn.execute(
+            "SELECT source_id, target_id, weight FROM connections WHERE weight > 0"
+        ).fetchall()
+        return [(int(r["source_id"]), int(r["target_id"]), float(r["weight"] or 0.0))
+                for r in rows]
+
+    def top_weighted_edges(self, limit: int = 500) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT source_id, target_id, weight, edge_type FROM connections "
+            "ORDER BY weight DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+        return [
+            {
+                "source": int(r["source_id"]),
+                "target": int(r["target_id"]),
+                "weight": float(r["weight"] or 0.0),
+                "type": r["edge_type"] or "similar",
+                "edge_type": r["edge_type"] or "similar",
+            }
+            for r in rows
+        ]
+
+    def prune_connections_below(self, threshold: float) -> int:
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM connections WHERE weight < ?", (float(threshold),)
+            )
+            self.conn.commit()
+            return int(cur.rowcount or 0)
+
     def close(self):
         # Signal the bg_checkpoint thread to stop and give it a brief window
         # to exit cleanly before we close the connection out from under it.
@@ -1298,10 +1372,9 @@ class Mazemaker:
             return
         self._last_drift_check = now
         try:
-            row = self.store.conn.execute("SELECT MAX(id) FROM memories").fetchone()
+            live_top = self.store.get_max_id()
         except Exception:
             return
-        live_top = int(row[0]) if row and row[0] is not None else 0
         if live_top > self._hnsw_max_known_id:
             # External drift detected. Mark stale; next recall rebuilds.
             self._hnsw_dirty = True
@@ -1601,9 +1674,9 @@ class Mazemaker:
 
     def _compute_temporal_score(self, mem_id: int, now: float) -> float:
         try:
-            row = self.store.conn.execute("SELECT created_at FROM memories WHERE id = ?", (mem_id,)).fetchone()
-            if row and row[0]:
-                return self._compute_temporal_score_from_mem({"created_at": row[0]}, now)
+            mem = self.store.get(mem_id, include_embedding=False)
+            if mem and mem.get("created_at"):
+                return self._compute_temporal_score_from_mem(mem, now)
             return 0.5
         except Exception:
             return 0.5
@@ -1700,23 +1773,12 @@ class Mazemaker:
         """
         if pool <= 0 or limit <= 0:
             return []
-        rows = self.store.conn.execute(
-            "SELECT id, content, embedding FROM memories "
-            "WHERE embedding IS NOT NULL "
-            "  AND label NOT LIKE 'derived:cluster%' "
-            "ORDER BY created_at DESC LIMIT ?",
-            (int(pool),),
-        ).fetchall()
+        rows = self.store.recent_semantic_pool(int(pool),
+                                               exclude_label_prefix="derived:cluster")
         scored: list[dict] = []
         for r in rows:
-            emb = r["embedding"]
-            if not emb:
-                continue
-            try:
-                # SQLite blob → numpy float32 array (matches store layout).
-                import numpy as np
-                vec = np.frombuffer(emb, dtype=np.float32).tolist()
-            except Exception:
+            vec = r.get("embedding") or []
+            if not vec:
                 continue
             sim = self._cosine_similarity(query_vec, vec)
             scored.append({
@@ -2160,9 +2222,7 @@ class Mazemaker:
         if device is None or device.type != "cuda":
             return False
 
-        rows = self.store.conn.execute(
-            "SELECT source_id, target_id, weight FROM connections WHERE weight > 0"
-        ).fetchall()
+        rows = self.store.weighted_edges()
         if not rows:
             self._gpu_ppr_adj = None
             self._gpu_ppr_node_to_idx = {}
@@ -2636,14 +2696,19 @@ class Mazemaker:
         stats = self.store.get_stats()
         edges = []
         seen = set()
-        # In lazy mode graph summary is still truthful: read from SQLite, not only hydrated nodes.
-        rows = self.store.conn.execute("SELECT source_id, target_id, weight, edge_type FROM connections ORDER BY weight DESC LIMIT 500").fetchall()
+        # In lazy mode graph summary is still truthful: read from the
+        # store's edge table directly, not only hydrated nodes.
+        rows = self.store.top_weighted_edges(limit=500)
         for r in rows:
-            key = tuple(sorted([r["source_id"], r["target_id"]])) + (r["edge_type"] or "similar",)
+            src = int(r["source"])
+            tgt = int(r["target"])
+            etype = r.get("type") or r.get("edge_type") or "similar"
+            key = tuple(sorted([src, tgt])) + (etype,)
             if key in seen:
                 continue
             seen.add(key)
-            edges.append({"from": r["source_id"], "to": r["target_id"], "weight": round(float(r["weight"]), 3), "type": r["edge_type"] or "similar"})
+            edges.append({"from": src, "to": tgt,
+                          "weight": round(float(r["weight"]), 3), "type": etype})
         return {"nodes": stats["memories"], "edges": stats["connections"], "top_edges": edges}
 
     def stats(self) -> dict:
@@ -2672,11 +2737,7 @@ class Mazemaker:
         """
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"threshold must be in [0,1], got {threshold}")
-        cur = self.store.conn.execute(
-            "DELETE FROM connections WHERE weight < ?", (float(threshold),)
-        )
-        deleted = cur.rowcount
-        self.store.conn.commit()
+        deleted = self.store.prune_connections_below(float(threshold))
         # Mirror the DELETE in the in-memory graph cache. Filter out sub-threshold
         # edges per node — DO NOT clear the whole connections dict, or every
         # surviving edge (weight >= threshold) disappears from recall/think

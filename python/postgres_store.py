@@ -463,13 +463,14 @@ class PostgresStore:
                     present.add(int(row[0]))
         return present
 
-    def get_connections(self, node_id: int) -> list[dict]:
-        """Return edges incident to node_id with both 'type' and 'edge_type' keys.
+    def get_connections(self, node_id: int,
+                        at_time: Optional[float] = None) -> list[dict]:
+        """Return edges incident to node_id with both 'type' and 'edge_type'.
 
-        Matches SQLiteStore.get_connections's dict shape exactly (the
-        get_connections also exposes both legacy `type` and modern
-        `edge_type` so cross-backend dashboards/recall don't lose the
-        edge classification).
+        `at_time` is accepted for SQLiteStore parity but ignored — the
+        Postgres connections table doesn't carry valid_from/valid_to
+        bitemporal columns yet. Recall code that passes at_time gets a
+        single union of all edges instead of a time-window slice.
         """
         with self._cursor() as (_conn, cur):
             cur.execute(
@@ -792,6 +793,87 @@ class PostgresStore:
             "revisions": int(rc),
             "fts": True,
         }
+
+    # -- NeuralMemory hot-path helpers (parity with SQLiteStore) ----------
+
+    def get_max_id(self) -> int:
+        with self._cursor() as (_conn, cur):
+            cur.execute("SELECT MAX(id) FROM memories")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def recent_semantic_pool(self, limit: int,
+                             exclude_label_prefix: Optional[str] = None) -> list[dict]:
+        """Top-N newest memories with non-null embedding, optionally
+        excluding labels with a prefix. Returns dicts with id/content/
+        embedding (already adapted to list[float] by pgvector)."""
+        if exclude_label_prefix:
+            sql = (
+                "SELECT id, content, embedding FROM memories "
+                "WHERE embedding IS NOT NULL "
+                "  AND (label IS NULL OR label NOT LIKE %s) "
+                "ORDER BY created_at DESC LIMIT %s"
+            )
+            params: tuple = (exclude_label_prefix + "%", int(limit))
+        else:
+            sql = (
+                "SELECT id, content, embedding FROM memories "
+                "WHERE embedding IS NOT NULL "
+                "ORDER BY created_at DESC LIMIT %s"
+            )
+            params = (int(limit),)
+        with self._cursor() as (_conn, cur):
+            cur.execute(sql, params)
+            out = []
+            for r in cur.fetchall():
+                emb = r[2]
+                # pgvector adapter returns numpy array or list; normalise.
+                if emb is None:
+                    continue
+                emb_list = list(emb) if not isinstance(emb, list) else emb
+                out.append({
+                    "id": int(r[0]),
+                    "content": r[1],
+                    "embedding": emb_list,
+                })
+            return out
+
+    def weighted_edges(self) -> list[tuple[int, int, float]]:
+        with self._cursor() as (_conn, cur):
+            cur.execute(
+                "SELECT source_id, target_id, weight FROM connections "
+                "WHERE weight > 0"
+            )
+            return [
+                (int(r[0]), int(r[1]), float(r[2] or 0.0))
+                for r in cur.fetchall()
+            ]
+
+    def top_weighted_edges(self, limit: int = 500) -> list[dict]:
+        with self._cursor() as (_conn, cur):
+            cur.execute(
+                "SELECT source_id, target_id, weight, edge_type FROM connections "
+                "ORDER BY weight DESC LIMIT %s",
+                (int(limit),),
+            )
+            return [
+                {
+                    "source": int(r[0]),
+                    "target": int(r[1]),
+                    "weight": float(r[2] or 0.0),
+                    "type": r[3] or "similar",
+                    "edge_type": r[3] or "similar",
+                }
+                for r in cur.fetchall()
+            ]
+
+    def prune_connections_below(self, threshold: float) -> int:
+        with self._cursor() as (_conn, cur):
+            cur.execute(
+                "DELETE FROM connections WHERE weight < %s",
+                (float(threshold),),
+            )
+            return int(cur.rowcount or 0)
 
     def close(self) -> None:
         try:
