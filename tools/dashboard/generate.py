@@ -25,7 +25,7 @@ import tempfile
 import subprocess
 
 # Embedding dim is read dynamically from DB at runtime (not hardcoded)
-DEFAULT_SQLITE = os.path.expanduser("~/.neural_memory/memory.db")
+DEFAULT_SQLITE = os.path.expanduser("~/.mazemaker/data/memory.db")
 TEMPLATE_PATH = Path(__file__).parent / "template.html"
 LIB_CACHE = Path(__file__).parent / ".lib_cache"
 

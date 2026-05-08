@@ -1,5 +1,5 @@
 name: neural
-description: "Mazemaker skin with alien brain"
+description: "Mazemaker skin"
 
 banner_border: "#9B30FF"
 banner_title: "#BF00FF"
@@ -15,8 +15,8 @@ banner_hero: |
   [#BF00FF]           ;::::; :;
   [#BF00FF]         ;:::::'   :;
   [#BF00FF]        ;:::::;     ;.
-  [#DA70D6]       ,:::::'       ;           OOa\
-  [#DA70D6]       ::::::;       ;          OOOOL\
+  [#DA70D6]       ,:::::'       ;           OOa
+  [#DA70D6]       ::::::;       ;          OOOOL
   [#DA70D6]       ;:::::;       ;         OOOOOOcO
   [#DA70D6]      ,;::::::;     ;'         / OOOOOaO
   [#E6E6FA]    ;:::::::::`. ,,,;.        /  / DOOOWOO
@@ -28,14 +28,11 @@ banner_hero: |
   [#E6E6FA]`:`:::::::`;:::::: ;::::::#/               DOE
   [#DA70D6] :::`:::::::`;; ;:::::::::##                OO
   [#DA70D6] ::::`:::::::`;::::::::;:::#                OO
-  [#BF00FF] `:::::`::::::::::::;'`;::#                O
+  [#BF00FF] `:::::`::::::::::::;'`;::#                 O
   [#BF00FF]  `:::::`::::::::;' /  / `:#
   [#9B30FF]   ::::::`:::::;'  /  /   `#
-  
-  
-  
-  
-  🦞 Ready to slurp lobster brains...
+
+  🦞 [#BF00FF]Ready [#DA70D6]to [#E6E6FA]slurp [#BF00FF]lobster [#DA70D6]brains...
 
 prompt-working: "#BF00FF italic"
 prompt-idle: "#9B30FF"
