@@ -122,12 +122,53 @@ CREATE TABLE IF NOT EXISTS connections (
     UNIQUE (source_id, target_id)
 );
 
+-- Mirrors SQLiteStore.add_revision: every supersession or conflict-fusion
+-- write captures the prior content here so audits can reconstruct the
+-- pre-fusion state.
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id          BIGSERIAL PRIMARY KEY,
+    memory_id   BIGINT REFERENCES memories(id) ON DELETE CASCADE,
+    old_content TEXT,
+    new_content TEXT,
+    reason      TEXT DEFAULT 'conflict_fusion',
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
+    ON memory_revisions(memory_id);
+
+-- Key-value config: embed-fingerprint, dim-lock, schema version, etc.
+-- One-row-per-key, last-writer-wins semantics matching SQLiteStore.set_meta.
+CREATE TABLE IF NOT EXISTS meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- License/tier audit log. Append-only; license-client adds a row on every
+-- detected tier change. Used by re-upgrade flows to recognise a returning
+-- account on a previously-bound volume rather than greeting them as a
+-- fresh install.
+CREATE TABLE IF NOT EXISTS tier_history (
+    id           BIGSERIAL PRIMARY KEY,
+    tier         TEXT NOT NULL,
+    started_at   TIMESTAMPTZ DEFAULT NOW(),
+    ended_at     TIMESTAMPTZ,
+    last_jti     TEXT,
+    fp_hash      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tier_history_started_at
+    ON tier_history(started_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_conn_source ON connections(source_id);
 CREATE INDEX IF NOT EXISTS idx_conn_target ON connections(target_id);
 CREATE INDEX IF NOT EXISTS idx_conn_weight ON connections(weight);
 CREATE INDEX IF NOT EXISTS idx_conn_edge_type_weight ON connections(edge_type, weight);
 CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON memories
     USING gin (to_tsvector('simple', coalesce(content, '')));
+CREATE INDEX IF NOT EXISTS idx_memories_label ON memories(label);
+CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
 """
 
 
