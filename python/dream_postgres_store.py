@@ -107,8 +107,35 @@ CREATE TABLE IF NOT EXISTS connection_history (
     new_weight  DOUBLE PRECISION,
     reason      TEXT,
     changed_at  DOUBLE PRECISION NOT NULL,
-    UNIQUE (source_id, target_id)
+    dream_session_id BIGINT
 );
+
+-- Drop the legacy UNIQUE (source_id, target_id) on connection_history if
+-- a previous bootstrap created it. The table is an append-only audit log
+-- of every weight change — a single edge can have many rows over its
+-- lifetime (one per dream cycle that touched it). Older schemas modelled
+-- it as latest-event-per-edge which silently dropped 99 % of the history.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'connection_history_source_id_target_id_key'
+    ) THEN
+        ALTER TABLE connection_history
+          DROP CONSTRAINT connection_history_source_id_target_id_key;
+    END IF;
+END$$;
+
+-- Ensure the dream_session_id column exists on legacy bootstraps.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'connection_history' AND column_name = 'dream_session_id'
+    ) THEN
+        ALTER TABLE connection_history ADD COLUMN dream_session_id BIGINT;
+    END IF;
+END$$;
 
 CREATE INDEX IF NOT EXISTS idx_dream_insights_type
     ON dream_insights(insight_type);
