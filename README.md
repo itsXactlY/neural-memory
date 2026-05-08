@@ -58,10 +58,10 @@ Most AI memory systems are search engines: type a query, get back the few docume
 
 | Need                                                           | Search-engine memory | This system |
 |----------------------------------------------------------------|----------------------|-------------|
-| Find a fact you told it once                                  | ✅                   | ✅          |
-| Follow a chain of reasoning across multiple memories          | ❌                   | ✅          |
-| Notice that two related facts should be connected             | ❌                   | ✅          |
-| Replace a stale fact when you tell it the new one             | ❌                   | ✅          |
+| Find a fact you told it once                                   | ✅                   | ✅          |
+| Follow a chain of reasoning across multiple memories           | ❌                   | ✅          |
+| Notice that two related facts should be connected              | ❌                   | ✅          |
+| Replace a stale fact when you tell it the new one              | ❌                   | ✅          |
 | Hold its ground when irrelevant noise piles up                 | ❌                   | ✅          |
 | Tell you *why* it surfaced a particular memory                 | ❌                   | ✅          |
 
@@ -77,7 +77,7 @@ A vector database with cosine similarity will do the first row of that table wel
 
 | Capability                                                          | Vanilla cosine          | Neural-Memory       | Lift               |
 |---------------------------------------------------------------------|-------------------------|---------------------|--------------------|
-| Hop-2 graph reasoning (answer reachable only via A→B→C edges)      | **0.00** R@10           | **1.00** R@10       | **+1.00**          |
+| Hop-2 graph reasoning (answer reachable only via A→B→C edges)      | **0.00** R@10            | **1.00** R@10       | **+1.00**          |
 | Real edges vs shuffled control (proves traversal, not embedding)    | n/a                     | 1.00 → 0.27         | **+0.73 collapse** |
 | Post-dream synthesis (facts inferable only after consolidation)     | structurally **0.00**   | **0.43** at scale   | **+0.43 lift**     |
 | Conflict supersession (winner@1 with `detect_conflicts=False`)      | 0.03 control            | **0.33**            | **+0.30**          |
@@ -104,7 +104,7 @@ So we built one, and had it independently audited by **GPT-5.5** (via [codex CLI
 | v5    | **YES** + 4 caveats                    | Every condition empirically satisfied                                            |
 | v6    | qualified-y w/ 4 caveats               | Real-text mode + lean preset shipped; 4 follow-ups                               |
 | v7    | qualified-y w/ 1 caveat                | n=200 real-prose: lean **beats** default skynet by +0.18 R@5                     |
-| **v8**| **UNCONDITIONAL YES — no residual caveat** | Dream lift +0.43 at scale; the +0.04 at v7 was a sample-size artifact            |
+| **v8**| **UNCONDITIONAL YES — no residual caveat** | Dream lift +0.43 at scale; the +0.04 at v7 was a sample-size artifact        |
 
 Every prompt and every verdict, from "no, this is just lexical retrieval" to "unconditional yes — accept it as evidence", is committed verbatim under [`benchmarks/audit/`](benchmarks/audit/). Open `codex-v2-audit-2026-04-28.md` and `codex-v8-verdict-2026-04-28.md` side by side to see the journey end-to-end.
 
@@ -404,6 +404,35 @@ non-zero replay chance every cycle regardless of age. Defaults:
 `max_memories_per_cycle=2000` (NREM), `max_isolated_per_cycle=800`
 (REM). Tunable via `DreamEngine` constructor args. Insight is
 unchanged — it already operates on the full edge graph.
+
+### GPU acceleration
+
+When CUDA is available (`GpuRecallEngine` loaded), every CPU-bypassable
+hot path moves to the GPU:
+
+- **NREM** — `Mazemaker.think_ids()` runs Personalized PageRank as a
+  series of sparse mat-vec multiplies on a row-stochastic adjacency
+  tensor cached on CUDA. Top-k happens on the GPU before any transfer
+  back, so only ~k ints cross the bus per call. Dict + label
+  resolution are skipped — NREM only feeds IDs into the
+  activated-edges set. Adjacency cache is reused across cycles
+  (rebuilt every 10th NREM by default) so REM's bridge-adds don't
+  trigger repeated full uploads.
+- **REM** — `recall_batch(queries, k)` collapses 800 sequential
+  per-query embed-server round-trips into one `embed_batch` call,
+  one matmul `(B, dim) × (dim, N_corpus).T`, one `topk` along the
+  batch axis. Bridge writes batch into a single SQL transaction
+  via `add_bridges_batch` (one commit instead of ~6000).
+- **Insight** — already global, transitively benefits from a richer
+  edge graph after batched REM.
+
+End-to-end cycle time on a 193k-memory / ~1M-edge corpus, RTX-class
+CUDA, default knobs: **~38s** (NREM ~16s + REM ~12s + Insight ~2s
++ overhead). Pre-GPU baseline never finished a cycle on the same
+corpus before the next idle re-trigger fired.
+
+CPU paths remain as fallbacks — non-CUDA installs see no behaviour
+change beyond raw speed.
 
 ---
 
