@@ -1181,29 +1181,57 @@ class DreamEngine:
             if not memories:
                 return stats
 
-            # Mark the GPU PPR adjacency cache stale so the FIRST think()
-            # rebuilds against the current connections table. Subsequent
-            # think() calls within this cycle share the same cached tensor
-            # — so we pay one upload per cycle, not one per memory.
-            if self._memory is not None and hasattr(
-                self._memory, "_invalidate_gpu_ppr_adjacency"
+            # GPU PPR adjacency cache management:
+            # Per-cycle invalidation is wasteful — full rebuild is ~2s on a
+            # 2M-nnz tensor and grows with the corpus. The cache is allowed
+            # to live across cycles; it goes stale (REM-added bridges and
+            # NREM strengthen/weaken/prune are not reflected) but PPR is
+            # already an approximation of activation strength, so a
+            # single-cycle lag is fine. Force a fresh rebuild every Nth
+            # cycle so drift can't accumulate forever. _dream_count is
+            # incremented in _run_dream_cycle, not here — read-only.
+            ppr_rebuild_every = getattr(self, "_ppr_rebuild_every", 10)
+            if (
+                self._memory is not None
+                and hasattr(self._memory, "_invalidate_gpu_ppr_adjacency")
+                and self._dream_count > 0
+                and self._dream_count % max(1, ppr_rebuild_every) == 0
             ):
                 try:
                     self._memory._invalidate_gpu_ppr_adjacency()
+                    logger.info(
+                        "Dream cycle %d — invalidating GPU PPR adjacency for refresh",
+                        self._dream_count,
+                    )
                 except Exception:
                     pass
 
             activated_edges: Set[Tuple[int, int]] = set()
 
+            # Prefer think_ids (no SQL get_many, no result-dict build, top-k
+            # on GPU) on memory backends that support it. Falls back to the
+            # full-think path on free-tier / non-CUDA setups.
+            use_think_ids = self._memory is not None and hasattr(self._memory, "think_ids")
+
             for mem in memories:
                 mid = mem["id"]
                 if self._memory:
                     try:
-                        activated = self._memory.think(mid, depth=2)
-                        for a in activated:
-                            aid = a.get("id")
-                            if aid and aid != mid:
-                                activated_edges.add((min(mid, aid), max(mid, aid)))
+                        if use_think_ids:
+                            activated_ids = self._memory.think_ids(mid, k=20)
+                            for aid in activated_ids:
+                                if aid != mid:
+                                    activated_edges.add(
+                                        (min(mid, aid), max(mid, aid))
+                                    )
+                        else:
+                            activated = self._memory.think(mid, depth=2)
+                            for a in activated:
+                                aid = a.get("id")
+                                if aid and aid != mid:
+                                    activated_edges.add(
+                                        (min(mid, aid), max(mid, aid))
+                                    )
                     except Exception:
                         pass
                 stats["processed"] += 1

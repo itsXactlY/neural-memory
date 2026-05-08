@@ -572,6 +572,29 @@ class Memory:
         merged = list(results) + expanded
         return merged[: max(k * 2, k)]
 
+    def think_ids(self, start_id: int, depth: int = 2, k: int = 20) -> "list[int]":
+        """Fast spreading-activation neighbour list. Returns just the top-k
+        activated node IDs — bypasses the label/content lookup that think()
+        does. Used by NREM's hot loop where the engine only feeds the IDs
+        into activated_edges. CUDA-accelerated when self._sqlite_memory
+        has _ppr_top_ids_gpu (i.e. GpuRecallEngine is loaded)."""
+        if hasattr(self._sqlite_memory, "think_ids"):
+            return self._sqlite_memory.think_ids(start_id, depth=depth, k=k)
+        return [
+            int(r.get("id"))
+            for r in self.think(start_id, depth=depth)
+            if r.get("id") is not None
+        ][:k]
+
+    def recall_batch(self, queries: "list[str]", k: int = 5) -> "list[list[dict]]":
+        """Batched semantic recall. Drives GpuRecallEngine.recall_batch
+        (one matmul, one embed_batch IPC) when CUDA is armed; falls back
+        to per-query recall() otherwise. Used by REM to collapse 800
+        sequential recalls into a single GPU batch."""
+        if hasattr(self._sqlite_memory, "recall_batch"):
+            return self._sqlite_memory.recall_batch(queries, k=k)
+        return [self._sqlite_memory.recall(q, k=k) for q in queries]
+
     def think(self, start_id: int, depth: int = 3, decay: float = 0.85) -> list[dict]:
         """Spreading activation. SQLite primary, Postgres-enhanced if available."""
         base = self._sqlite_memory.think(start_id, depth, decay)

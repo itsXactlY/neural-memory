@@ -2077,6 +2077,88 @@ class Mazemaker:
             return {}
         return {n: v / max_score for n, v in p.items() if n not in seeds or v > 0}
 
+    def _ppr_top_ids_gpu(self, seed_id: int, k: int = 20) -> "list[int]":
+        """Like _ppr_scores_gpu, but returns ONLY the top-k node IDs and
+        does the top-k on the GPU before any CPU transfer. The full PPR
+        score vector for a 1M-edge graph carries hundreds of thousands of
+        non-zero floats — most callers (NREM's activated-edges loop) only
+        need the highest 20-ish, and don't need labels or content.
+        Returning the IDs early collapses ~150KB of GPU→CPU transfer per
+        think into ~80 bytes, plus skips the store.get_many SQL round-trip
+        downstream callers like think() do for label resolution."""
+        if self._gpu is None:
+            return []
+        try:
+            import torch
+        except ImportError:
+            return []
+        if (
+            getattr(self, "_gpu_ppr_adj", None) is None
+            or getattr(self, "_gpu_ppr_dirty", True)
+        ):
+            if not self._build_gpu_ppr_adjacency():
+                return []
+        if self._gpu_ppr_adj is None:
+            return []
+
+        node_to_idx = self._gpu_ppr_node_to_idx
+        idx_to_node = self._gpu_ppr_idx_to_node
+        n = len(idx_to_node)
+        seed_idx = node_to_idx.get(int(seed_id))
+        if seed_idx is None:
+            return []
+
+        device = self._gpu_ppr_adj.device
+        pers = torch.zeros(n, device=device, dtype=torch.float32)
+        pers[seed_idx] = 1.0
+        p = pers.clone()
+        alpha = self._ppr_alpha
+        iters = self._ppr_iters
+        for _ in range(max(1, iters)):
+            spread = torch.sparse.mm(
+                self._gpu_ppr_adj, p.unsqueeze(1)
+            ).squeeze(1)
+            p = alpha * pers + (1.0 - alpha) * spread
+            s = float(p.sum())
+            if s > 0:
+                p = p / s
+
+        eff_k = min(k + 1, n)
+        top = torch.topk(p, eff_k)
+        # One sync, transfer ~k ints — vs the full N-vector transfer
+        # in _ppr_scores_gpu.
+        ind = top.indices.cpu().numpy()
+        out: "list[int]" = []
+        for i in ind:
+            nid = idx_to_node[int(i)]
+            if nid == seed_id:
+                continue
+            out.append(int(nid))
+            if len(out) >= k:
+                break
+        return out
+
+    def think_ids(self, start_id: int, depth: int = 2, k: int = 20) -> "list[int]":
+        """Fast think — returns only the top-k activated node IDs.
+
+        Skips label/content resolution (no store.get_many SQL roundtrip)
+        and skips the result-dict construction. Used by the NREM hot loop
+        where the engine only feeds those IDs into the activated_edges
+        set — labels are dead weight there.
+
+        On GPU+CUDA this hits _ppr_top_ids_gpu directly (top-k on GPU,
+        ~k ints transferred). Off GPU it falls back to a slim think()
+        wrapper that pulls just the IDs."""
+        if self._gpu is not None:
+            try:
+                ids = self._ppr_top_ids_gpu(int(start_id), k=k)
+                if ids is not None:
+                    return ids
+            except Exception:
+                pass
+        # CPU fallback: reuse think() and strip
+        return [int(r.get("id")) for r in self.think(int(start_id), depth=depth) if r.get("id") is not None][:k]
+
     def think(self, start_id: int, depth: int = 3, decay: float = 0.85, engine: Optional[str] = None) -> list[dict]:
         engine = (engine or self._think_engine or "bfs").lower()
         if not self._ensure_node(start_id):
