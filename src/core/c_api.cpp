@@ -4,10 +4,13 @@
 #include "mazemaker/memory_adapter.h"
 #include "mazemaker/lstm.h"
 #include "mazemaker/knn.h"
+#include "mazemaker/community.h"
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
 #include <new>
+#include <span>
+#include <unordered_map>
 #include <vector>
 
 using namespace neural;
@@ -556,4 +559,70 @@ MAZEMAKER_API void nm_knn_adjust_weights(KNNEngineHandle handle,
 MAZEMAKER_API void nm_knn_destroy(KNNEngineHandle handle) {
     if (!handle) return;
     delete to_knn(handle);
+}
+
+// ============================================================================
+// Louvain community detection
+// ============================================================================
+
+MAZEMAKER_API int mazemaker_detect_communities(
+    const uint64_t* edge_src,
+    const uint64_t* edge_dst,
+    const float*    edge_weight,
+    size_t          edge_count,
+    int             max_iterations,
+    double          min_gain,
+    unsigned        seed,
+    uint64_t*       out_node_ids,
+    int32_t*        out_community_ids,
+    size_t*         out_node_count,
+    double*         out_modularity,
+    int*            out_iterations_used
+) {
+    if (!edge_src || !edge_dst || !edge_weight ||
+        !out_node_ids || !out_community_ids || !out_node_count) {
+        return -1;
+    }
+    if (edge_count == 0) {
+        *out_node_count = 0;
+        if (out_modularity) *out_modularity = 0.0;
+        if (out_iterations_used) *out_iterations_used = 0;
+        return 0;
+    }
+
+    try {
+        std::vector<neural::graph::LouvainEdge> edges;
+        edges.reserve(edge_count);
+        for (size_t i = 0; i < edge_count; ++i) {
+            edges.push_back({ edge_src[i], edge_dst[i], edge_weight[i] });
+        }
+
+        neural::graph::CommunityDetector::Config cfg{};
+        if (max_iterations > 0) cfg.max_iterations = max_iterations;
+        if (min_gain >= 0.0)    cfg.min_gain       = min_gain;
+        cfg.seed = seed;
+
+        neural::graph::CommunityDetector det{cfg};
+        auto result = det.detect(std::span<const neural::graph::LouvainEdge>{
+            edges.data(), edges.size()
+        });
+
+        // Flatten Result.communities into parallel (node_id, community_id) arrays.
+        // We fabricate stable community labels 0..K-1 in the order the detector
+        // returned them (which is sorted DESC by community size).
+        size_t written = 0;
+        for (int32_t cid = 0; cid < static_cast<int32_t>(result.communities.size()); ++cid) {
+            for (uint64_t nid : result.communities[cid]) {
+                out_node_ids[written]      = nid;
+                out_community_ids[written] = cid;
+                ++written;
+            }
+        }
+        *out_node_count = written;
+        if (out_modularity)      *out_modularity      = result.modularity;
+        if (out_iterations_used) *out_iterations_used = result.iterations_used;
+        return 0;
+    } catch (...) {
+        return -2;
+    }
 }

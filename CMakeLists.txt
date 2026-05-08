@@ -58,6 +58,7 @@ set(NEURAL_SOURCES
     src/memory/knn.cpp
     src/memory/lstm.cpp
     src/graph/knowledge_graph.cpp
+    src/graph/community.cpp
     src/core/memory_adapter.cpp
     src/core/c_api.cpp
 )

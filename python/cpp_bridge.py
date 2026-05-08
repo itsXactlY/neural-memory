@@ -362,9 +362,130 @@ class MazemakerCpp:
     def __enter__(self):
         self.initialize()
         return self
-    
+
     def __exit__(self, *args):
         self.shutdown()
+
+
+# ============================================================================
+# Standalone Louvain community detection (no adapter handle needed)
+# ============================================================================
+
+_louvain_lib: Optional[ctypes.CDLL] = None
+
+
+def _louvain_get_lib() -> ctypes.CDLL:
+    """Lazy-load libmazemaker.so once and bind detect_communities."""
+    global _louvain_lib
+    if _louvain_lib is not None:
+        return _louvain_lib
+    lib = ctypes.CDLL(_find_lib())
+    lib.mazemaker_detect_communities.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),  # edge_src
+        ctypes.POINTER(ctypes.c_uint64),  # edge_dst
+        ctypes.POINTER(ctypes.c_float),   # edge_weight
+        ctypes.c_size_t,                  # edge_count
+        ctypes.c_int,                     # max_iterations
+        ctypes.c_double,                  # min_gain
+        ctypes.c_uint,                    # seed
+        ctypes.POINTER(ctypes.c_uint64),  # out_node_ids
+        ctypes.POINTER(ctypes.c_int32),   # out_community_ids
+        ctypes.POINTER(ctypes.c_size_t),  # out_node_count
+        ctypes.POINTER(ctypes.c_double),  # out_modularity
+        ctypes.POINTER(ctypes.c_int),     # out_iterations_used
+    ]
+    lib.mazemaker_detect_communities.restype = ctypes.c_int
+    _louvain_lib = lib
+    return lib
+
+
+def detect_communities(
+    edges,
+    max_iterations: int = 0,
+    min_gain: float = -1.0,
+    seed: int = 42,
+) -> dict:
+    """
+    Run C++ Louvain community detection over an undirected weighted graph.
+
+    `edges` is an iterable of (src:int, dst:int, weight:float) tuples. Self-
+    loops and edges with weight <= 0 are silently dropped on the C++ side.
+    Pass each undirected edge ONCE (do not double up reverse direction).
+
+    Returns:
+        {
+            "communities": [[node_id, ...], ...],   # sorted DESC by size
+            "modularity":  float,                    # Newman-Girvan Q
+            "iterations":  int,
+            "node_count":  int,
+            "elapsed_ms":  float,
+        }
+
+    Raises FileNotFoundError if libmazemaker.so isn't built, RuntimeError if
+    the C call fails (returns non-zero rc).
+    """
+    import time
+    lib = _louvain_get_lib()
+
+    # Materialise edges into ctypes arrays. We accept any iterable, but each
+    # iteration of the C call needs all three parallel buffers in memory.
+    src_list, dst_list, w_list = [], [], []
+    for s, d, w in edges:
+        src_list.append(int(s))
+        dst_list.append(int(d))
+        w_list.append(float(w))
+    n = len(src_list)
+    if n == 0:
+        return {
+            "communities": [], "modularity": 0.0,
+            "iterations": 0, "node_count": 0, "elapsed_ms": 0.0,
+        }
+
+    SrcArr = (ctypes.c_uint64 * n)(*src_list)
+    DstArr = (ctypes.c_uint64 * n)(*dst_list)
+    WArr   = (ctypes.c_float  * n)(*w_list)
+
+    # Upper bound on unique nodes: 2 * edge_count.
+    cap = max(2 * n, 1)
+    NodesOut = (ctypes.c_uint64 * cap)()
+    CommsOut = (ctypes.c_int32  * cap)()
+    out_count = ctypes.c_size_t(0)
+    out_Q     = ctypes.c_double(0.0)
+    out_iters = ctypes.c_int(0)
+
+    t0 = time.perf_counter()
+    rc = lib.mazemaker_detect_communities(
+        SrcArr, DstArr, WArr, ctypes.c_size_t(n),
+        ctypes.c_int(max_iterations),
+        ctypes.c_double(min_gain),
+        ctypes.c_uint(seed),
+        NodesOut, CommsOut,
+        ctypes.byref(out_count),
+        ctypes.byref(out_Q),
+        ctypes.byref(out_iters),
+    )
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    if rc != 0:
+        raise RuntimeError(f"mazemaker_detect_communities failed: rc={rc}")
+
+    # Bucket nodes by community id, preserving the DESC-by-size invariant the
+    # C++ side enforces (community ids are assigned in that order).
+    nc = out_count.value
+    buckets: dict[int, list[int]] = {}
+    for i in range(nc):
+        cid = CommsOut[i]
+        buckets.setdefault(cid, []).append(int(NodesOut[i]))
+
+    communities = [buckets[cid] for cid in sorted(buckets.keys())]
+
+    return {
+        "communities": communities,
+        "modularity":  float(out_Q.value),
+        "iterations":  int(out_iters.value),
+        "node_count":  int(nc),
+        "elapsed_ms":  elapsed_ms,
+    }
 
 
 # ============================================================================

@@ -296,6 +296,38 @@ MAZEMAKER_API void nm_knn_adjust_weights(KNNEngineHandle handle,
 // Destroy kNN engine.
 MAZEMAKER_API void nm_knn_destroy(KNNEngineHandle handle);
 
+// ============================================================================
+// Louvain community detection (stateless — no adapter handle)
+// ============================================================================
+
+// Detect communities in an undirected weighted graph.
+//
+// Input: parallel edge arrays of length edge_count. Self-loops and edges with
+// weight <= 0 are ignored. Each (src, dst, w) record is treated as a single
+// undirected edge — do NOT pass both directions.
+//
+// Output buffers: out_node_ids and out_community_ids must each hold at least
+// 2 * edge_count entries (the upper bound on unique nodes). On success the
+// first *out_node_count entries are filled with parallel arrays — node[i] is
+// in community community[i]. Community IDs are arbitrary uint32 labels;
+// equality is the only meaningful operation on them.
+//
+// Returns 0 on success, -1 on null pointer / invalid args, -2 on exception.
+MAZEMAKER_API int mazemaker_detect_communities(
+    const uint64_t* edge_src,
+    const uint64_t* edge_dst,
+    const float*    edge_weight,
+    size_t          edge_count,
+    int             max_iterations,    // <= 0 → use default (10)
+    double          min_gain,          // < 0 → use default (1e-9)
+    unsigned        seed,
+    uint64_t*       out_node_ids,
+    int32_t*        out_community_ids,
+    size_t*         out_node_count,
+    double*         out_modularity,
+    int*            out_iterations_used
+);
+
 #ifdef __cplusplus
 }
 #endif
