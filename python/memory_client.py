@@ -2980,10 +2980,22 @@ class Mazemaker:
         Read-only; bypasses the _get_dream_engine guard so dream_stats
         keeps working when MM_DREAM_DISABLED is set (external dream_worker
         is still writing rows that this method reads).
+
+        Backend resolution mirrors __init__: when MM_DB_BACKEND=postgres
+        (the canonical setup for the Pro/Enterprise pod where the
+        dream_worker container writes dream_sessions to pgvector), we
+        read the Postgres store. Otherwise the SQLite primary. Without
+        this branch, an in-pod mcp with MM_DREAM_DISABLED=1 would
+        silently fall back to a stale SQLite dream_sessions table while
+        the external dream_worker keeps appending to Postgres.
         """
-        from dream_engine import SQLiteDreamBackend  # type: ignore[import]
         if self._dream_engine_singleton is not None:
             return self._dream_engine_singleton._backend.get_dream_stats()
+        backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
+        if backend_choice == "postgres":
+            from dream_postgres_store import DreamPostgresStore  # type: ignore[import]
+            return DreamPostgresStore().get_dream_stats()
+        from dream_engine import SQLiteDreamBackend  # type: ignore[import]
         return SQLiteDreamBackend(str(self._db_path)).get_dream_stats()
 
     def graph(self) -> dict:
