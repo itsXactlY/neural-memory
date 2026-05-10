@@ -147,6 +147,72 @@ def _categorize(label: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
+# Agent classifier — for the architect mirror.
+#
+# Parses memory labels to figure out which agent ingested the row.
+# Labels are written by the various MCP clients and the dream engine
+# itself.  Pattern is `auto:<agent>:<session>:t<N>:[u|a]` for
+# conversation turns, plus a few well-known prefixes for synthesised
+# nodes (derived: clusters, peer: handles).
+#
+# Color palette is the brand accent ladder so the mirror reads as a
+# Mazemaker artefact, not a generic ops dashboard.
+# ═══════════════════════════════════════════════════════════
+
+AGENT_PALETTE = {
+    "Claude":   "#76d9ff",   # bright cyan — the loudest co-author
+    "Hermes":   "#ffd700",   # warm gold
+    "GPT":      "#34d399",   # mint green
+    "Gemini":   "#60a5fa",   # blue
+    "Mistral":  "#f97316",   # orange
+    "Qwen":     "#ec4899",   # pink
+    "Gemma":    "#a78bfa",   # violet
+    "User":     "#ededf2",   # near-white
+    "Dream":    "#bf00ff",   # mazemaker accent — synthesised by sleep
+    "Peer":     "#ccff00",   # neon green (matches existing peer color)
+    "Other":    "#5e5e6b",   # dim — the unclassified background
+}
+
+
+def _classify_agent(label: str) -> str:
+    """Best-effort agent attribution from a memory label.
+
+    Tightly coupled to the MCP plugins' label-writing convention
+    (`auto:<agent>:<session>:t<N>:<role>`).  Unknown labels collapse
+    to "Other" so the mirror keeps rendering them at lower visual
+    weight.
+    """
+    if not label:
+        return "Other"
+    lo = label.lower()
+    if lo.startswith("derived:"):
+        return "Dream"
+    if lo.startswith("peer:"):
+        return "Peer"
+    if lo.startswith(("auto:claude", "claude:", "claude-turn")):
+        return "Claude"
+    if lo.startswith(("auto:hermes", "hermes:")):
+        return "Hermes"
+    if lo.startswith(("auto:gpt", "gpt:", "auto:openai", "openai:")):
+        return "GPT"
+    if lo.startswith(("auto:gemini", "gemini:")):
+        return "Gemini"
+    if lo.startswith(("auto:mistral", "mistral:", "auto:ministral")):
+        return "Mistral"
+    if lo.startswith(("auto:qwen", "qwen:")):
+        return "Qwen"
+    if lo.startswith(("auto:gemma", "gemma:")):
+        return "Gemma"
+    if lo.startswith(("auto:user", "user:")) or lo.endswith(":u"):
+        return "User"
+    return "Other"
+
+
+def _agent_color(agent: str) -> str:
+    return AGENT_PALETTE.get(agent, AGENT_PALETTE["Other"])
+
+
+# ═══════════════════════════════════════════════════════════
 # Data readers
 # ═══════════════════════════════════════════════════════════
 
@@ -797,10 +863,212 @@ current_hash: str      = ""
 reload_fn:    callable = None
 _poll_interval: float  = POLL_INTERVAL
 
+# Architect-mirror state: highest IDs seen on the previous poll, used
+# to compute incremental events.  Reset on db source switch.
+_mirror_state: dict = {
+    "max_memory_id": 0,
+    "max_edge_changed_at": 0.0,   # connection_history.changed_at high-water
+    "dream_session_states": {},   # session_id → {phase, started_at, finished_at}
+    "last_event_seq": 0,           # rolling sequence for clients
+}
+
 
 def compute_data_hash(data: dict) -> str:
     s = data["stats"]
     return f"{s['memories']}:{s['connections']}"
+
+
+# ═══════════════════════════════════════════════════════════
+# Architect mirror — incremental event reader
+# ═══════════════════════════════════════════════════════════
+
+def read_mirror_events_postgres() -> list[dict]:
+    """Pull events from Postgres that happened since the last poll.
+
+    Three event types:
+    * memory.added  — new rows in `memories` (id > previous high-water)
+    * edge.changed  — new rows in `connection_history`
+                      (changed_at > previous high-water).  This is the
+                      table the dream engine writes to on every NREM
+                      strengthen / REM bridge / Insight link, plus the
+                      regular auto-connect path on memory writes.
+    * dream.phase.{started,finished} — transitions on `dream_sessions`
+                      (each session's started_at / finished_at).
+
+    Each event carries `agent` + `color` derived from label patterns,
+    so the mirror frontend can render without a per-row lookup.
+    """
+    import psycopg
+    import datetime as _dt
+
+    def _to_epoch(v):
+        if v is None: return 0.0
+        if isinstance(v, _dt.datetime): return v.timestamp()
+        try: return float(v)
+        except (TypeError, ValueError): return 0.0
+
+    dsn = os.environ.get("MM_POSTGRES_DSN") or (
+        f"host={os.environ.get('MM_POSTGRES_HOST', '127.0.0.1')} "
+        f"port={os.environ.get('MM_POSTGRES_PORT', '5432')} "
+        f"dbname={os.environ.get('MM_POSTGRES_DB', 'mazemaker')} "
+        f"user={os.environ.get('MM_POSTGRES_USER', 'mazemaker')} "
+        f"password={os.environ.get('MM_POSTGRES_PASSWORD', '')}"
+    )
+
+    events: list[dict] = []
+    seq = _mirror_state["last_event_seq"]
+    now = time.time()
+
+    with psycopg.connect(dsn, connect_timeout=5) as conn:
+        cur = conn.cursor()
+
+        # 1. New memories
+        prev_id = _mirror_state["max_memory_id"]
+        cur.execute(
+            "SELECT id, label, created_at FROM memories "
+            "WHERE id > %s ORDER BY id ASC LIMIT 500",
+            (prev_id,),
+        )
+        new_max_id = prev_id
+        for r in cur.fetchall():
+            mid, label, created = r[0], r[1] or "", r[2]
+            agent = _classify_agent(label)
+            seq += 1
+            events.append({
+                "seq": seq, "t": "memory.added",
+                "id": mid, "label": label[:80],
+                "agent": agent, "color": _agent_color(agent),
+                "ts": _to_epoch(created), "wall": now,
+            })
+            if mid > new_max_id: new_max_id = mid
+        _mirror_state["max_memory_id"] = new_max_id
+
+        # 2. Edge events from connection_history
+        prev_ts = _mirror_state["max_edge_changed_at"]
+        # connection_history is the dream engine's audit log:
+        # source_id, target_id, old_weight, new_weight, reason, changed_at, dream_session_id
+        try:
+            cur.execute(
+                "SELECT source_id, target_id, old_weight, new_weight, "
+                "       reason, changed_at, dream_session_id "
+                "FROM connection_history "
+                "WHERE changed_at > %s ORDER BY changed_at ASC LIMIT 1000",
+                (prev_ts,),
+            )
+            new_max_ts = prev_ts
+            for r in cur.fetchall():
+                src, dst, oldw, neww, reason, changed_at, dsid = r
+                ts = _to_epoch(changed_at)
+                seq += 1
+                events.append({
+                    "seq": seq, "t": "edge.changed",
+                    "src": src, "dst": dst,
+                    "old_weight": float(oldw or 0),
+                    "new_weight": float(neww or 0),
+                    "reason": reason or "auto",
+                    "dream_session_id": dsid,
+                    "ts": ts, "wall": now,
+                })
+                if ts > new_max_ts: new_max_ts = ts
+            _mirror_state["max_edge_changed_at"] = new_max_ts
+        except psycopg.errors.UndefinedTable:
+            # connection_history table may not exist on older deployments
+            pass
+
+        # 3. Dream session phase transitions
+        try:
+            cur.execute(
+                "SELECT id, phase, started_at, finished_at, "
+                "       memories_processed, connections_strengthened, "
+                "       connections_pruned, bridges_found, insights_created "
+                "FROM dream_sessions "
+                "WHERE started_at >= %s ORDER BY started_at ASC",
+                (now - 600,),  # last 10 minutes window
+            )
+            states = _mirror_state["dream_session_states"]
+            for r in cur.fetchall():
+                sid, phase, started, finished = r[0], r[1], r[2], r[3]
+                started_ts = _to_epoch(started)
+                finished_ts = _to_epoch(finished) if finished else 0.0
+                stats_blob = {
+                    "memories_processed":      r[4] or 0,
+                    "connections_strengthened": r[5] or 0,
+                    "connections_pruned":      r[6] or 0,
+                    "bridges_found":           r[7] or 0,
+                    "insights_created":        r[8] or 0,
+                }
+                prev = states.get(sid, {})
+                if not prev:
+                    seq += 1
+                    events.append({
+                        "seq": seq, "t": "dream.phase.started",
+                        "session_id": sid, "phase": (phase or "").upper(),
+                        "ts": started_ts, "wall": now,
+                    })
+                if finished_ts and not prev.get("finished_at"):
+                    seq += 1
+                    events.append({
+                        "seq": seq, "t": "dream.phase.finished",
+                        "session_id": sid, "phase": (phase or "").upper(),
+                        "stats": stats_blob,
+                        "ts": finished_ts, "wall": now,
+                    })
+                states[sid] = {
+                    "phase": phase, "started_at": started_ts,
+                    "finished_at": finished_ts, "stats": stats_blob,
+                }
+            # Garbage-collect old session entries
+            old_cutoff = now - 3600
+            states_keep = {
+                k: v for k, v in states.items()
+                if v.get("started_at", 0) > old_cutoff
+            }
+            _mirror_state["dream_session_states"] = states_keep
+        except psycopg.errors.UndefinedTable:
+            pass
+
+    _mirror_state["last_event_seq"] = seq
+    return events
+
+
+def reset_mirror_state() -> None:
+    """Re-baseline mirror state to *now* so we don't replay pre-startup
+    history on the first poll.  Called once at startup with the current
+    DB high-water marks."""
+    import psycopg, datetime as _dt
+    def _to_epoch(v):
+        if v is None: return 0.0
+        if isinstance(v, _dt.datetime): return v.timestamp()
+        try: return float(v)
+        except (TypeError, ValueError): return 0.0
+    if os.environ.get("MM_DB_BACKEND", "").lower() != "postgres":
+        return
+    dsn = os.environ.get("MM_POSTGRES_DSN") or (
+        f"host={os.environ.get('MM_POSTGRES_HOST', '127.0.0.1')} "
+        f"port={os.environ.get('MM_POSTGRES_PORT', '5432')} "
+        f"dbname={os.environ.get('MM_POSTGRES_DB', 'mazemaker')} "
+        f"user={os.environ.get('MM_POSTGRES_USER', 'mazemaker')} "
+        f"password={os.environ.get('MM_POSTGRES_PASSWORD', '')}"
+    )
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(MAX(id), 0) FROM memories")
+            _mirror_state["max_memory_id"] = int(cur.fetchone()[0])
+            try:
+                cur.execute("SELECT COALESCE(MAX(changed_at), 0) "
+                            "FROM connection_history")
+                row = cur.fetchone()
+                _mirror_state["max_edge_changed_at"] = _to_epoch(row[0]) if row else 0.0
+            except Exception:
+                _mirror_state["max_edge_changed_at"] = 0.0
+        logger.info(
+            "mirror baseline: max_memory_id=%d max_edge_ts=%.0f",
+            _mirror_state["max_memory_id"],
+            _mirror_state["max_edge_changed_at"],
+        )
+    except Exception as exc:
+        logger.warning("mirror baseline failed: %s", exc)
 
 
 async def poll_db_changes():
@@ -811,6 +1079,24 @@ async def poll_db_changes():
             _metrics["poll_count"] += 1
             new_data = await loop.run_in_executor(_DB_EXECUTOR, reload_fn)
             new_hash = compute_data_hash(new_data)
+
+            # Mirror events run on every poll, independent of the
+            # graph-snapshot diff: e.g. dream phases tick even if the
+            # node count hasn't moved.
+            mirror_events: list[dict] = []
+            if os.environ.get("MM_DB_BACKEND", "").lower() == "postgres":
+                try:
+                    mirror_events = await loop.run_in_executor(
+                        _DB_EXECUTOR, read_mirror_events_postgres
+                    )
+                except Exception as exc:
+                    logger.debug("mirror events poll error: %s", exc)
+                if mirror_events and manager.count:
+                    await manager.broadcast({
+                        "type": "mirror_events",
+                        "events": mirror_events,
+                    })
+
             if new_hash != current_hash:
                 old_m = current_data.get("stats", {}).get("memories",    0)
                 old_c = current_data.get("stats", {}).get("connections",  0)
@@ -989,6 +1275,12 @@ def _build_html(template_name: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global current_data, current_hash, reload_fn
+    # Baseline mirror state once before the poll loop starts so we
+    # don't dump pre-startup history into the first broadcast.
+    try:
+        reset_mirror_state()
+    except Exception as exc:
+        logger.debug("mirror baseline skipped: %s", exc)
     task = asyncio.create_task(poll_db_changes())
     yield
     task.cancel()
@@ -1006,6 +1298,22 @@ async def index():
 @app.get("/desktop")
 async def desktop():
     return HTMLResponse(_build_html("template-desktop.html"))
+
+
+@app.get("/mirror")
+async def mirror():
+    """The Architect Mirror — live reflection of every memory write,
+    edge change, and dream-phase transition across all MCP clients.
+    Subscribes to the same /ws/stream as the main dashboard but
+    consumes the `mirror_events` payload."""
+    return HTMLResponse(_build_html("template-mirror.html"))
+
+
+@app.get("/api/mirror/agents")
+async def api_mirror_agents():
+    """Operator-side palette + label-prefix list so the mirror frontend
+    can render its legend without hardcoding the classifier."""
+    return {"palette": AGENT_PALETTE}
 
 
 @app.get("/api/graph")
