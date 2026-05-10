@@ -35,3 +35,4 @@ benchmarks/external/data/
 benchmarks/external/logs/
 benchmarks/external/.demolition-venv/
 benchmarks/track_a_*.log
+.wrangler/

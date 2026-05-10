@@ -1,14 +1,19 @@
-# Neural-Memory Benchmark
+# Mazemaker Benchmark Suites
 
-A self-contained, peer-review-grade benchmark for the **mazemaker-adapter** semantic-memory plugin.
+A self-contained, peer-review-grade benchmark suite for the **Mazemaker** semantic-memory engine. This directory holds the **internal** suites — graph reasoning, dream synthesis, supersession, continuity, channel ablation — that drive the eight-round GPT-5.5 audit.
 
-The headline claim of mazemaker is that it does things a generic vector store cannot — graph reasoning, dream-driven consolidation, conflict supersession, and graceful cross-session continuity. This benchmark **proves that claim with synthetic AND real-text adversarial data**, with **eight rounds of GPT-5.5 audit** driving the design from "no, this is just lexical retrieval" to **"unconditional yes — no residual caveat"**.
+The headline claim of Mazemaker is that it does things a generic vector store cannot — graph reasoning, dream-driven consolidation, conflict supersession, and graceful cross-session continuity. This benchmark **proves that claim with synthetic AND real-text adversarial data**, with **eight rounds of GPT-5.5 audit** driving the design from "no, this is just lexical retrieval" to **"unconditional yes — no residual caveat"**.
+
+**External, public-dataset numbers** live one directory deeper in [`external/`](external/README.md):
+
+- **LongMemEval-S 500-question retrieval** (Wu et al., ICLR 2025) — `R@5 = 0.9787`, `MRR = 0.9114` with ColBERT@1.5 (`R@1 = 0.8574`, `+5.10 pp` over the hybrid baseline). Three of six question types reach perfect R@5.
+- **Demolition Bench** (ten Hindsight-failed models on plain-text scoring) — `188/200 = 94.0%` with ColBERT@1.5, `0 errors deterministic`. `gemma3:270m` (270M params, runs on a Pi) scores `18/20 = 90%`.
 
 ---
 
 ## TL;DR
 
-| Capability | Vanilla cosine | Neural-Memory | Lift |
+| Capability | Vanilla cosine | Mazemaker | Lift |
 |---|---|---|---|
 | **Hop-2 graph reasoning** (synthetic, answer only via A→B→C edges) | **0.00** | **1.00** | **+1.00** |
 | **Hop-2 graph reasoning** (real-text chains) | **0.10** | **1.00** | **+0.90** |

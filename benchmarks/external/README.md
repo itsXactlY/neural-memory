@@ -4,6 +4,74 @@ External, third-party memory benchmarks run against the Mazemaker engine.
 Internal benchmarks live in `benchmarks/neural_memory_benchmark/`; the harnesses
 here only call the public Mazemaker API (`memory_client.Mazemaker`).
 
+## Verified results — at a glance
+
+Result JSONs in [`results/`](results/) are tracked in-tree (whitelisted in this
+directory's `.gitignore`) so anyone reproducing the benches can diff their
+numbers against ours without a separate artifact download.
+
+### LongMemEval-S — 500q retrieval, 470 gradeable
+
+Same harness, same dataset (sha256 `d6f21ea9…`), same config
+(`recall_mode=hybrid, k=10, granularity=session`); only ColBERT@1.5 differs.
+
+| Metric | hybrid baseline | hybrid + ColBERT@1.5 | Δ |
+|---|---|---|---|
+| **R@1** | 0.8064 | **0.8574** | **+5.10 pp** |
+| **R@5** | 0.9596 | **0.9787** | **+1.91 pp** |
+| **R@10** | 0.9830 | **0.9894** | +0.64 pp |
+| **MRR** | 0.8733 | **0.9114** | **+3.81 pp** |
+| p50 latency | 41.1 ms | 56.9 ms | +15.8 ms |
+
+Per-question-type R@5 with ColBERT@1.5 reaches **1.0000** on
+`knowledge-update`, `multi-session`, `single-session-assistant`. The
+biggest single-category swing is `single-session-user`: R@5 +7.8 pp,
+MRR +10.4 pp.
+
+Result files:
+- [`results/longmemeval_s_master-baseline_20260509T214714Z.json`](results/longmemeval_s_master-baseline_20260509T214714Z.json) — no-CB
+- [`results/longmemeval_s_colbert-on-master_20260510T034308Z.json`](results/longmemeval_s_colbert-on-master_20260510T034308Z.json) — CB@1.5
+
+### Demolition Bench — 10 Hindsight-failed models, 20 questions
+
+| Run | Aggregate | Errors | Notes |
+|---|---|---|---|
+| no-ColBERT canonical | 186/200 = 93.0% | 2 | hybrid + rerank + advanced |
+| ColBERT@1.5 broken | 168/200 = 84.0% | 24 | superseded — GPU contention bug |
+| **ColBERT@1.5 fixed** | **188/200 = 94.0%** | **0** | reproducibility-fix verified |
+
+`gemma3:270m` (270M params, runs on a Raspberry Pi) scores 18/20 = 90% in
+both conditions. JSON leaks: 0 / 200 across both runs. The "broken"
+canonical is intentionally kept in tree as the before-state of the
+reproducibility fix — anyone reading the diff or re-running the harness
+can see the 24-error baseline and verify their own run drops to 0.
+
+Result files:
+- [`results/demolition_canonical-synthetic20_20260509T213339Z.json`](results/demolition_canonical-synthetic20_20260509T213339Z.json) — no-CB
+- [`results/demolition_colbert-w15-canonical_20260509T223543Z.json`](results/demolition_colbert-w15-canonical_20260509T223543Z.json) — CB@1.5 *broken*
+- [`results/demolition_colbert-w15-clean_20260510T010504Z.json`](results/demolition_colbert-w15-clean_20260510T010504Z.json) — CB@1.5 *fixed*
+
+### Reproducibility fix (Demolition Bench, 2026-05-10)
+
+The ColBERT-on canonical regressed from 186/200 to 168/200 with 24 HTTP-500
+errors before the fix landed. Root cause was GPU contention, not ColBERT
+logic: the in-process ColBERT helper (BGE-M3 ~1.4 GB VRAM), the bench's
+torch CUDA init, and ollama's keep-alive holding the previous LLM in VRAM
+combined to OOM the GPU. ollama returned 500.
+
+Two surgical fixes at the top of `demolition_bench.py`:
+
+1. Hide CUDA from the bench python (`CUDA_VISIBLE_DEVICES=""`,
+   `MM_COLBERT_DEVICE=cpu`, `MM_FORCE_CPU=1`). Operator override:
+   `MM_BENCH_ALLOW_CUDA=1`.
+2. New `ollama_evict(model)` helper sending `keep_alive: 0` between
+   models. No more stacked-VRAM OOM.
+
+Operator pre-flight: stop `mazemaker-dream-worker.service` (5-min
+consolidation cycle holds ~1 GB GPU and breaks reproducibility). After
+the fix: 0 / 200 errors deterministic, 188/200 correct, identical
+distribution to no-CB.
+
 ## LongMemEval-S
 
 Wu et al., *LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive

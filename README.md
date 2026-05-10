@@ -20,16 +20,24 @@ Plug it in, and your assistant gets a brain that:
 
 That's it. The rest of this README goes deeper the further you scroll.
 
-> **🌀 Don't want to install anything?** A managed hosted version is in the works:
-> **[mazemaker.dev](https://mazemaker.dev)** / **[mazemaker.online](https://mazemaker.online)**
-> — *Build the maze. Your agent finds the way.*  Sign up, point your agent at an MCP endpoint, done. (Both domains are placeholders until launch.)
+> **🌀 Don't want to install anything?** Managed hosted endpoint at
+> **[api.mazemaker.dev](https://api.mazemaker.dev)** with the operator console at
+> **[mazemaker.dev](https://mazemaker.dev)** and the marketing surface at
+> **[mazemaker.online](https://mazemaker.online)** — *Build the maze. Your agent finds the way.*
+> Sign up, point your agent at the MCP endpoint, done.
 
 ---
 
 ## Get it running
 
 ```bash
-cd ~/projects/mazemaker-adapter
+# One-line managed install (rootless Podman pod, four containers,
+# wires up every MCP-speaking tool the script detects):
+curl -fsSL https://api.mazemaker.dev/install.sh | bash
+
+# OR self-host the engine directly into a Hermes Agent:
+git clone https://github.com/itsXactlY/mazemaker
+cd mazemaker
 bash install.sh          # auto-detect hermes-agent
 bash install.sh /path    # explicit path
 ```
@@ -73,9 +81,11 @@ If you want the numbers behind those check marks, keep scrolling. If you don't, 
 
 ## The numbers
 
-A vector database with cosine similarity will do the first row of that table well and fail every other row. We measured that explicitly.
+A vector database with cosine similarity will do the first row of the table below well and fail every other row. We measured that explicitly, with negative controls (shuffled edges, supersession off, pre-dream zero) that *must* fail when the relevant mechanism is disabled.
 
-| Capability                                                          | Vanilla cosine          | Neural-Memory       | Lift               |
+### Internal benchmark suite — capability lifts
+
+| Capability                                                          | Vanilla cosine          | Mazemaker           | Lift               |
 |---------------------------------------------------------------------|-------------------------|---------------------|--------------------|
 | Hop-2 graph reasoning (answer reachable only via A→B→C edges)      | **0.00** R@10            | **1.00** R@10       | **+1.00**          |
 | Real edges vs shuffled control (proves traversal, not embedding)    | n/a                     | 1.00 → 0.27         | **+0.73 collapse** |
@@ -84,9 +94,33 @@ A vector database with cosine similarity will do the first row of that table wel
 | Cross-session continuity under concept-mode distractors             | **0.06**                | **0.62**            | **+0.56**          |
 | Lean retrieval mode (real prose, n=200) vs default skynet           | n/a                     | **0.60** vs 0.42    | **+0.18 R@5**      |
 
-R@10 = "the right answer is in the top-10 results", scored 0..1. Higher is better. Every cell measured by a suite that *cannot* be solved by token overlap, with negative controls (shuffled edges, supersession off, pre-dream zero) that *must* fail when the relevant mechanism is disabled.
-
+R@10 = "the right answer is in the top-10 results", scored 0..1. Higher is better.
 Full numbers, the JSON dumps, and the suite catalog: [`benchmarks/README.md`](benchmarks/README.md).
+
+### Public benchmark numbers — LongMemEval-S 500-question retrieval
+
+External, third-party benchmark from Wu et al. (ICLR 2025). 470 gradeable questions out of 500. Same harness, same dataset, same config (`recall_mode=hybrid, k=10, granularity=session`); only the ColBERT@1.5 late-interaction channel differs.
+
+| Metric | hybrid baseline | hybrid + ColBERT@1.5 | Δ |
+|---|---|---|---|
+| **R@1** | 0.8064 | **0.8574** | **+5.10 pp** |
+| **R@5** | 0.9596 | **0.9787** | **+1.91 pp** |
+| **R@10** | 0.9830 | **0.9894** | +0.64 pp |
+| **MRR** | 0.8733 | **0.9114** | **+3.81 pp** |
+| p50 latency | 41.1 ms | 56.9 ms | +15.8 ms |
+
+ColBERT@1.5 lifts **three of six question types to perfect R@5** (knowledge-update, multi-session, single-session-assistant) and gives the largest single-category swing on **single-session-user (+7.8 pp R@5, +10.4 pp MRR)**. Reproducible through the harness in [`benchmarks/external/longmemeval_s.py`](benchmarks/external/longmemeval_s.py); the canonical result JSONs are checked in alongside.
+
+### Public benchmark numbers — Demolition Bench
+
+Head-to-head against the ten small/medium open-source models that an external memory-benchmark vendor publishes as scoring 0/N because the models couldn't follow the required JSON output schema. We score plain-text answers via substring match. No JSON gating.
+
+| Run | Aggregate | Errors | Notes |
+|---|---|---|---|
+| no-ColBERT | 186/200 = **93.0%** | 2 | hybrid + rerank + advanced |
+| **ColBERT@1.5 (fixed)** | **188/200 = 94.0%** | **0** | reproducibility-fix verified |
+
+`gemma3:270m` — Google's smallest production-deployed LLM (270M parameters, runs on a Raspberry Pi) — scores 18/20 = 90% in both conditions. Reproducible by curl: `bash <(curl -fsSL https://mazemaker.dev/demolition.sh)`. Harness + canonical JSONs in [`benchmarks/external/`](benchmarks/external/README.md).
 
 ---
 
@@ -117,6 +151,7 @@ Running the benchmark wasn't just measurement. It surfaced real engineering wins
 - **`retrieval_mode: lean`** — channel ablation proved that on real prose, BM25 / temporal / salience are dead-weight (or actively *harmful*). Lean drops them. Result: **4× faster than skynet on synthetic; +0.18 R@5 better than skynet on real prose**. The benchmark told the production code which channels to remove.
 - **`recall_score_percentile`** — the legacy `score_floor` operates on a badly-scaled internal score (~0..0.05); a sensible-looking value like 0.2 silently nukes everything. The new percentile knob is calibrated [0,1] by *rank*, so `0.5` keeps top half regardless of corpus or model.
 - **PPR is the load-bearing channel for ranking** (-0.13 MRR if removed); semantic is the load-bearing channel for recall (-0.26 if removed). Surface this in your config tuning.
+- **`MM_COLBERT_ENABLED=1` is the precision-mode opt-in** — pre-computes a per-memory top-32 token cache (~64 KB/row, ~14.7 GB across a 230k-memory corpus), unlocks the late-interaction rerank channel, and on LongMemEval-S 500q lifts R@1 +5.10 pp / MRR +3.81 pp. Three of six question types reach perfect R@5. Default-off so existing latency budgets stay intact.
 
 Run the benchmark yourself:
 
@@ -147,7 +182,8 @@ If the install + the cheat sheet above is enough for you, you can stop reading h
 - **Spreading activation** — BFS or Personalized PageRank for `think(start_id)`. The only path that solves hop-2 retrieval; vanilla cosine literally cannot.
 - **Dream Engine** — three-phase autonomous consolidation: NREM (strengthen activated edges + prune weak), REM (bridge isolated memories), Insight (Louvain communities + materialise `derived:cluster` summary memories).
 - **Conflict detection + supersession** — fuse-or-mark with revision history. `detect_conflicts=False` control arm proves the algorithm is doing real work, not just relying on recency.
-- **Multi-channel retrieval** — semantic + BM25 + entity + temporal + PPR, fused via Reciprocal Rank Fusion. Six presets (`semantic`, `hybrid`, `advanced`, `skynet`, `lean`, `trim`).
+- **Multi-channel retrieval** — semantic + BM25 + entity + temporal + PPR + optional ColBERT late-interaction, fused via Reciprocal Rank Fusion. Six presets (`semantic`, `hybrid`, `advanced`, `skynet`, `lean`, `trim`).
+- **ColBERT-style late-interaction rerank** — opt-in 2nd-stage channel via `MM_COLBERT_ENABLED=1`. BGE-M3 emits per-token contextual embeddings; we cache the top-32 per memory in a `colbert_tokens` BLOB and rescore the top-100 fused candidates with max-sim. On LongMemEval-S 500q: R@1 +5.10 pp, R@5 +1.91 pp, MRR +3.81 pp at +15.8 ms p50 latency.
 - **GPU recall** — CUDA-accelerated cosine over an in-memory matrix (~100ms for 10k memories). CPU fallback automatic.
 - **SQLite-first** — always works, no external DB needed. WAL mode + bg checkpointing. **Postgres + pgvector optional** for shared multi-agent / Pro-tier deployments (set `MM_DB_BACKEND=postgres`).
 - **Hermes plugin / MCP server / standalone library** — one core, three integration shapes.
@@ -305,16 +341,19 @@ memory:
 
 ## Tools (LLM-callable surface)
 
-When the plugin is active, these tools appear in Hermes:
+Nine MCP tools. Four are surfaced through the Hermes plugin schema; the rest live on the full Memory class and the daemon path.
 
-| Tool | Description |
-|------|-------------|
-| `neural_remember` | Store a memory (with conflict detection) |
-| `neural_recall` | Search memories by semantic similarity |
-| `neural_think` | Spreading activation from a memory |
-| `neural_graph` | View knowledge graph statistics |
-| `neural_dream` | Force a dream cycle (all/nrem/rem/insight) |
-| `neural_dream_stats` | Dream engine statistics |
+| Tool | Description | Surface |
+|------|-------------|---------|
+| `mazemaker_remember` | Store a memory (with conflict detection) | Core MCP |
+| `mazemaker_recall` | Search memories; multi-channel fusion (semantic + BM25 + entity + temporal + PPR + ColBERT) | Core MCP |
+| `mazemaker_think` | Spreading activation from a memory; BFS or PPR | Core MCP |
+| `mazemaker_graph` | View knowledge graph statistics | Core MCP |
+| `mazemaker_stats` | Engine vitals — memory count, edges, embedding fingerprint, compute device | Core MCP |
+| `mazemaker_quota` | Live quota state — calls remaining today/month, tier, budget | Core MCP |
+| `mazemaker_dream` | Force a dream cycle (all / nrem / rem / insight) | Memory class |
+| `mazemaker_dream_stats` | Dream engine telemetry — sessions, phase outcomes, insights | Memory class |
+| `mazemaker_prune` | Targeted forgetting by id, label glob, or age (with import-grace marker) | Memory class |
 
 ---
 
@@ -362,7 +401,7 @@ flowchart LR
 
 - Automatic: after 600s idle (configurable)
 - Automatic: every 50 new memories (configurable)
-- Manual: `neural_dream` tool
+- Manual: `mazemaker_dream` tool
 - Standalone: `python python/dream_worker.py --daemon`
 
 ### Standalone daemon — `dream_worker.py`
@@ -441,7 +480,7 @@ change beyond raw speed.
 ### Smoke Test (Quick)
 
 ```bash
-cd ~/projects/mazemaker-adapter/python
+cd ~/projects/mazemaker/python
 python3 demo.py
 ```
 
@@ -453,14 +492,14 @@ cd ~/.hermes/hermes-agent/plugins/memory/neural
 python3 test_suite.py
 
 # Upside-Down Test Suite — edge cases, corruption, concurrency, SQL injection
-cd ~/projects/mazemaker-adapter
+cd ~/projects/mazemaker
 python3 tests/test_upside_down.py
 ```
 
 ### Clean Smoke Test (Any Machine)
 
 ```bash
-cd ~/projects/mazemaker-adapter
+cd ~/projects/mazemaker
 python3 -c "
 import sys; sys.path.insert(0, 'python')
 from mazemaker import Mazemaker
@@ -490,14 +529,14 @@ Tested on a fresh Debian 12 QEMU/KVM VM — hermes-agent + mazemaker only, no ja
 |---|------|--------|
 | 1 | Mazemaker standalone (remember/recall/graph) | PASS |
 | 2 | Memory Provider (FastEmbed 1024d) | PASS |
-| 3 | NeuralMemoryProvider.__init__ | PASS |
+| 3 | MemoryProvider.__init__ | PASS |
 | 4 | is_available() | PASS |
 | 5 | initialize(session_id) | PASS |
 | 6 | get_tool_schemas() → 4 tools | PASS |
 | 7 | system_prompt_block() (250 chars) | PASS |
-| 8 | handle_tool_call — neural_remember | PASS |
-| 9 | handle_tool_call — neural_recall | PASS |
-| 10 | handle_tool_call — neural_graph | PASS |
+| 8 | handle_tool_call — mazemaker_remember | PASS |
+| 9 | handle_tool_call — mazemaker_recall | PASS |
+| 10 | handle_tool_call — mazemaker_graph | PASS |
 | 11 | prefetch() | PASS |
 | 12 | shutdown() | PASS |
 
@@ -517,7 +556,7 @@ Tested on a fresh Debian 12 QEMU/KVM VM — hermes-agent + mazemaker only, no ja
 ## File Structure
 
 ```
-mazemaker-adapter/
+mazemaker/
 ├── install.sh                    # Installer
 ├── hermes-plugin/                # Plugin (deployed to hermes-agent)
 │   ├── __init__.py               # MemoryProvider + tools
@@ -532,15 +571,22 @@ mazemaker-adapter/
 │   ├── access_logger.py          # Recall event logger
 │   └── ...
 ├── python/                       # Python source (mirrors hermes-plugin)
+│   ├── colbert_helper.py         # ColBERT late-interaction token extractor
+│   ├── migrate_colbert_tokens.py # One-shot backfill for existing memories
+│   ├── postgres_store.py         # Postgres + pgvector primary backend
 │   └── ...
 ├── src/                          # C++ source (optional, legacy)
 │   ├── memory/lstm.cpp           # LSTM predictor
 │   ├── memory/knn.cpp            # kNN engine
 │   └── memory/hopfield.cpp       # Hopfield network
-├── benchmarks/                   # The eight-round audit story
-│   ├── README.md                 # Suite catalog + headline numbers
+├── benchmarks/                   # Internal audit + external benchmarks
+│   ├── README.md                 # Internal suite catalog + headline numbers
 │   ├── audit/                    # codex-v2..v8 prompts + verdicts (verbatim)
-│   └── neural_memory_benchmark/  # Suites + dataset generators
+│   ├── neural_memory_benchmark/  # Internal suites + dataset generators
+│   └── external/                 # LongMemEval-S + Demolition Bench harnesses
+│       ├── longmemeval_s.py      # 500q public retrieval benchmark
+│       ├── demolition_bench.py   # 10 Hindsight-failed models, plain-text scoring
+│       └── results/              # Canonical reference JSONs (whitelisted)
 └── README.md
 ```
 
@@ -560,7 +606,7 @@ mazemaker-adapter/
 
 - **SQLite = Source of Truth** — Postgres + pgvector is an optional mirror. SQLite always works.
 - **Auto-detect everything** — CUDA, backends, venv paths. Minimize config burden.
-- **4 tool schemas** exposed by NeuralMemoryProvider: `neural_remember`, `neural_recall`, `neural_think`, `neural_graph`. (`neural_dream` / `neural_dream_stats` are standalone Memory class only.)
+- **9 MCP tools** exposed; the four core (`mazemaker_remember/recall/think/graph`) ride the Hermes provider schema. The full set — including dream control + telemetry, prune, stats, quota — is callable through the standalone Memory class and the daemon path.
 
 ### Benchmark-driven defaults
 
