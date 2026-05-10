@@ -30,27 +30,66 @@ That's it. The rest of this README goes deeper the further you scroll.
 
 ## Get it running
 
+> **TL;DR.** Easiest path is the one-line managed install — it sets up
+> the full Pro stack (ColBERT@1.5, REM + Insight dream phases, the
+> Architect UI, dream-worker autonomy, Postgres) and is **free during
+> launch** with no credit card. Self-hosting works, is fully
+> open-source, but ships a deliberately lighter feature set; see the
+> tier table below.
+
 ```bash
-# One-line managed install (rootless Podman pod, four containers,
-# wires up every MCP-speaking tool the script detects):
+# One-line managed install — Pro stack, free during launch.  Sets up
+# rootless Podman pods, the four containers, and wires up every
+# MCP-speaking tool the script detects.  Requires the onboarding
+# wizard (browser opens itself).
 curl -fsSL https://api.mazemaker.dev/install.sh | bash
 
-# OR self-host the engine directly into a Hermes Agent:
+# OR self-host the community engine directly:
 git clone https://github.com/itsXactlY/mazemaker
 cd mazemaker
+pip install -r requirements.txt
 bash install.sh          # auto-detect hermes-agent
 bash install.sh /path    # explicit path
 ```
 
-The installer figures out:
+The managed installer figures out: Python deps, GPU detection, plugin
+deployment, DB init at `~/.neural_memory/memory.db`, the four pod
+containers, the `~/.mazemaker/license.jwt` license key.
 
-1. Python deps (FastEmbed, torch, numpy)
-2. Whether you have a GPU
-3. Where to deploy the plugin
-4. Database init (SQLite at `~/.neural_memory/memory.db`)
-5. Config setup
+Restart hermes after install: `hermes gateway restart`.
 
-Restart hermes after install: `hermes gateway restart`
+### Community vs. Pro feature matrix
+
+The engine source is dual-licensed under AGPLv3 + PolyForm-NC.  Every
+feature is in this repo and every gate is a plain `if has_feature()`
+call you can grep for in [`python/license.py`](python/license.py).
+The community build is real and useful — it produces the published
+R@5 = 0.96 LongMemEval-S hybrid number — but the headline
+differentiators ship in the Pro tier.
+
+| Feature                          | Community (no license) | Pro / Enterprise |
+|----------------------------------|:----------------------:|:----------------:|
+| Hybrid recall (BM25 + dense)     | ✅                     | ✅               |
+| LongMemEval-S R@5 = 0.96         | ✅                     | ✅               |
+| NREM dream consolidation         | ✅                     | ✅               |
+| SQLite WAL backend               | ✅                     | ✅               |
+| MCP server + CLI                 | ✅                     | ✅               |
+| Hop-2 graph reasoning (R@10=1.0) | ✅                     | ✅               |
+| Conflict supersession            | ✅                     | ✅               |
+| **ColBERT@1.5 late-interaction** | ❌                     | ✅ → R@5 = 0.98  |
+| **REM dream phase** (bridges)    | ❌                     | ✅               |
+| **Insight dream phase** (clusters)| ❌                    | ✅               |
+| **Autonomous dream-worker**      | ❌                     | ✅               |
+| **Architect UI** (visual graph)  | ❌                     | ✅               |
+| **Postgres + pgvector backend**  | ❌                     | ✅               |
+| One-line installer + auto-update | ❌                     | ✅               |
+| Operator-direct email support    | ❌                     | ✅               |
+
+The community build runs the same engine with the Pro features gated
+off.  No booby-traps, no anti-features — every gate is open-source and
+inspectable.  License-key verification lives in `python/license.py`
+(Ed25519-signed JWTs); see [mazemaker.online/#pricing](https://mazemaker.online/#pricing)
+for tier details.
 
 That's the beginner path. If anything goes wrong, the [Production Lessons](#production-lessons) section near the bottom has every gotcha I've seen on a clean VM.
 
