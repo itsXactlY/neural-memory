@@ -34,7 +34,24 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
 )
 
-DEFAULT_SQLITE = os.path.expanduser("~/.neural_memory/memory.db")
+def _default_sqlite_path() -> str:
+    """Resolve the engine's SQLite store path.  The repo was renamed
+    from `neural-memory` → `mazemaker` (2026-05-01), and the on-disk
+    layout moved with it.  Try the new location first, fall back to
+    the legacy one so older installs still get picked up.
+    """
+    candidates = (
+        "~/.mazemaker/data/memory.db",   # current (post-rename)
+        "~/.mazemaker/memory.db",        # transitional
+        "~/.neural_memory/memory.db",    # legacy
+    )
+    for p in candidates:
+        full = os.path.expanduser(p)
+        if os.path.exists(full):
+            return full
+    return os.path.expanduser(candidates[0])  # default for empty installs
+
+DEFAULT_SQLITE = _default_sqlite_path()
 TEMPLATE_DIR   = Path(__file__).parent
 POLL_INTERVAL  = 2.0
 CONFIG_PATH    = os.path.expanduser("~/.hermes/config.yaml")
