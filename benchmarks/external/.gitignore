@@ -1,0 +1,24 @@
+# Track-C external benchmark harness — runtime artifacts that shouldn't be committed.
+# The dataset (data/) and runtime logs (logs/) are regenerated per run.
+data/
+logs/
+*.pyc
+__pycache__/
+.demolition-venv/
+
+# Default: don't ship per-run result files. They're large (~340 KB each
+# for LongMemEval) and bloat the repo with every operator's runs. The
+# whitelist below tracks a small canonical reference set — the exact
+# runs the website and blog quote — so anyone reproducing the bench can
+# diff their numbers against ours without a separate artifact download.
+results/*
+
+# Canonical reference results — keep tracked.
+!results/demolition_canonical-synthetic20_20260509T213339Z.json
+!results/demolition_canonical-synthetic20_20260509T213339Z.md
+!results/demolition_colbert-w15-canonical_20260509T223543Z.json
+!results/demolition_colbert-w15-canonical_20260509T223543Z.md
+!results/demolition_colbert-w15-clean_20260510T010504Z.json
+!results/demolition_colbert-w15-clean_20260510T010504Z.md
+!results/longmemeval_s_master-baseline_20260509T214714Z.json
+!results/longmemeval_s_colbert-on-master_20260510T034308Z.json

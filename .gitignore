@@ -24,3 +24,14 @@ tools/dashboard/.lib_cache/
 
 # Claude Code per-user local overrides (this file is gitignored on purpose)
 .claude/settings.local.json
+docs/BENCHMARK_DOMINANCE_PLAN.md
+docs/DAE_DESIGN.md
+docs/RESEARCH_FRONTIER.md
+docs/SOTA_LANDSCAPE.md
+
+# Benchmark artifacts: harness ships, but the LongMemEval-S dataset
+# (~265 MB) and intermediate run artefacts do not.
+benchmarks/external/data/
+benchmarks/external/logs/
+benchmarks/external/.demolition-venv/
+benchmarks/track_a_*.log
