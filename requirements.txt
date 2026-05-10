@@ -1,0 +1,19 @@
+# Mazemaker engine — runtime Python dependencies.
+#
+# Hard runtime deps (the engine will not start without these):
+cryptography>=41.0.0   # Ed25519 verification for license JWTs
+PyJWT>=2.8.0           # JWT envelope decode + signature check
+
+# Optional deps — declared here for reference; only required for
+# specific code paths.  See README for which features need which.
+#
+# embeddings:
+#   fastembed>=0.3.0          # default offline ONNX embeddings (community + Pro)
+#   sentence-transformers     # MLX-flavoured backend (Pro)
+#
+# postgres backend (Pro feature, opt-in):
+#   psycopg[binary]>=3.1
+#
+# colbert@1.5 channel (Pro feature, opt-in):
+#   sentence-transformers
+#   torch
