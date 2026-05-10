@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from license import has_feature  # Pro feature gate; community → False
+
 logger = logging.getLogger(__name__)
 
 
@@ -1067,12 +1069,21 @@ class Mazemaker:
             self.embedder = EmbeddingProvider(backend=embedding_backend)
 
         # Backend dispatch. SQLite is the default; MM_DB_BACKEND=postgres
-        # opts in to the Postgres + pgvector store.
+        # opts in to the Postgres + pgvector store IF the license carries
+        # the `postgres` feature (Pro/Enterprise tier with backend=postgres
+        # claim).  Community / Lite installs fall back to SQLite with a
+        # one-line warning so the operator knows what happened.
         backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
-        if backend_choice == "postgres":
+        if backend_choice == "postgres" and has_feature("postgres"):
             from postgres_store import PostgresStore
             self.store = PostgresStore()
         else:
+            if backend_choice == "postgres":
+                logger.warning(
+                    "MM_DB_BACKEND=postgres requested but the Postgres "
+                    "backend is a Pro feature; falling back to SQLite. "
+                    "See https://mazemaker.online/#pricing"
+                )
             self.store = SQLiteStore(db_path)
 
         self.dim = self.embedder.dim
@@ -1190,8 +1201,20 @@ class Mazemaker:
         # The opt-in default exists because populating the blob costs
         # ~64 KB/memory; on a 230k-memory corpus that's 14.7 GB extra
         # disk — kept opt-in so the cheap-recall path stays small.
-        self._colbert_write_enabled = (os.environ.get("MM_COLBERT_ENABLED", "0").strip().lower()
-                                       in ("1", "true", "yes", "on"))
+        # ColBERT is a Pro feature.  The env knob still exists (lets a
+        # Pro operator toggle the channel without re-issuing the JWT)
+        # but it now AND-s with has_feature("colbert"), so a community
+        # install with MM_COLBERT_ENABLED=1 quietly stays on the
+        # hybrid path — published R@5 = 0.96, no ColBERT bonus.
+        _cb_env = (os.environ.get("MM_COLBERT_ENABLED", "0").strip().lower()
+                   in ("1", "true", "yes", "on"))
+        self._colbert_write_enabled = _cb_env and has_feature("colbert")
+        if _cb_env and not self._colbert_write_enabled:
+            logger.warning(
+                "MM_COLBERT_ENABLED=1 ignored — ColBERT@1.5 is a Pro "
+                "feature.  Engine staying on hybrid recall (R@5 = 0.96). "
+                "See https://mazemaker.online/#pricing"
+            )
 
         self._hnsw_enabled = use_hnsw
         if self._hnsw_enabled is None:
@@ -2235,6 +2258,11 @@ class Mazemaker:
             (enable_colbert is True)
             or (enable_colbert is None and cb_weight > 0.0)
         )
+        # Pro feature gate.  Community / Lite installs simply skip the
+        # ColBERT fusion channel; the other six channels still produce
+        # the published R@5 = 0.96 hybrid number.
+        if cb_on and not has_feature("colbert"):
+            cb_on = False
         if cb_on and cb_weight > 0.0 and fused:
             colbert_scores = self._colbert_score_candidates(query, fused)
             if colbert_scores:
@@ -2992,7 +3020,7 @@ class Mazemaker:
         if self._dream_engine_singleton is not None:
             return self._dream_engine_singleton._backend.get_dream_stats()
         backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
-        if backend_choice == "postgres":
+        if backend_choice == "postgres" and has_feature("postgres"):
             from dream_postgres_store import DreamPostgresStore  # type: ignore[import]
             return DreamPostgresStore().get_dream_stats()
         from dream_engine import SQLiteDreamBackend  # type: ignore[import]
