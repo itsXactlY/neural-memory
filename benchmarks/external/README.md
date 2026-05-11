@@ -32,7 +32,7 @@ Result files:
 - [`results/longmemeval_s_master-baseline_20260509T214714Z.json`](results/longmemeval_s_master-baseline_20260509T214714Z.json) — no-CB
 - [`results/longmemeval_s_colbert-on-master_20260510T034308Z.json`](results/longmemeval_s_colbert-on-master_20260510T034308Z.json) — CB@1.5
 
-### Demolition Bench — 10 Hindsight-failed models, 20 questions
+### Comparison Bench — 10 small LLMs Hindsight evaluated, 20 questions
 
 | Run | Aggregate | Errors | Notes |
 |---|---|---|---|
@@ -51,7 +51,7 @@ Result files:
 - [`results/demolition_colbert-w15-canonical_20260509T223543Z.json`](results/demolition_colbert-w15-canonical_20260509T223543Z.json) — CB@1.5 *broken*
 - [`results/demolition_colbert-w15-clean_20260510T010504Z.json`](results/demolition_colbert-w15-clean_20260510T010504Z.json) — CB@1.5 *fixed*
 
-### Reproducibility fix (Demolition Bench, 2026-05-10)
+### Reproducibility fix (Comparison Bench, 2026-05-10)
 
 The ColBERT-on canonical regressed from 186/200 to 168/200 with 24 HTTP-500
 errors before the fix landed. Root cause was GPU contention, not ColBERT
@@ -59,7 +59,7 @@ logic: the in-process ColBERT helper (BGE-M3 ~1.4 GB VRAM), the bench's
 torch CUDA init, and ollama's keep-alive holding the previous LLM in VRAM
 combined to OOM the GPU. ollama returned 500.
 
-Two surgical fixes at the top of `demolition_bench.py`:
+Two surgical fixes at the top of `comparison_bench.py`:
 
 1. Hide CUDA from the bench python (`CUDA_VISIBLE_DEVICES=""`,
    `MM_COLBERT_DEVICE=cpu`, `MM_FORCE_CPU=1`). Operator override:
@@ -230,13 +230,13 @@ specific questions had their gold rank promoted/demoted.
   produce numbers that are directly comparable to the published
   LongMemEval-S leaderboard.
 
-## Demolition Bench
+## Comparison Bench
 
-`demolition_bench.py` — head-to-head harness against the 10 small/medium
+`comparison_bench.py` — head-to-head harness against the 10 small/medium
 open-source models that Hindsight's public benchmark page lists as scoring
 0/N. Hindsight's pipeline gates each answer on a strict JSON schema; if
 the model can't emit that exact shape, the answer is thrown out. The
-demolition harness asks every model in plain English for a one-sentence
+comparison harness asks every model in plain English for a one-sentence
 answer, then substring-matches the gold answer.
 
 The 10 Hindsight-fail models are the default `--models`:
@@ -260,20 +260,20 @@ granite3.1-dense:2b   llama3.2:latest   ministral-3:3b
 
 ```bash
 # Smoke (1 model, 3 synthetic questions, hash backend — fast and offline-safe)
-python -u -m benchmarks.external.demolition_bench \
+python -u -m benchmarks.external.comparison_bench \
     --models gemma3:270m --n 3 --dataset synthetic \
     --backend hash --no-rerank --tag smoke
 
 # Default config: full 10-model grid, BGE-M3 + cross-encoder rerank,
 # `advanced` retrieval mode, 20 stratified questions
-python -u -m benchmarks.external.demolition_bench --n 20
+python -u -m benchmarks.external.comparison_bench --n 20
 
 # Custom subset
-python -u -m benchmarks.external.demolition_bench \
+python -u -m benchmarks.external.comparison_bench \
     --models qwen2.5:3b llama3.2:latest --n 50
 
 # ColBERT-on second pass to compare
-python -u -m benchmarks.external.demolition_bench \
+python -u -m benchmarks.external.comparison_bench \
     --n 20 --enable-colbert --tag colbert-on
 ```
 
@@ -290,8 +290,8 @@ python -u -m benchmarks.external.demolition_bench \
 
 ### Output
 
-Each run writes `demolition_<tag>_<UTC-ts>.json` AND
-`demolition_<tag>_<UTC-ts>.md` under `results/`. The markdown is a
+Each run writes `bench_<tag>_<UTC-ts>.json` AND
+`bench_<tag>_<UTC-ts>.md` under `results/`. The markdown is a
 ready-to-quote table with the Hindsight `0/N` claim next to the
 Mazemaker accuracy.
 

@@ -29,7 +29,7 @@ VALID_SYSTEMS = ("mazemaker", "hindsight", "letta", "mem0", "amem", "cognee")
 
 
 # ---------------------------------------------------------------------------
-# ResultRecord — mirrors the existing demolition_*.json shape so the
+# ResultRecord — mirrors the existing bench_*.json shape so the
 # comparator can ingest old runs too.
 # ---------------------------------------------------------------------------
 
@@ -67,7 +67,7 @@ class HostInfo:
 @dataclass
 class ResultRecord:
     timestamp: str
-    demolition_pod_version: str
+    bench_pod_version: str
     system: str
     system_version: str
     system_config: dict[str, Any]

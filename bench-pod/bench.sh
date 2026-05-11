@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Demolition Pod — bootstrap entrypoint.
+# Comparison Pod — bootstrap entrypoint.
 #
 # Usage:
-#   bash <(curl -fsSL https://mazemaker.dev/demolish.sh)
-#   bash demolish.sh                  # full matrix
-#   bash demolish.sh --only=mazemaker # only the Mazemaker reference run
-#   bash demolish.sh --skip-fetch     # use already-fetched datasets
+#   bash <(curl -fsSL https://mazemaker.dev/bench.sh)
+#   bash bench.sh                  # full matrix
+#   bash bench.sh --only=mazemaker # only the Mazemaker reference run
+#   bash bench.sh --skip-fetch     # use already-fetched datasets
 #
 # Idempotent. Refuses to run if pre-flight fails. Never invokes sudo.
 # Never invokes docker.
@@ -27,7 +27,7 @@ else
 fi
 
 VERSION="0.1.0"
-WORK_DIR="${DEMOLITION_POD_WORK:-$HOME/.demolition-pod}"
+WORK_DIR="${DEMOLITION_POD_WORK:-$HOME/.bench-pod}"
 ONLY=""
 SKIP_FETCH=0
 SKIP_PREFLIGHT=0
@@ -47,7 +47,7 @@ for arg in "$@"; do
         --version)       printf '%s\n' "$VERSION"; exit 0 ;;
         --help|-h)
             cat <<EOF
-Demolition Pod v$VERSION
+Comparison Pod v$VERSION
 
   --only=<system>      Run a single runner (mazemaker|hindsight|letta|mem0|amem|cognee)
   --skip-fetch         Skip dataset fetch/verify
@@ -79,7 +79,7 @@ if [ "$PIPED_MODE" -eq 1 ]; then
         log "repo already present, pulling"
         (cd "$WORK_DIR/src" && git pull --ff-only) || log "git pull failed; using existing checkout"
     fi
-    POD_ROOT="$WORK_DIR/src/demolition-pod"
+    POD_ROOT="$WORK_DIR/src/bench-pod"
 fi
 
 [ -d "$POD_ROOT" ] || fail "pod root not found: $POD_ROOT"

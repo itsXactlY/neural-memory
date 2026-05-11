@@ -1,15 +1,15 @@
 [Unit]
-Description=Mazemaker Demolition Pod (Mazemaker + 5 competitor memory systems on the same bench)
+Description=Mazemaker Comparison Bench Pod (Mazemaker + 5 competitor memory systems on the same bench)
 After=network-online.target
 Wants=network-online.target
 
 [Pod]
-PodName=demolition
+PodName=bench
 
 # All runners share a single work dir bind-mounted into the pod.
-# The `:z` suffix relabels for SELinux. Host: $HOME/.demolition-pod
+# The `:z` suffix relabels for SELinux. Host: $HOME/.bench-pod
 # (the systemd %h specifier expands to the unit owner's home dir).
-Volume=%h/.demolition-pod:/work:z
+Volume=%h/.bench-pod:/work:z
 
 # Loopback-only — NO published ports. Operator dashboards / matrix
 # rendering happen on the host after the pod exits. If a future
@@ -23,13 +23,13 @@ Volume=%h/.demolition-pod:/work:z
 # version the pod is shipping, so a partial upgrade can't quietly mix
 # competing engine builds.
 #
-#   localhost/demolition-mazemaker:0.1.0
-#   localhost/demolition-hindsight:0.1.0
-#   localhost/demolition-letta:0.1.0
-#   localhost/demolition-mem0:0.1.0
-#   localhost/demolition-amem:0.1.0
-#   localhost/demolition-cognee:0.1.0
-#   localhost/demolition-ollama:0.1.0
+#   localhost/bench-mazemaker:0.1.0
+#   localhost/bench-hindsight:0.1.0
+#   localhost/bench-letta:0.1.0
+#   localhost/bench-mem0:0.1.0
+#   localhost/bench-amem:0.1.0
+#   localhost/bench-cognee:0.1.0
+#   localhost/bench-ollama:0.1.0
 #
 # v0.1 ships only the pod manifest. The Mazemaker reference runner
 # runs on the host Python and writes directly into /work via the

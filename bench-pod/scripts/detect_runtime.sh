@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Demolition Pod runtime preflight.
+# Comparison Pod runtime preflight.
 #
 # Checks (fail-fast):
 #   - podman present, version >= 4.4

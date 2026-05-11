@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Sequence: fetch -> install quadlet -> run all runners -> compare.
-# This is the underlying machinery `demolish.sh` wraps; exposing it
+# This is the underlying machinery `bench.sh` wraps; exposing it
 # separately makes a "re-run just the comparator" workflow trivial.
 
 set -euo pipefail
 
 POD_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="${DEMOLITION_POD_WORK:-$HOME/.demolition-pod}"
+WORK="${DEMOLITION_POD_WORK:-$HOME/.bench-pod}"
 PY="${PY:-python3}"
 
 log() { printf '[run-all] %s\n' "$*"; }

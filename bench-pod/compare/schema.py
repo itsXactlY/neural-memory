@@ -10,16 +10,16 @@ from typing import Any
 
 RESULT_RECORD_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "title": "DemolitionPodResultRecord",
+    "title": "BenchPodResultRecord",
     "type": "object",
     "required": [
-        "timestamp", "demolition_pod_version", "system", "system_version",
+        "timestamp", "bench_pod_version", "system", "system_version",
         "system_config", "dataset", "metrics", "host",
     ],
     "additionalProperties": True,
     "properties": {
         "timestamp": {"type": "string"},
-        "demolition_pod_version": {"type": "string"},
+        "bench_pod_version": {"type": "string"},
         "system": {
             "type": "string",
             "enum": ["mazemaker", "hindsight", "letta", "mem0", "amem", "cognee"],

@@ -1,4 +1,4 @@
-# Demolition Pod dataset checksums (SHA-256)
+# Comparison Pod dataset checksums (SHA-256)
 #
 # These are the canonical hashes for the dataset bundles the pod fetches
 # and validates before any benchmark run. The comparator (compare/compare.py)

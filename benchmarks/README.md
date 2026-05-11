@@ -7,7 +7,7 @@ The headline claim of Mazemaker is that it does things a generic vector store ca
 **External, public-dataset numbers** live one directory deeper in [`external/`](external/README.md):
 
 - **LongMemEval-S 500-question retrieval** (Wu et al., ICLR 2025) — `R@5 = 0.9787`, `MRR = 0.9114` with ColBERT@1.5 (`R@1 = 0.8574`, `+5.10 pp` over the hybrid baseline). Three of six question types reach perfect R@5.
-- **Demolition Bench** (ten Hindsight-failed models on plain-text scoring) — `188/200 = 94.0%` with ColBERT@1.5, `0 errors deterministic`. `gemma3:270m` (270M params, runs on a Pi) scores `18/20 = 90%`.
+- **Comparison Bench** (ten small LLMs Hindsight evaluated on plain-text scoring) — `188/200 = 94.0%` with ColBERT@1.5, `0 errors deterministic`. `gemma3:270m` (270M params, runs on a Pi) scores `18/20 = 90%`.
 
 ---
 

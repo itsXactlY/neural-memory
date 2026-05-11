@@ -1,4 +1,4 @@
-"""Demolition Pod comparator: reads per-system ResultRecord JSON,
+"""Comparison Pod comparator: reads per-system ResultRecord JSON,
 validates them against a strict schema, and emits matrix.md /
 matrix.json / verdict.md.
 

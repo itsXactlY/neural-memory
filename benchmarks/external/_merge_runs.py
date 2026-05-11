@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Merge multiple demolition bench result files into one canonical file.
+"""Merge multiple comparison bench result files into one canonical file.
 
 For each model, picks the run with the FEWEST errors (tiebreak: highest
 accuracy, then most recent). Useful when an Ollama 500 storm during a
 full grid run nuked some models — re-run them in isolation and merge.
 
 Usage:
-    python -u benchmarks/external/_merge_demolition.py \
+    python -u benchmarks/external/_merge_runs.py \
         results/demolition_full-grid-synthetic20_*.json \
         results/demolition_rerun-2models_*.json \
         --tag canonical-synthetic20
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Reuse the markdown renderer from the harness
-import demolition_bench as db  # noqa: E402
+import comparison_bench as db  # noqa: E402
 
 
 def main() -> int:
@@ -83,8 +83,8 @@ def main() -> int:
         "_chosen_run_per_model": chosen_run,
     }
 
-    json_path = RESULTS_DIR / f"demolition_{args.tag}_{ts}.json"
-    md_path = RESULTS_DIR / f"demolition_{args.tag}_{ts}.md"
+    json_path = RESULTS_DIR / f"bench_{args.tag}_{ts}.json"
+    md_path = RESULTS_DIR / f"bench_{args.tag}_{ts}.md"
     json_path.write_text(json.dumps(payload, indent=2))
 
     # Build a tiny shim args object the renderer can read

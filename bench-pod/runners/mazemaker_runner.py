@@ -112,7 +112,7 @@ def run(args) -> int:
         "--backend", args.backend,
         "--granularity", args.granularity,
         "-k", str(args.k),
-        "--tag", "demolition-pod",
+        "--tag", "bench-pod",
     ]
     if args.limit:
         cmd += ["--limit", str(args.limit)]
@@ -137,7 +137,7 @@ def run(args) -> int:
         # Emit a partial record so the comparator can surface ERROR
         rec = ResultRecord(
             timestamp=now_iso(),
-            demolition_pod_version=POD_VERSION,
+            bench_pod_version=POD_VERSION,
             system=SYSTEM,
             system_version=_engine_version(repo),
             system_config={"argv": cmd, "harness_rc": rc},
@@ -184,7 +184,7 @@ def run(args) -> int:
 
     rec = ResultRecord(
         timestamp=now_iso(),
-        demolition_pod_version=POD_VERSION,
+        bench_pod_version=POD_VERSION,
         system=SYSTEM,
         system_version=_engine_version(repo),
         system_config={
@@ -222,7 +222,7 @@ def _f(v, scale: float = 1.0) -> float | None:
 def build_parser():
     p = base_argparser(SYSTEM, "Mazemaker reference runner — drives benchmarks/external/longmemeval_s.py")
     p.add_argument("--mazemaker-repo", default=str(DEFAULT_MAZEMAKER_REPO),
-                   help="Path to the mazemaker engine repo (default: parent of demolition-pod/).")
+                   help="Path to the mazemaker engine repo (default: parent of bench-pod/).")
     p.add_argument("--recall-mode", default="hybrid",
                    choices=["semantic", "hybrid", "advanced", "skynet", "lean", "trim"])
     p.add_argument("--backend", default="auto")

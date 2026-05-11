@@ -1,4 +1,4 @@
-"""Demolition Pod runner package.
+"""Comparison Pod runner package.
 
 Each `<system>_runner` module implements a thin shim that drives one
 memory system through the canonical bench and emits a `ResultRecord`

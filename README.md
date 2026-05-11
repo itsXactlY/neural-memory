@@ -150,7 +150,7 @@ External, third-party benchmark from Wu et al. (ICLR 2025). 470 gradeable questi
 
 ColBERT@1.5 lifts **three of six question types to perfect R@5** (knowledge-update, multi-session, single-session-assistant) and gives the largest single-category swing on **single-session-user (+7.8 pp R@5, +10.4 pp MRR)**. Reproducible through the harness in [`benchmarks/external/longmemeval_s.py`](benchmarks/external/longmemeval_s.py); the canonical result JSONs are checked in alongside.
 
-### Public benchmark numbers — Demolition Bench
+### Public benchmark numbers — Comparison Bench
 
 Head-to-head against the ten small/medium open-source models that an external memory-benchmark vendor publishes as scoring 0/N because the models couldn't follow the required JSON output schema. We score plain-text answers via substring match. No JSON gating.
 
@@ -159,7 +159,7 @@ Head-to-head against the ten small/medium open-source models that an external me
 | no-ColBERT | 186/200 = **93.0%** | 2 | hybrid + rerank + advanced |
 | **ColBERT@1.5 (fixed)** | **188/200 = 94.0%** | **0** | reproducibility-fix verified |
 
-`gemma3:270m` — Google's smallest production-deployed LLM (270M parameters, runs on a Raspberry Pi) — scores 18/20 = 90% in both conditions. Reproducible by curl: `bash <(curl -fsSL https://mazemaker.dev/demolition.sh)`. Harness + canonical JSONs in [`benchmarks/external/`](benchmarks/external/README.md).
+`gemma3:270m` — Google's smallest production-deployed LLM (270M parameters, runs on a Raspberry Pi) — scores 18/20 = 90% in both conditions. Reproducible by curl: `bash <(curl -fsSL https://mazemaker.dev/bench.sh)`. Harness + canonical JSONs in [`benchmarks/external/`](benchmarks/external/README.md).
 
 ---
 
@@ -622,9 +622,9 @@ mazemaker/
 │   ├── README.md                 # Internal suite catalog + headline numbers
 │   ├── audit/                    # codex-v2..v8 prompts + verdicts (verbatim)
 │   ├── neural_memory_benchmark/  # Internal suites + dataset generators
-│   └── external/                 # LongMemEval-S + Demolition Bench harnesses
+│   └── external/                 # LongMemEval-S + Comparison Bench harnesses
 │       ├── longmemeval_s.py      # 500q public retrieval benchmark
-│       ├── demolition_bench.py   # 10 Hindsight-failed models, plain-text scoring
+│       ├── comparison_bench.py   # 10 small LLMs Hindsight evaluated, plain-text scoring
 │       └── results/              # Canonical reference JSONs (whitelisted)
 └── README.md
 ```

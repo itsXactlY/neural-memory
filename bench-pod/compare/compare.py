@@ -132,7 +132,7 @@ def _build_row(system: str, rec: dict[str, Any] | None) -> dict[str, Any]:
 def _render_matrix_md(rows: list[dict[str, Any]], dataset_name: str,
                       dataset_size: int, dataset_hash: str) -> str:
     lines: list[str] = []
-    lines.append(f"# Demolition Pod — Comparison Matrix")
+    lines.append(f"# Comparison Pod — Comparison Matrix")
     lines.append("")
     lines.append(f"Dataset: `{dataset_name}` (n={dataset_size}, hash=`{dataset_hash}`)")
     lines.append("")
@@ -203,7 +203,7 @@ def _render_verdict(rows: list[dict[str, Any]], dataset_name: str,
     except ImportError:
         # Minimal hand-rolled fallback — no control flow, just headline + table.
         out: list[str] = []
-        out.append("# Demolition Pod — Verdict")
+        out.append("# Comparison Pod — Verdict")
         out.append("")
         out.append(f"**Run:** {timestamp}")
         out.append(f"**Pod version:** `{pod_version}`")
@@ -245,7 +245,7 @@ def _render_verdict(rows: list[dict[str, Any]], dataset_name: str,
 def main(argv=None) -> int:
     import datetime as _dt
 
-    p = argparse.ArgumentParser(description="Demolition Pod comparator")
+    p = argparse.ArgumentParser(description="Comparison Pod comparator")
     p.add_argument("--results-dir", required=True)
     p.add_argument("--out-dir", required=True)
     p.add_argument("--pod-version", default=None)

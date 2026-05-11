@@ -1,4 +1,4 @@
-# Mazemaker Demolition Pod
+# Mazemaker Comparison Pod
 
 A single-command Podman-based reproducer that runs Mazemaker plus five
 competitor memory systems on the same benchmarks, then emits a
@@ -22,25 +22,25 @@ emit `ResultRecord` JSON to `/work/results/<system>.json`.
 ## One-liner
 
 ```
-bash <(curl -fsSL https://mazemaker.dev/demolish.sh)
+bash <(curl -fsSL https://mazemaker.dev/bench.sh)
 ```
 
 That entrypoint runs preflight checks (`scripts/detect_runtime.sh`),
 fetches and hash-verifies the datasets, installs the Quadlet pod
 manifest, and runs the comparator. Final output:
 
-- `~/.demolition-pod/results/*.json`
-- `~/.demolition-pod/matrix.md`
-- `~/.demolition-pod/matrix.json`
-- `~/.demolition-pod/verdict.md`
+- `~/.bench-pod/results/*.json`
+- `~/.bench-pod/matrix.md`
+- `~/.bench-pod/matrix.json`
+- `~/.bench-pod/verdict.md`
 
 ## From a clone
 
 ```
 git clone https://github.com/itsXactlY/mazemaker
-cd mazemaker/demolition-pod
-bash demolish.sh                 # full matrix (Mazemaker + stubs)
-bash demolish.sh --only=mazemaker # Mazemaker reference run only
+cd mazemaker/bench-pod
+bash bench.sh                 # full matrix (Mazemaker + stubs)
+bash bench.sh --only=mazemaker # Mazemaker reference run only
 ```
 
 The script is idempotent and refuses to run on a missing pre-flight.
@@ -63,7 +63,7 @@ are identical.
 
 This pod uses **Podman + Quadlet only**. There is no `docker`, no
 `docker-compose`, no Kubernetes. Quadlet units land under
-`~/.config/containers/systemd/demolition/` and are managed via
+`~/.config/containers/systemd/bench/` and are managed via
 `systemctl --user`.
 
 LLM extraction for systems that need it (Mem0, A-MEM, Cognee) is

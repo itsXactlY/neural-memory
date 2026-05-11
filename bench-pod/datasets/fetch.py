@@ -109,8 +109,8 @@ def _handle_entry(entry: dict[str, Any], work_dir: Path) -> tuple[str, str]:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Fetch + SHA-verify Demolition Pod datasets")
-    p.add_argument("--work", required=True, help="$WORK dir, e.g. ~/.demolition-pod")
+    p = argparse.ArgumentParser(description="Fetch + SHA-verify Comparison Pod datasets")
+    p.add_argument("--work", required=True, help="$WORK dir, e.g. ~/.bench-pod")
     args = p.parse_args(argv)
 
     work = Path(args.work).expanduser().resolve()
