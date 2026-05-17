@@ -1070,12 +1070,27 @@ class PostgresStore:
         return len(payload)
 
     def prune_memories_by_label_prefix(self, prefix: str, older_than_ts: float) -> int:
-        """PG counterpart to SQLiteStore.prune_memories_by_label_prefix."""
+        """PG counterpart to SQLiteStore.prune_memories_by_label_prefix.
+
+        `connections.source_id` / `target_id` reference `memories.id` without
+        ON DELETE CASCADE, so a naive DELETE FROM memories trips the FK on
+        any row that still has edges (derived:cluster outputs always do —
+        they're emitted with derived_from connections in the same cycle).
+        Clear the connections first, then the memories. Single transaction
+        so a crash mid-prune doesn't leak orphan edges.
+        """
         from datetime import datetime, timezone
-        # PG `memories.created_at` is TIMESTAMPTZ; convert epoch → datetime.
         cutoff = datetime.fromtimestamp(float(older_than_ts), tz=timezone.utc)
         try:
-            with self._cursor() as (_conn, cur):
+            with self._cursor() as (conn, cur):
+                cur.execute(
+                    "DELETE FROM connections "
+                    "WHERE source_id IN (SELECT id FROM memories "
+                    "                    WHERE label LIKE %s AND created_at < %s) "
+                    "   OR target_id IN (SELECT id FROM memories "
+                    "                    WHERE label LIKE %s AND created_at < %s)",
+                    (prefix + "%", cutoff, prefix + "%", cutoff),
+                )
                 cur.execute(
                     "DELETE FROM memories WHERE label LIKE %s AND created_at < %s",
                     (prefix + "%", cutoff),
