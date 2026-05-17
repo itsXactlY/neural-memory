@@ -19,10 +19,14 @@ Two granularities are supported via ``--granularity``:
 Usage
 -----
     python -m benchmarks.external.longmemeval_s --recall-mode hybrid --k 10
-    python -m benchmarks.external.longmemeval_s --recall-mode skynet \\
+    python -m benchmarks.external.longmemeval_s --recall-mode skynet \
         --rerank --backend auto --limit 50
 
 Outputs JSON under ``benchmarks/external/results/longmemeval_s_<ts>.json``.
+
+Canonical corpus source: ``benchmarks/snapshots/mm_bench_raw_20260513_0158_full.dump``
+(regenerate via ``scripts/import_raw_corpora_to_pg.py``). Set
+``MM_LME_FROM_PG=1`` to read from mm_bench_raw instead of the JSON file.
 """
 from __future__ import annotations
 
@@ -56,7 +60,71 @@ RESULTS_DIR = Path(__file__).resolve().parent / "results"
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_dataset(path: Path = DATASET_PATH) -> list[dict[str, Any]]:
+def _load_dataset_from_pg(variant: str) -> list[dict[str, Any]]:
+    """Reconstruct the upstream JSON shape from mm_bench_raw.
+
+    Why rebuild instead of selecting JSONB blobs? The importer split
+    `haystack_sessions` into a relational `sessions` table for query-
+    ability; we have to re-stitch by (question_id, session_idx, msg_idx)
+    so existing harness code that walks haystack_sessions keeps working
+    untouched.
+    """
+    import psycopg
+
+    schema = f"longmemeval_{variant.lower()}"
+    pw = os.environ.get("MM_POSTGRES_PASSWORD", "")
+    host = os.environ.get("MM_POSTGRES_HOST", "127.0.0.1")
+    port = os.environ.get("MM_POSTGRES_PORT", "5432")
+    user = os.environ.get("MM_POSTGRES_USER", "mazemaker")
+    dsn = os.environ.get("MM_POSTGRES_DSN") or (
+        f"host={host} port={port} dbname=mm_bench_raw user={user} password={pw}"
+    )
+
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT question_id, question_type, question, question_date, "
+                f"answer, answer_session_ids, haystack_dates, haystack_session_ids "
+                f"FROM {schema}.questions"
+            )
+            q_rows = cur.fetchall()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT question_id, session_idx, msg_idx, role, content "
+                f"FROM {schema}.sessions "
+                f"ORDER BY question_id, session_idx, msg_idx"
+            )
+            # bucket[(qid, s_idx)] = list[{role,content}] in msg_idx order
+            bucket: dict[tuple[str, int], list[dict[str, Any]]] = {}
+            for qid, s_idx, _m_idx, role, content in cur:
+                bucket.setdefault((qid, s_idx), []).append(
+                    {"role": role, "content": content}
+                )
+
+    records: list[dict[str, Any]] = []
+    for (qid, qtype, qtext, qdate, ans, ans_ids, dates, sids) in q_rows:
+        # answer_session_ids drives reconstruction order; haystack_session_ids
+        # is the *full* haystack including distractors, so use that.
+        full_sids = sids or []
+        sessions = [bucket.get((qid, i), []) for i in range(len(full_sids))]
+        records.append({
+            "question_id": qid,
+            "question_type": qtype,
+            "question": qtext,
+            "question_date": qdate,
+            "answer": ans,
+            "answer_session_ids": ans_ids or [],
+            "haystack_dates": dates or [],
+            "haystack_session_ids": full_sids,
+            "haystack_sessions": sessions,
+        })
+    return records
+
+
+def load_dataset(path: Path = DATASET_PATH, variant: str = "s") -> list[dict[str, Any]]:
+    if os.environ.get("MM_LME_FROM_PG") == "1":
+        return _load_dataset_from_pg(variant)
     if not path.exists():
         raise FileNotFoundError(
             f"LongMemEval-S dataset not found at {path}. See README.md "
@@ -83,235 +151,177 @@ def question_types(records: Iterable[dict[str, Any]]) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Ingest helpers
+# Stratified sampling so every question_type appears proportionally
 # ---------------------------------------------------------------------------
 
-def _format_session(sess: list[dict[str, Any]], date: str | None) -> str:
-    """Render a session's turns into a single chunk of text.
+def stratified_sample(records: list[dict[str, Any]], limit: int,
+                      seed: int = 42) -> list[dict[str, Any]]:
+    import random
+    rng = random.Random(seed)
+    bucket: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        bucket.setdefault(r.get("question_type", "unknown"), []).append(r)
+    # Proportionally allocate slots
+    total = len(records)
+    selected: list[dict[str, Any]] = []
+    remaining = limit
+    qtypes = sorted(bucket.keys(), key=lambda qt: -len(bucket[qt]))
+    for i, qt in enumerate(qtypes):
+        pool = bucket[qt]
+        # Last type gets whatever's left; otherwise proportional
+        if i == len(qtypes) - 1:
+            n = remaining
+        else:
+            n = max(1, round(len(pool) / total * limit))
+        n = min(n, len(pool), remaining)
+        rng.shuffle(pool)
+        selected.extend(pool[:n])
+        remaining -= n
+        if remaining <= 0:
+            break
+    rng.shuffle(selected)
+    return selected
 
-    Format: ``[date] role: content`` separated by newlines.
+
+# ---------------------------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------------------------
+
+def _chunk_text(text: str, chunk_chars: int = 2000, overlap: int = 200) -> list[str]:
+    """Sliding-window chunker matching bake_chunked_sessions.py.
+
+    Sessions <= chunk_chars stay whole. Above that, emit overlapping windows
+    so every sentence is inside SOME chunk's ColBERT-encodable boundary.
     """
-    lines: list[str] = []
-    if date:
-        lines.append(f"[{date}]")
-    for turn in sess:
-        role = turn.get("role", "?")
-        content = turn.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
+    if len(text) <= chunk_chars:
+        return [text]
+    out: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + chunk_chars, n)
+        out.append(text[start:end])
+        if end == n:
+            break
+        start = end - overlap
+    return out
 
 
-def ingest_session_level(nm: Mazemaker, record: dict[str, Any]) -> int:
-    """Ingest each session as a single memory; returns count ingested."""
-    n = 0
-    sids = record.get("haystack_session_ids", [])
-    sessions = record.get("haystack_sessions", [])
-    dates = record.get("haystack_dates", []) or [None] * len(sessions)
-    for sid, sess, date in zip(sids, sessions, dates):
-        text = _format_session(sess, date)
+def ingest_session_level(nm: Mazemaker, record: dict[str, Any],
+                         enable_chunks: bool = False) -> int:
+    """Ingest each haystack session as one memory.
+
+    When enable_chunks is on, each session is split into 2000-char windows
+    with 200-char overlap; each chunk becomes its own memory labeled
+    `session:<sid>::chunk::<n>`. The bench scorer matches via
+    `label.split(':')` so the sid is still surfaced from every chunk.
+
+    Returns number of memories stored.
+    """
+    sids = record.get("haystack_session_ids") or []
+    sessions = record.get("haystack_sessions") or []
+    count = 0
+    for sid, msgs in zip(sids, sessions):
+        # Concatenate all messages in this session into one text block
+        text = "\n".join(
+            f"{m.get('role', 'user')}: {m.get('content', '')}"
+            for m in (msgs or [])
+        )
         if not text.strip():
             continue
-        nm.remember(
-            text,
-            label=f"session:{sid}",
-            auto_connect=False,
-            detect_conflicts=False,
-        )
-        n += 1
-    return n
+        if enable_chunks:
+            for i, chunk in enumerate(_chunk_text(text)):
+                nm.remember(chunk, label=f"session:{sid}::chunk::{i}",
+                            auto_connect=False, detect_conflicts=False)
+                count += 1
+        else:
+            nm.remember(text, label=f"session:{sid}",
+                        auto_connect=False, detect_conflicts=False)
+            count += 1
+    return count
 
 
 def ingest_turn_level(nm: Mazemaker, record: dict[str, Any]) -> int:
-    n = 0
-    sids = record.get("haystack_session_ids", [])
-    sessions = record.get("haystack_sessions", [])
-    dates = record.get("haystack_dates", []) or [None] * len(sessions)
-    for sid, sess, date in zip(sids, sessions, dates):
-        for j, turn in enumerate(sess):
-            content = turn.get("content", "")
-            if not content.strip():
+    """Ingest each chat turn as a separate memory.
+    Returns number of memories stored."""
+    sids = record.get("haystack_session_ids") or []
+    sessions = record.get("haystack_sessions") or []
+    count = 0
+    for sid, msgs in zip(sids, sessions):
+        for ti, m in enumerate(msgs or []):
+            text = f"{m.get('role', 'user')}: {m.get('content', '')}"
+            if not text.strip():
                 continue
-            prefix = f"[{date}] " if date else ""
-            text = f"{prefix}{turn.get('role','?')}: {content}"
-            nm.remember(
-                text,
-                label=f"turn:{sid}:{j}",
-                auto_connect=False,
-                detect_conflicts=False,
-            )
-            n += 1
-    return n
+            nm.remember(text, label=f"turn:{sid}:{ti}",
+                        auto_connect=False, detect_conflicts=False)
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
-def _result_session_id(result: dict[str, Any]) -> Optional[str]:
-    label = result.get("label") or ""
-    if label.startswith("session:"):
-        return label.split(":", 1)[1]
-    if label.startswith("turn:"):
-        # turn:<sid>:<idx>
-        parts = label.split(":")
-        if len(parts) >= 3:
-            return parts[1]
+def rank_of_gold(results: list[dict[str, Any]],
+                 gold_session_ids: set[str]) -> int | None:
+    """Return 1-indexed rank of the first result matching a gold session,
+    or None if none matched."""
+    for i, r in enumerate(results, 1):
+        label = r.get("label") or ""
+        # Session-level: label is "session:<sid>" — check any label segment
+        # matches a gold id.
+        for segment in label.split(":"):
+            if segment in gold_session_ids:
+                return i
     return None
 
 
-def rank_of_gold(results: list[dict[str, Any]], gold_session_ids: set[str]) -> Optional[int]:
-    """Return the 1-indexed rank of the first result whose session matches gold.
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
 
-    For session-level granularity each session appears once, so the rank is
-    direct. For turn-level we rank by FIRST surfaced turn from a gold session.
-    Returns None if no gold session appears in the result list.
-    """
-    seen: set[str] = set()
-    for i, r in enumerate(results, start=1):
-        sid = _result_session_id(r)
-        if sid is None:
-            continue
-        if sid in gold_session_ids and sid not in seen:
-            return i
-        seen.add(sid)
-    return None
-
-
-def percentile(values: list[float], q: float) -> float:
+def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
-    s = sorted(values)
-    idx = min(len(s) - 1, max(0, int(round((len(s) - 1) * q))))
-    return s[idx]
-
-
-# ---------------------------------------------------------------------------
-# Run
-# ---------------------------------------------------------------------------
-
-def _build_engine(args, db_path: str) -> Mazemaker:
-    # ColBERT opt-in. The flag flips MM_COLBERT_ENABLED in the env so
-    # remember() will write the per-memory token blob during ingest;
-    # without that, recall would have nothing to score against.
-    if getattr(args, "enable_colbert", False):
-        os.environ["MM_COLBERT_ENABLED"] = "1"
-    if getattr(args, "enable_dae", False):
-        os.environ["MM_DAE_ENABLED"] = "1"
-    channel_weights = None
-    if getattr(args, "colbert_weight", None) is not None:
-        channel_weights = {"colbert": float(args.colbert_weight)}
-    if getattr(args, "dae_weight", None) is not None:
-        channel_weights = channel_weights or {}
-        channel_weights["dae"] = float(args.dae_weight)
-    return Mazemaker(
-        db_path=db_path,
-        embedding_backend=args.backend,
-        use_cpp=False,
-        retrieval_mode=args.recall_mode,
-        use_hnsw=False,
-        lazy_graph=True,
-        think_engine="bfs",
-        rerank=args.rerank,
-        channel_weights=channel_weights,
-    )
-
-
-def run_question(args, record: dict[str, Any]) -> dict[str, Any]:
-    qid = record["question_id"]
-    question = record["question"]
-    gold_ids = set(record.get("answer_session_ids") or [])
-    is_abstention = qid.endswith("_abs")
-
-    with tempfile.TemporaryDirectory(prefix=f"lme-{qid[:8]}-") as td:
-        db = str(Path(td) / "bench.db")
-        nm = _build_engine(args, db)
-        try:
-            t0 = time.perf_counter()
-            if args.granularity == "turn":
-                n_ingested = ingest_turn_level(nm, record)
-            else:
-                n_ingested = ingest_session_level(nm, record)
-            ingest_ms = (time.perf_counter() - t0) * 1000.0
-
-            # DAE second-pass: per-question ephemeral SQLite needs the
-            # memory_dae_embeddings table populated before recall can
-            # consult the channel.  Failures here must not abort the
-            # bench — log and continue with the primary embeddings.
-            if getattr(args, "enable_dae", False):
-                try:
-                    from dae import dae_bulk_compute
-                    dae_bulk_compute(
-                        nm,
-                        self_weight=float(args.dae_self_weight),
-                        neighbour_k=int(args.dae_neighbour_k),
-                    )
-                except Exception as _dae_err:
-                    print(f"[lme-s] WARN: dae_bulk_compute failed for "
-                          f"{qid}: {_dae_err}", file=sys.stderr, flush=True)
-
-            t1 = time.perf_counter()
-            recall_kwargs = dict(
-                k=args.k,
-                hybrid=(args.recall_mode in {"hybrid", "advanced", "skynet", "lean", "trim"}),
-                rerank=args.rerank,
-            )
-            if getattr(args, "enable_colbert", False):
-                recall_kwargs["enable_colbert"] = True
-            if getattr(args, "colbert_weight", None) is not None:
-                recall_kwargs["colbert_weight"] = float(args.colbert_weight)
-            if getattr(args, "enable_dae", False):
-                recall_kwargs["enable_dae"] = True
-            if getattr(args, "dae_weight", None) is not None:
-                recall_kwargs["dae_weight"] = float(args.dae_weight)
-            results = nm.recall(question, **recall_kwargs)
-            recall_ms = (time.perf_counter() - t1) * 1000.0
-
-            rank = rank_of_gold(results, gold_ids) if gold_ids else None
-            return {
-                "qid": qid,
-                "question_type": record.get("question_type"),
-                "is_abstention": is_abstention,
-                "n_ingested": n_ingested,
-                "n_results": len(results),
-                "gold_session_ids": sorted(gold_ids),
-                "rank_of_gold": rank,
-                "ingest_ms": round(ingest_ms, 2),
-                "latency_ms": round(recall_ms, 2),
-                "top_labels": [r.get("label", "") for r in results[: args.k]],
-            }
-        finally:
-            try:
-                nm.close()
-            except Exception:
-                pass
+    sorted_v = sorted(values)
+    k = (len(sorted_v) - 1) * pct
+    f = int(k)
+    c = f + 1
+    if c >= len(sorted_v):
+        return sorted_v[-1]
+    return sorted_v[f] + (k - f) * (sorted_v[c] - sorted_v[f])
 
 
 def aggregate(per_question: list[dict[str, Any]]) -> dict[str, Any]:
-    # Restrict metrics to questions that HAVE gold sessions (skip abstention,
-    # which has no positive evidence to retrieve).
     gradeable = [q for q in per_question if q.get("gold_session_ids") and not q.get("is_abstention")]
-    n = max(1, len(gradeable))
-
-    def _hits(thresh: int) -> int:
-        return sum(1 for q in gradeable if q.get("rank_of_gold") is not None and q["rank_of_gold"] <= thresh)
-
     rrs: list[float] = []
+    latencies: list[float] = []
     for q in gradeable:
-        r = q.get("rank_of_gold")
-        rrs.append(1.0 / r if r else 0.0)
+        rank = q.get("rank_of_gold")
+        if rank is not None and rank > 0:
+            rrs.append(1.0 / rank)
+        else:
+            rrs.append(0.0)
+        if "latency_ms" in q:
+            latencies.append(q["latency_ms"])
+    n = len(gradeable)
 
-    latencies = [q["latency_ms"] for q in per_question if "latency_ms" in q]
+    def _hits(k: int) -> int:
+        return sum(1 for q in gradeable
+                   if q.get("rank_of_gold") is not None and 0 < q["rank_of_gold"] <= k)
+
+    ingest_values = [q["ingest_ms"] for q in per_question if "ingest_ms" in q]
 
     return {
         "n_total": len(per_question),
-        "n_gradeable": len(gradeable),
-        "recall@1": round(_hits(1) / n, 4),
-        "recall@5": round(_hits(5) / n, 4),
-        "recall@10": round(_hits(10) / n, 4),
+        "n_gradeable": n,
+        "recall@1": round(_hits(1) / n, 4) if n else 0.0,
+        "recall@5": round(_hits(5) / n, 4) if n else 0.0,
+        "recall@10": round(_hits(10) / n, 4) if n else 0.0,
         "MRR": round(statistics.mean(rrs) if rrs else 0.0, 4),
         "p50_ms": round(percentile(latencies, 0.50), 3),
         "p95_ms": round(percentile(latencies, 0.95), 3),
-        "mean_ingest_ms": round(statistics.mean([q["ingest_ms"] for q in per_question if "ingest_ms" in q]) or 0.0, 1) if per_question else 0.0,
+        "mean_ingest_ms": round(statistics.mean(ingest_values), 1) if ingest_values else 0.0,
     }
 
 
@@ -334,50 +344,153 @@ def _git_dirty() -> bool:
         )
         return bool(out.decode().strip())
     except Exception:
-        return False
+        return True
 
 
-def write_result(args, per_question: list[dict[str, Any]], metrics: dict[str, Any], qtype_metrics: dict[str, Any]) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    name = f"longmemeval_s_{ts}.json"
-    if args.tag:
-        name = f"longmemeval_s_{args.tag}_{ts}.json"
-    path = RESULTS_DIR / name
+# ---------------------------------------------------------------------------
+# Engine factory
+# ---------------------------------------------------------------------------
 
-    payload = {
-        "timestamp": ts,
-        "git_sha": _git_sha(),
-        "git_dirty": _git_dirty(),
-        "system_config": {
-            "recall_mode": args.recall_mode,
-            "rerank": bool(args.rerank),
-            "embedding_backend": args.backend,
-            "granularity": args.granularity,
-            "k": args.k,
-            "limit": args.limit,
-            "seed": args.seed,
-            "stratified": bool(args.stratified),
-            "use_hnsw": False,
-            "use_cpp": False,
-            "enable_colbert": bool(getattr(args, "enable_colbert", False)),
-            "colbert_weight": getattr(args, "colbert_weight", None),
-            "enable_dae": bool(getattr(args, "enable_dae", False)),
-            "dae_weight": getattr(args, "dae_weight", None),
-            "dae_self_weight": getattr(args, "dae_self_weight", None),
-            "dae_neighbour_k": getattr(args, "dae_neighbour_k", None),
-        },
-        "dataset": {
-            "name": "longmemeval_s",
-            "path": str(DATASET_PATH),
-            "sha256": dataset_hash() if DATASET_PATH.exists() else None,
-        },
-        "metrics": metrics,
-        "metrics_by_question_type": qtype_metrics,
-        "per_question": per_question,
-    }
-    path.write_text(json.dumps(payload, indent=2))
-    return path
+def _build_engine(args, db_path: str) -> Mazemaker:
+    if getattr(args, "enable_colbert", False):
+        os.environ["MM_COLBERT_ENABLED"] = "1"
+    if getattr(args, "enable_dae", False):
+        os.environ["MM_DAE_ENABLED"] = "1"
+    channel_weights = None
+    if getattr(args, "colbert_weight", None) is not None:
+        channel_weights = {"colbert": float(args.colbert_weight)}
+    if getattr(args, "dae_weight", None) is not None:
+        channel_weights = channel_weights or {}
+        channel_weights["dae"] = float(args.dae_weight)
+    # Audit fix (2026-05-11): the published 97.87% R@5 LME-S run had
+    # use_cpp=False, use_hnsw=False — Mazemaker's C++ kNN and HNSW
+    # were off entirely. Both are now ON; expect a small recall+ and
+    # a latency change. Rerank stays operator-controlled via --rerank
+    # because it has a real perf cost (~8s cold-start per recall).
+    return Mazemaker(
+        db_path=db_path,
+        embedding_backend=args.backend,
+        use_cpp=True,
+        retrieval_mode=args.recall_mode,
+        use_hnsw="auto",
+        lazy_graph=True,
+        think_engine="bfs",
+        rerank=args.rerank,
+        channel_weights=channel_weights,
+    )
+
+
+def run_question(args, record: dict[str, Any]) -> dict[str, Any]:
+    qid = record["question_id"]
+    question = record["question"]
+    gold_ids = set(record.get("answer_session_ids") or [])
+    is_abstention = qid.endswith("_abs")
+
+    # When PG backend is active, skip the SQLite temp file entirely.
+    # No tempdir, no bench.db, no "no such table: memories" GPU cache
+    # spam. PG handles everything.
+    backend = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
+    using_pg = (backend == "postgres")
+    td_ctx = None
+    if using_pg:
+        db = ""
+        nm = _build_engine(args, db)
+    else:
+        td_ctx = tempfile.TemporaryDirectory(prefix=f"lme-{qid[:8]}-")
+        td = td_ctx.__enter__()
+        db = str(Path(td) / "bench.db")
+        nm = _build_engine(args, db)
+    try:
+        t0 = time.perf_counter()
+        enable_chunks = getattr(args, "enable_chunks", False)
+        if args.granularity == "turn":
+            n_ingested = ingest_turn_level(nm, record)
+        else:
+            n_ingested = ingest_session_level(nm, record,
+                                              enable_chunks=enable_chunks)
+        ingest_ms = (time.perf_counter() - t0) * 1000.0
+
+        # AFE second-pass (4th dream phase): extract atomic facts from each
+        # long ingested session/chunk and add them as new memories with
+        # `supports` back-edges. Runs in the per-question ephemeral engine
+        # so the fact set is isolated to that question's haystack.
+        if getattr(args, "enable_afe", False):
+            try:
+                from dream_engine import DreamEngine
+                # AFE writes via the engine's _store_extracted_fact path;
+                # backend dispatch picks SQLite or DreamPostgresStore from env.
+                backend_choice = (os.environ.get("MM_DB_BACKEND") or "").strip().lower()
+                if backend_choice == "postgres":
+                    from dream_postgres_store import DreamPostgresStore
+                    _be = DreamPostgresStore()
+                else:
+                    from dream_engine import SQLiteDreamBackend
+                    _be = SQLiteDreamBackend(db)
+                _de = DreamEngine(_be, neural_memory=nm)
+                # Loop once — AFE processes up to MAZEMAKER_AFE_MAX_PER_CYCLE
+                # per call. For per-question corpora (50-200 sessions) one
+                # cycle is enough.
+                _de._phase_afe()
+            except Exception as _afe_err:
+                print(f"[lme-s] WARN: AFE phase failed for {qid}: {_afe_err}",
+                      file=sys.stderr, flush=True)
+
+        # DAE second-pass: per-question ephemeral engines need the
+        # memory_dae_embeddings table populated before recall can
+        # consult the channel.  Failures here must not abort the
+        # bench — log and continue with the primary embeddings.
+        if getattr(args, "enable_dae", False):
+            try:
+                from dae import dae_bulk_compute
+                dae_bulk_compute(
+                    nm,
+                    self_weight=float(args.dae_self_weight),
+                    neighbour_k=int(args.dae_neighbour_k),
+                )
+            except Exception as _dae_err:
+                print(f"[lme-s] WARN: dae_bulk_compute failed for "
+                      f"{qid}: {_dae_err}", file=sys.stderr, flush=True)
+
+        t1 = time.perf_counter()
+        recall_kwargs = dict(
+            k=args.k,
+            hybrid=(args.recall_mode in {"hybrid", "advanced", "skynet", "lean", "trim"}),
+            rerank=args.rerank,
+        )
+        if getattr(args, "enable_colbert", False):
+            recall_kwargs["enable_colbert"] = True
+        if getattr(args, "colbert_weight", None) is not None:
+            recall_kwargs["colbert_weight"] = float(args.colbert_weight)
+        if getattr(args, "enable_dae", False):
+            recall_kwargs["enable_dae"] = True
+        if getattr(args, "dae_weight", None) is not None:
+            recall_kwargs["dae_weight"] = float(args.dae_weight)
+        results = nm.recall(question, **recall_kwargs)
+        recall_ms = (time.perf_counter() - t1) * 1000.0
+
+        rank = rank_of_gold(results, gold_ids) if gold_ids else None
+        return {
+            "qid": qid,
+            "question_type": record.get("question_type"),
+            "is_abstention": is_abstention,
+            "n_ingested": n_ingested,
+            "n_results": len(results),
+            "gold_session_ids": sorted(gold_ids),
+            "rank_of_gold": rank,
+            "ingest_ms": round(ingest_ms, 2),
+            "latency_ms": round(recall_ms, 2),
+            "top_labels": [r.get("label", "") for r in results[: args.k]],
+        }
+    finally:
+        try:
+            nm.close()
+        except Exception:
+            pass
+        if td_ctx is not None:
+            try:
+                td_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 def aggregate_by_qtype(per_question: list[dict[str, Any]]) -> dict[str, Any]:
@@ -395,69 +508,108 @@ def select_records(records: list[dict[str, Any]], args) -> list[dict[str, Any]]:
         bucket: dict[str, list[dict[str, Any]]] = {}
         for r in records:
             bucket.setdefault(r.get("question_type", "unknown"), []).append(r)
-        total = len(records)
-        out: list[dict[str, Any]] = []
-        for qt, rows in bucket.items():
-            n_take = max(1, round(len(rows) / total * args.limit))
-            rng.shuffle(rows)
-            out.extend(rows[:n_take])
-        rng.shuffle(out)
-        return out[: args.limit]
-    if args.limit and args.limit < len(records):
+        selected: list[dict[str, Any]] = []
+        remaining = args.limit
+        qtypes = sorted(bucket.keys(), key=lambda qt: -len(bucket[qt]))
+        for i, qt in enumerate(qtypes):
+            pool = bucket[qt]
+            n = remaining if i == len(qtypes) - 1 else max(1, round(len(pool) / len(records) * args.limit))
+            n = min(n, len(pool), remaining)
+            rng.shuffle(pool)
+            selected.extend(pool[:n])
+            remaining -= n
+            if remaining <= 0:
+                break
+        rng.shuffle(selected)
+        return selected
+    elif args.limit:
         return records[: args.limit]
     return records
 
 
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_result(args, per_question, metrics, qtype_metrics) -> Path:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    tag = f"_{args.tag}" if args.tag else ""
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fname = f"longmemeval_s{tag}_{ts}.json"
+    path = RESULTS_DIR / fname
+
+    payload = {
+        "timestamp": ts,
+        "git_sha": _git_sha(),
+        "git_dirty": _git_dirty(),
+        "system_config": {
+            "recall_mode": args.recall_mode,
+            "rerank": args.rerank,
+            "embedding_backend": args.backend,
+            "granularity": args.granularity,
+            "k": args.k,
+            "limit": args.limit,
+            "use_hnsw": "auto",
+            "use_cpp": True,
+            "enable_colbert": bool(getattr(args, "enable_colbert", False)),
+            "colbert_weight": getattr(args, "colbert_weight", None),
+            "enable_dae": bool(getattr(args, "enable_dae", False)),
+            "dae_weight": getattr(args, "dae_weight", None),
+            "dae_self_weight": getattr(args, "dae_self_weight", None),
+            "dae_neighbour_k": getattr(args, "dae_neighbour_k", None),
+            "enable_afe": bool(getattr(args, "enable_afe", False)),
+            "enable_chunks": bool(getattr(args, "enable_chunks", False)),
+        },
+        "dataset": {
+            "name": "longmemeval_s",
+            "path": str(DATASET_PATH),
+            "sha256": dataset_hash(DATASET_PATH),
+        },
+        "metrics": metrics,
+        "metrics_by_question_type": qtype_metrics,
+        "per_question": per_question,
+    }
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="LongMemEval-S external harness")
+    p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--recall-mode", default="hybrid",
-                   choices=["semantic", "hybrid", "advanced", "skynet", "lean", "trim"],
-                   help="retrieval_mode passed to Mazemaker(...)")
-    p.add_argument("--rerank", action="store_true",
-                   help="Enable cross-encoder reranker on the head of recall")
-    p.add_argument("--backend", default="auto",
-                   help="Embedding backend: auto (BGE-M3 if available), hash (fast smoke), fastembed, ...")
+                    choices=["semantic", "hybrid", "advanced", "skynet", "lean", "trim"])
+    p.add_argument("--rerank", action="store_true", help="Enable cross-encoder reranker")
+    p.add_argument("--backend", default="auto", help="Embedding backend")
     p.add_argument("--granularity", default="session", choices=["session", "turn"])
-    p.add_argument("-k", "--k", type=int, default=10)
-    p.add_argument("--limit", type=int, default=0,
-                   help="Optional cap on number of questions (0 = all)")
-    p.add_argument("--stratified", action="store_true",
-                   help="When --limit < N, sample proportionally per question_type")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--tag", default="", help="Optional tag prefix on the result filename")
-    p.add_argument("--dataset", default=str(DATASET_PATH))
+    p.add_argument("-k", type=int, default=10, help="Top-k cutoff")
+    p.add_argument("--limit", type=int, default=0, help="Max questions (0 = all)")
+    p.add_argument("--stratified", action="store_true", help="Stratified sample when --limit is set")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for stratified sampling")
+    p.add_argument("--tag", default="", help="Tag for output filename")
+    p.add_argument("--enable-colbert", action="store_true")
+    p.add_argument("--colbert-weight", type=float, default=None)
+    p.add_argument("--enable-dae", action="store_true")
+    p.add_argument("--dae-weight", type=float, default=None)
+    p.add_argument("--dae-self-weight", type=float, default=0.4)
+    p.add_argument("--dae-neighbour-k", type=int, default=20)
+    p.add_argument("--enable-afe", action="store_true",
+                   help="4th dream phase — extract atomic facts from each "
+                        "ingested session/chunk before recall. Each fact becomes "
+                        "a new memory linked back to source via `supports` edge.")
+    p.add_argument("--enable-chunks", action="store_true",
+                   help="Split each haystack session into 2000-char windows "
+                        "with 200-char overlap before ingest (session-granularity "
+                        "only; ignored under --granularity turn). Labels become "
+                        "session:<sid>::chunk::<n>.")
     p.add_argument("--quiet", action="store_true")
-    # ColBERT-style late-interaction rerank. Default OFF so existing
-    # baseline numbers don't shift unintentionally; flip on via
-    # --enable-colbert. The flag also flips MM_COLBERT_ENABLED=1 so the
-    # per-question ingest actually populates the token-cache the rerank
-    # reads from.
-    p.add_argument("--enable-colbert", action="store_true",
-                   help="Enable ColBERT late-interaction rerank channel")
-    p.add_argument("--colbert-weight", type=float, default=None,
-                   help="Override colbert channel weight (default: preset-driven; "
-                        "skynet=1.2, advanced/hybrid=0.5, lean/trim/semantic=0)")
-    # Dream-Augmented Embeddings (DAE) opt-in. Default OFF — the DAE
-    # channel weight defaults to 0.0 in memory_client even when the
-    # Pro license gate is on, so existing baselines are unchanged.
-    # --enable-dae flips MM_DAE_ENABLED=1 (mirroring the ColBERT env
-    # flip) and the harness calls dae_bulk_compute() between ingest
-    # and recall on each ephemeral per-question SQLite.
-    p.add_argument("--enable-dae", action="store_true",
-                   help="Enable Dream-Augmented Embeddings second-pass channel")
-    p.add_argument("--dae-weight", type=float, default=None,
-                   help="Override dae channel weight (default 0.0 = off)")
-    p.add_argument("--dae-self-weight", type=float, default=0.4,
-                   help="DAE self-vs-neighbour mix (0=pure neighbours, 1=identity)")
-    p.add_argument("--dae-neighbour-k", type=int, default=20,
-                   help="Top-k neighbours for the DAE PPR-weighted mean")
     args = p.parse_args()
 
-    records = load_dataset(Path(args.dataset))
+    records = load_dataset(DATASET_PATH, variant="s")
     selected = select_records(records, args)
+
+    print(f"[lme-s] dataset={DATASET_PATH.name} total={len(records)} selected={len(selected)}", flush=True)
     if not args.quiet:
-        print(f"[lme-s] dataset={Path(args.dataset).name} total={len(records)} selected={len(selected)}", flush=True)
-        print(f"[lme-s] config: recall_mode={args.recall_mode} rerank={args.rerank} backend={args.backend} "
+        print(f"[lme-s] config: recall_mode={args.recall_mode} "
+              f"rerank={args.rerank} backend={args.backend} "
               f"granularity={args.granularity} k={args.k}", flush=True)
         print(f"[lme-s] type counts (selected): {question_types(selected)}", flush=True)
 
