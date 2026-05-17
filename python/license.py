@@ -187,7 +187,8 @@ def _features_for_tier(tier: str, backend: str) -> frozenset:
     if tier not in PRO_TIERS:
         return frozenset()
 
-    feats = {"colbert", "rem", "insight", "architect", "dream_worker", "dae"}
+    feats = {"colbert", "rem", "insight", "architect",
+             "dream_worker", "dae", "synthesis"}
     if backend == "postgres":
         feats.add("postgres")
     return frozenset(feats)
@@ -366,6 +367,18 @@ def get_license() -> License:
     global _loaded
     if _loaded is None:
         _loaded = load_license()
+    return _loaded
+
+
+def reload_license() -> License:
+    """Force a re-read of the license file. Used after an in-place
+    license upgrade so the running process picks up the new tier
+    without a process restart. The previous module-singleton API only
+    loaded once, so a freshly-activated Pro feature stayed gated until
+    the next restart.
+    """
+    global _loaded
+    _loaded = load_license()
     return _loaded
 
 

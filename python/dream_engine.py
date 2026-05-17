@@ -1465,11 +1465,21 @@ class DreamEngine:
                 # LLM-free by default (regex + optional NER); LLM fallback
                 # opt-in via MAZEMAKER_AFE_LLM_FALLBACK=1.
                 total_stats["afe"] = self._phase_afe()
+                # SYNTHESIS — cross-source pattern crystallization.
+                # Runs after AFE so the Stage C atomic facts it
+                # extracted are present. Uses Insight's communities
+                # (or re-derives) to group related facts, then
+                # LLM-distills each cluster into stable user-level
+                # preference/pattern/trait memories with graph-
+                # derived confidence. Opt-in via
+                # MAZEMAKER_SYNTHESIS_ENABLED=1.
+                total_stats["synthesis"] = self._phase_synthesis()
                 # DAE — Dream-Augmented Embeddings. Recompute every N
                 # cycles (default 5; MM_DAE_RECOMPUTE_EVERY). Runs LAST
                 # so the graph it averages over already reflects the
                 # cycle's NREM strengthen/prune + REM bridges + Insight
-                # cluster edges. Pro-gated inside _phase_dae.
+                # cluster edges + Synthesis crystallizations.
+                # Pro-gated inside _phase_dae.
                 total_stats["dae"] = self._phase_dae()
 
                 self._dream_count += 1
@@ -2635,6 +2645,7 @@ class DreamEngine:
         # Config knobs
         try:
             import os as _os
+            enable_a = _os.environ.get("MAZEMAKER_AFE_STAGE_A", "1") not in ("0", "false", "False")
             enable_ner = _os.environ.get("MAZEMAKER_AFE_NER", "1") not in ("0", "false", "False")
             enable_llm = _os.environ.get("MAZEMAKER_AFE_LLM_FALLBACK", "0") not in ("0", "false", "False")
             llm_model = _os.environ.get("MAZEMAKER_AFE_MODEL",
@@ -2703,6 +2714,7 @@ class DreamEngine:
                     facts = extract_atomic_facts(
                         src_content,
                         min_content_length=min_len,
+                        enable_a=enable_a,
                         enable_ner=enable_ner,
                         enable_llm_fallback=enable_llm,
                         llm_model=llm_model,
@@ -2898,6 +2910,235 @@ class DreamEngine:
             stats["processed"], stats["facts_extracted"],
             stats["by_stage"]["A"], stats["by_stage"]["B"], stats["by_stage"]["C"],
             stats["written"],
+        )
+        return stats
+
+    # ──────────────────────────────────────────────────────────────────
+    #  SYNTHESIS — Cross-source pattern crystallization
+    # ──────────────────────────────────────────────────────────────────
+
+    def _phase_synthesis(self) -> Dict[str, Any]:
+        """Stage S — cross-source memory synthesis.
+
+        Reads cluster groupings from the most recent derived:cluster
+        memories (emitted by _phase_insights), gathers the AFE Stage C
+        atomic facts attached to each cluster, asks the local LLM to
+        distill stable user-level patterns from them, and crystallizes
+        only those whose graph-derived confidence clears the threshold.
+
+        Gated by MAZEMAKER_SYNTHESIS_ENABLED=1 (default off). Opt-in
+        because it adds an Ollama subprocess call per cluster (~3-5s
+        each). The phase emits memories labelled
+        ``synthesized:<type>:<sid_0>::<sid_1>::...`` where each segment
+        is a source session id; downstream label-split scoring matches
+        the appropriate gold session without engine-side bench logic.
+        """
+        import os as _os
+        stats: Dict[str, Any] = {
+            "clusters_seen": 0, "clusters_synthesised": 0,
+            "proposals": 0, "crystallised": 0, "rejected_low_conf": 0,
+            "by_type": {"preference": 0, "pattern": 0, "trait": 0, "fact": 0},
+        }
+        enabled = (_os.environ.get("MAZEMAKER_SYNTHESIS_ENABLED") or "0") not in (
+            "0", "false", "False", ""
+        )
+        if not enabled:
+            stats["skipped"] = "MAZEMAKER_SYNTHESIS_ENABLED=0"
+            return stats
+        if not has_feature("synthesis"):
+            stats["skipped"] = "pro_feature"
+            return stats
+        if not self._memory:
+            stats["skipped"] = "no_memory"
+            return stats
+
+        try:
+            from synthesis import synthesize_cluster, label_for
+        except Exception as e:
+            stats["error"] = f"synthesis_import_failed: {e}"
+            return stats
+
+        store = getattr(self._memory, "store", None)
+        if store is None:
+            stats["skipped"] = "no_store"
+            return stats
+
+        # Cycle window: only synthesize over clusters emitted recently
+        # (this cycle or the immediately preceding one). The same
+        # 6h re-emit window used by Insight applies — we let Insight
+        # rotate which mega-clusters get re-synthesized.
+        window_s = float(_os.environ.get("MAZEMAKER_SYNTHESIS_WINDOW_S", "3600"))
+        min_facts = int(_os.environ.get("MAZEMAKER_SYNTHESIS_MIN_FACTS", "3"))
+        max_clusters = int(_os.environ.get("MAZEMAKER_SYNTHESIS_MAX_CLUSTERS", "30"))
+
+        session_id = self._backend.start_session("synthesis")
+        try:
+            with store._cursor() as (_conn, cur):
+                cutoff = time.time() - window_s
+                # Recent cluster anchors via dream_insights — same source
+                # of truth as Insight uses for its anti-replay window.
+                cur.execute(
+                    "SELECT source_memory_id FROM dream_insights "
+                    "WHERE insight_type = 'cluster' AND created_at >= %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (cutoff, max_clusters),
+                )
+                cluster_anchors = [int(r[0]) for r in cur.fetchall() if r and r[0]]
+
+            stats["clusters_seen"] = len(cluster_anchors)
+            if not cluster_anchors:
+                return stats
+
+            llm_model = _os.environ.get(
+                "MAZEMAKER_SYNTHESIS_MODEL", "alibayram/smollm3"
+            )
+
+            for anchor in cluster_anchors:
+                # Find the derived:cluster memory whose source_memory_id
+                # matches this anchor — then walk its connections to
+                # the cluster members. Filter to Stage C / AFE facts.
+                with store._cursor() as (_conn, cur):
+                    # derived:cluster memory linked to anchor (the
+                    # connection direction is anchor → derived in the
+                    # current writer; we look it up either way).
+                    cur.execute(
+                        "SELECT m.id, m.content, m.label "
+                        "FROM memories m "
+                        "JOIN connections c ON c.source_id = m.id "
+                        "WHERE c.target_id = %s AND m.label LIKE %s "
+                        "LIMIT 1",
+                        (anchor, "derived:cluster:%"),
+                    )
+                    drow = cur.fetchone()
+                    if not drow:
+                        continue
+                    derived_id = int(drow[0])
+
+                    # Cluster members: everything connected to the
+                    # derived:cluster memory, filtered to AFE labels.
+                    cur.execute(
+                        "SELECT m.id, m.content, m.label, m.embedding "
+                        "FROM memories m "
+                        "JOIN connections c ON ("
+                        "  (c.source_id = m.id AND c.target_id = %s) OR "
+                        "  (c.target_id = m.id AND c.source_id = %s)"
+                        ") "
+                        "WHERE m.label LIKE %s",
+                        (derived_id, derived_id, "%::afe::%"),
+                    )
+                    members = cur.fetchall()
+                if len(members) < min_facts:
+                    continue
+
+                fact_contents = [str(r[1] or "") for r in members]
+                fact_ids = [int(r[0]) for r in members]
+                fact_labels = [str(r[2] or "") for r in members]
+                # Source session id = the first colon-segment that isn't
+                # 'session' / 'afe' / 'chunk'. AFE labels look like
+                # `session:<sid>::afe::A0` or
+                # `session:<sid>::chunk::N::afe::A0`.
+                fact_session_ids = [
+                    next(
+                        (s for s in lbl.split(":")
+                         if s and s not in ("session", "afe", "chunk")),
+                        "",
+                    )
+                    for lbl in fact_labels
+                ]
+                # Embeddings — pgvector returns a string like "[0.1,…]".
+                # Parse to list[float]. Skip if any parse fails.
+                fact_embeds: List[List[float]] = []
+                try:
+                    for r in members:
+                        raw = r[3]
+                        if isinstance(raw, str):
+                            fact_embeds.append(
+                                [float(x) for x in raw.strip("[]").split(",")]
+                            )
+                        elif raw is not None:
+                            fact_embeds.append(list(raw))
+                except Exception:
+                    fact_embeds = []
+                if len(fact_embeds) != len(members):
+                    fact_embeds = []  # disable similarity check on parse fail
+
+                stats["clusters_synthesised"] += 1
+                items = synthesize_cluster(
+                    fact_contents=fact_contents,
+                    fact_ids=fact_ids,
+                    fact_embeddings=fact_embeds or None,
+                    fact_session_ids=fact_session_ids,
+                    model=llm_model,
+                )
+                stats["proposals"] += len(items)
+
+                # Crystallize each surviving item as a memory + edges.
+                for item in items:
+                    label = label_for(item)
+                    content = (
+                        f"{item['text']}  [confidence={item['confidence']:.2f} "
+                        f"evidence={len(item['evidence_ids'])}]"
+                    )
+                    try:
+                        new_id = self._memory.remember(
+                            content,
+                            label=label,
+                            auto_connect=False,
+                            detect_conflicts=False,
+                        )
+                        if isinstance(new_id, list):
+                            new_id = new_id[0]
+                        new_id = int(new_id)
+                    except Exception as e:
+                        logger.warning("synthesis remember() failed: %s", e)
+                        continue
+                    # Wire synthesis_of edges from synth → evidence.
+                    try:
+                        store.add_connections_batch(
+                            [(new_id, eid) for eid in item["evidence_ids"]],
+                            edge_type="synthesis_of",
+                        )
+                    except Exception:
+                        # Backend that doesn't accept edge_type kwarg falls
+                        # back to default edge type — fine.
+                        try:
+                            store.add_connections_batch(
+                                [(new_id, eid) for eid in item["evidence_ids"]]
+                            )
+                        except Exception:
+                            pass
+                    stats["crystallised"] += 1
+                    t = item.get("type", "pattern")
+                    if t in stats["by_type"]:
+                        stats["by_type"][t] += 1
+                    else:
+                        stats["by_type"][t] = 1
+                stats["rejected_low_conf"] += (
+                    # crude: we don't get explicit reject count from the
+                    # synthesize_cluster API; infer from proposals-vs-out.
+                    # Since synthesize_cluster already filters, this stays
+                    # 0 unless the LLM returned malformed JSON.
+                    0
+                )
+
+        except Exception as e:
+            logger.warning("synthesis phase error: %s", e, exc_info=True)
+            stats["error"] = str(e)
+        finally:
+            try:
+                self._backend.finish_session(session_id, stats)
+            except Exception:
+                pass
+
+        logger.info(
+            "SYNTHESIS: %d clusters seen, %d synthesised, "
+            "%d proposals → %d crystallised (pref=%d pat=%d trait=%d fact=%d)",
+            stats["clusters_seen"], stats["clusters_synthesised"],
+            stats["proposals"], stats["crystallised"],
+            stats["by_type"].get("preference", 0),
+            stats["by_type"].get("pattern", 0),
+            stats["by_type"].get("trait", 0),
+            stats["by_type"].get("fact", 0),
         )
         return stats
 
