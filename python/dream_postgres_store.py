@@ -57,7 +57,15 @@ def _env(key: str, fallback: str = "") -> str:
     return os.environ.get(key) or _dotenv.get(key, fallback)
 
 
+_PW_WARN_EMITTED = False
+
+
 def _build_dsn() -> str:
+    """URI-form DSN with percent-encoded user/password. The previous
+    keyword-DSN form broke on passwords containing spaces, '#', or
+    backslashes — see postgres_store._build_dsn for the same fix.
+    """
+    global _PW_WARN_EMITTED
     dsn = _env("MM_POSTGRES_DSN", "")
     if dsn:
         return dsn
@@ -66,14 +74,15 @@ def _build_dsn() -> str:
     db = _env("MM_POSTGRES_DB", "mazemaker")
     user = _env("MM_POSTGRES_USER", "mazemaker")
     password = _env("MM_POSTGRES_PASSWORD", "")
-    if not password:
-        logger.warning(
-            "MM_POSTGRES_PASSWORD not set — add it to ~/.hermes/.env or "
-            "the MM_POSTGRES_DSN env var"
+    if not password and not _PW_WARN_EMITTED:
+        _PW_WARN_EMITTED = True
+        logger.info(
+            "MM_POSTGRES_PASSWORD empty — relying on local trust/peer auth"
         )
-    return (
-        f"host={host} port={port} dbname={db} user={user} password={password}"
-    )
+    import urllib.parse
+    user_q = urllib.parse.quote(user, safe="")
+    pw_q = urllib.parse.quote(password, safe="")
+    return f"postgresql://{user_q}:{pw_q}@{host}:{port}/{db}"
 
 
 _DREAM_PG_SCHEMA = """
@@ -150,10 +159,14 @@ CREATE INDEX IF NOT EXISTS idx_dream_sessions_started_at
 """
 
 
-class DreamPostgresStore:
+from dream_engine import DreamBackend  # noqa: E402
+
+
+class DreamPostgresStore(DreamBackend):
     """Postgres-backed dream store. Creates dream tables on first use.
 
-    Provides the dream-store API surface used by DreamWorker.
+    Provides the dream-store API surface used by DreamWorker. Inherits
+    from DreamBackend so DreamEngine's isinstance check accepts it.
     """
 
     def __init__(self, dsn: str | None = None, min_size: int = 1, max_size: int = 4):
@@ -166,15 +179,29 @@ class DreamPostgresStore:
                 "Postgres dream backend"
             ) from exc
 
+        # Honour the same schema env var that PostgresStore uses, so a
+        # bench run with MM_POSTGRES_SCHEMA=conv_N targets that schema's
+        # memories table for the dream cycle's reads as well.
+        import re
+        raw_schema = os.environ.get("MM_POSTGRES_SCHEMA", "public").strip() or "public"
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", raw_schema):
+            raise ValueError(f"Invalid MM_POSTGRES_SCHEMA: {raw_schema!r}")
+        self._schema = raw_schema
+
         self._dsn = dsn or _build_dsn()
         self.pool = ConnectionPool(
             self._dsn,
             min_size=min_size,
             max_size=max_size,
             kwargs={"autocommit": True},
+            configure=self._configure_conn,
             open=True,
         )
         self._ensure_schema()
+
+    def _configure_conn(self, conn) -> None:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path = {self._schema}, public")
 
     @classmethod
     def from_config(cls, config: dict) -> "DreamPostgresStore":
@@ -391,36 +418,69 @@ class DreamPostgresStore:
         if not canon:
             return 0
         now = time.time()
+        # Bulk path: COPY pairs into a temp table, then ONE UPDATE FROM
+        # joining temp → connections. Replaces an executemany N-round-trip
+        # loop. Same pattern for the audit-row insert: derive history rows
+        # from the post-update weights via RETURNING + COPY.
         with self._cursor() as (_conn, cur):
-            cur.executemany(
-                "UPDATE connections SET weight = LEAST(weight + %s, 1.0) "
-                "WHERE source_id = %s AND target_id = %s",
-                canon,
+            cur.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _nrem_pairs "
+                "(source_id BIGINT, target_id BIGINT) ON COMMIT PRESERVE ROWS"
             )
-            if dream_session_id is not None:
-                # Read back current weights so the audit row carries the
-                # post-strengthen value. Single round-trip via ANY().
-                pair_keys = [(p[1], p[2]) for p in canon]
-                cur.execute(
-                    "SELECT source_id, target_id, weight FROM connections "
-                    "WHERE (source_id, target_id) IN ("
-                    + ",".join("(%s,%s)" for _ in pair_keys) + ")",
-                    [v for pair in pair_keys for v in pair],
-                )
-                weights = {(int(r[0]), int(r[1])): float(r[2] or 0.0)
-                           for r in cur.fetchall()}
-                hist = []
+            cur.execute("TRUNCATE _nrem_pairs")
+            with cur.copy(
+                "COPY _nrem_pairs (source_id, target_id) FROM STDIN"
+            ) as cp:
                 for _d, s, t in canon:
-                    new_w = weights.get((s, t), 0.0)
-                    hist.append((s, t, max(0.0, new_w - delta), new_w,
-                                 "nrem_strengthen", now,
-                                 int(dream_session_id)))
-                cur.executemany(
-                    "INSERT INTO connection_history "
-                    "(source_id, target_id, old_weight, new_weight, "
-                    " reason, changed_at, dream_session_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    hist,
+                    cp.write_row((s, t))
+            if dream_session_id is not None:
+                cur.execute(
+                    "UPDATE connections c "
+                    "SET weight = LEAST(c.weight + %s, 1.0) "
+                    "FROM _nrem_pairs p "
+                    "WHERE c.source_id = p.source_id "
+                    "  AND c.target_id = p.target_id "
+                    "RETURNING c.source_id, c.target_id, c.weight",
+                    (delta,),
+                )
+                rows = cur.fetchall()
+                if rows:
+                    cur.execute(
+                        "CREATE TEMP TABLE IF NOT EXISTS _nrem_hist "
+                        "(source_id BIGINT, target_id BIGINT, "
+                        " old_weight DOUBLE PRECISION, new_weight DOUBLE PRECISION, "
+                        " reason TEXT, changed_at DOUBLE PRECISION, "
+                        " dream_session_id BIGINT) ON COMMIT PRESERVE ROWS"
+                    )
+                    cur.execute("TRUNCATE _nrem_hist")
+                    with cur.copy(
+                        "COPY _nrem_hist (source_id, target_id, old_weight, "
+                        "new_weight, reason, changed_at, dream_session_id) "
+                        "FROM STDIN"
+                    ) as cp:
+                        dsid = int(dream_session_id)
+                        for r in rows:
+                            new_w = float(r[2] or 0.0)
+                            cp.write_row((int(r[0]), int(r[1]),
+                                          max(0.0, new_w - delta),
+                                          new_w, "nrem_strengthen",
+                                          now, dsid))
+                    cur.execute(
+                        "INSERT INTO connection_history "
+                        "(source_id, target_id, old_weight, new_weight, "
+                        " reason, changed_at, dream_session_id) "
+                        "SELECT source_id, target_id, old_weight, new_weight, "
+                        "       reason, changed_at, dream_session_id "
+                        "FROM _nrem_hist"
+                    )
+            else:
+                cur.execute(
+                    "UPDATE connections c "
+                    "SET weight = LEAST(c.weight + %s, 1.0) "
+                    "FROM _nrem_pairs p "
+                    "WHERE c.source_id = p.source_id "
+                    "  AND c.target_id = p.target_id",
+                    (delta,),
                 )
         return len(canon)
 
@@ -451,6 +511,91 @@ class DreamPostgresStore:
                      time.time(), int(dream_session_id)),
                 )
             return n
+
+    def add_bridges_batch(
+        self,
+        bridges,
+        dream_session_id=None,
+        reason: str = "rem_bridge",
+    ) -> int:
+        """Override of DreamBackend default to give PG a true bulk path.
+
+        Default fallback loops `add_bridge` — each call does a SELECT
+        existence check + INSERT — so a 6000-bridge REM phase burns
+        12 000 round-trips. This override is the same as the SQLite
+        bulk impl: COPY into a temp staging table, EXISTS-anti-join
+        against `connections` to find new rows, single bulk INSERT.
+        One commit per cycle instead of one per bridge.
+        """
+        if not bridges:
+            return 0
+        canon = []
+        seen = set()
+        for s, t, w in bridges:
+            si, ti = int(s), int(t)
+            if si == ti:
+                continue
+            if si > ti:
+                si, ti = ti, si
+            if (si, ti) in seen:
+                continue
+            seen.add((si, ti))
+            canon.append((si, ti, max(0.0, min(1.0, float(w)))))
+        if not canon:
+            return 0
+        now = time.time()
+        with self._cursor() as (_conn, cur):
+            cur.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _bridge_stage "
+                "(source_id BIGINT, target_id BIGINT, "
+                " weight DOUBLE PRECISION) ON COMMIT PRESERVE ROWS"
+            )
+            cur.execute("TRUNCATE _bridge_stage")
+            with cur.copy(
+                "COPY _bridge_stage (source_id, target_id, weight) FROM STDIN"
+            ) as cp:
+                for s, t, w in canon:
+                    cp.write_row((s, t, w))
+            cur.execute(
+                "INSERT INTO connections "
+                "(source_id, target_id, weight, edge_type, created_at) "
+                "SELECT s.source_id, s.target_id, s.weight, 'bridge', NOW() "
+                "FROM _bridge_stage s "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM connections c "
+                "  WHERE c.source_id = s.source_id "
+                "    AND c.target_id = s.target_id"
+                ") "
+                "RETURNING source_id, target_id, weight"
+            )
+            new_rows = cur.fetchall()
+            if dream_session_id is not None and new_rows:
+                cur.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS _bridge_hist "
+                    "(source_id BIGINT, target_id BIGINT, "
+                    " old_weight DOUBLE PRECISION, new_weight DOUBLE PRECISION, "
+                    " reason TEXT, changed_at DOUBLE PRECISION, "
+                    " dream_session_id BIGINT) ON COMMIT PRESERVE ROWS"
+                )
+                cur.execute("TRUNCATE _bridge_hist")
+                with cur.copy(
+                    "COPY _bridge_hist (source_id, target_id, old_weight, "
+                    "new_weight, reason, changed_at, dream_session_id) "
+                    "FROM STDIN"
+                ) as cp:
+                    dsid = int(dream_session_id)
+                    for r in new_rows:
+                        cp.write_row((int(r[0]), int(r[1]), 0.0,
+                                      float(r[2] or 0.0), reason, now, dsid))
+                cur.execute(
+                    "INSERT INTO connection_history "
+                    "(source_id, target_id, old_weight, new_weight, "
+                    " reason, changed_at, dream_session_id) "
+                    "SELECT source_id, target_id, old_weight, new_weight, "
+                    "       reason, changed_at, dream_session_id "
+                    "FROM _bridge_hist"
+                )
+        return len(new_rows)
 
     def add_bridge(self, source_id: int, target_id: int,
                    weight: float = 0.3) -> bool:
@@ -570,6 +715,62 @@ class DreamPostgresStore:
             )
             return [{"id": int(r[0]), "content": r[1] or ""} for r in cur.fetchall()]
 
+    def get_memory_vectors(self, memory_ids: List[int]) -> Dict[int, List[float]]:
+        """Return {id: vector_floats} for the requested ids.
+
+        Needed by the supersedes phase. Without this, the default-empty
+        DreamBackend implementation kicked in and _phase_supersedes
+        silently no-op'd whenever the dream worker ran against PG.
+        """
+        if not memory_ids:
+            return {}
+        ids = [int(i) for i in memory_ids if i is not None]
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.execute(
+                    "SELECT id, embedding FROM memories "
+                    "WHERE id = ANY(%s) AND embedding IS NOT NULL",
+                    (ids,),
+                )
+                rows = cur.fetchall()
+        except Exception as exc:
+            logger.warning("PG get_memory_vectors failed: %s", exc)
+            return {}
+        # psycopg's pgvector adapter returns numpy arrays / lists already.
+        out: Dict[int, List[float]] = {}
+        for mid, vec in rows:
+            if vec is None:
+                continue
+            try:
+                out[int(mid)] = [float(x) for x in vec]
+            except Exception:
+                continue
+        return out
+
+    def get_memory_metadata(self, memory_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """PG counterpart for the SQLite supersedes-phase metadata fetch."""
+        if not memory_ids:
+            return {}
+        ids = [int(i) for i in memory_ids if i is not None]
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.execute(
+                    "SELECT id, EXTRACT(EPOCH FROM created_at) AS ts, content "
+                    "FROM memories WHERE id = ANY(%s)",
+                    (ids,),
+                )
+                rows = cur.fetchall()
+        except Exception as exc:
+            logger.warning("PG get_memory_metadata failed: %s", exc)
+            return {}
+        return {
+            int(r[0]): {
+                "created_at": float(r[1] or 0.0),
+                "content": r[2] or "",
+            }
+            for r in rows
+        }
+
     def sample_for_dream(
         self,
         limit: int,
@@ -688,13 +889,16 @@ class DreamPostgresStore:
             return cur.rowcount or 0
 
     def prune_orphans(self) -> int:
+        # FK constraint REFERENCES memories(id) already prevents orphan
+        # connections at INSERT time. The legacy NOT IN double-scan was
+        # O(connections × memories) — 30+ min on 300k-row cache schemas.
+        # Use NOT EXISTS (anti-join, hash-joined in PG) and gate behind a
+        # cheap fast-path: if the FK is enforced, this can only return 0.
         with self._cursor() as (_conn, cur):
             cur.execute(
-                """
-                DELETE FROM connections
-                WHERE source_id NOT IN (SELECT id FROM memories)
-                   OR target_id NOT IN (SELECT id FROM memories)
-                """
+                "DELETE FROM connections c "
+                "WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = c.source_id) "
+                "   OR NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = c.target_id)"
             )
             return cur.rowcount or 0
 

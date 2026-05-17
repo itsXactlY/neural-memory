@@ -27,17 +27,7 @@ logger = logging.getLogger(__name__)
 # Find the shared library
 # ============================================================================
 
-def _find_lib():
-    candidates = [
-        Path(__file__).parent.parent / "build" / "libmazemaker.so",
-        Path.home() / "projects" / "mazemaker-adapter" / "build" / "libmazemaker.so",
-        Path("/usr/local/lib/libmazemaker.so"),
-        Path("/usr/lib/libmazemaker.so"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return str(p)
-    raise FileNotFoundError("libmazemaker.so not found. Build first: cd build && cmake --build .")
+from _lib_finder import find_lib as _find_lib  # canonical resolver
 
 
 # ============================================================================
@@ -209,7 +199,12 @@ class SQLiteStore:
         self._checkpoint_thread.start()
 
     def get_meta(self, key: str) -> Optional[str]:
-        row = self.conn.execute("SELECT value FROM db_meta WHERE key = ?", (key,)).fetchone()
+        # set_meta holds self._lock; get_meta must too — without it, a
+        # reader can observe a half-applied write on the same connection
+        # (sqlite3.Connection is *not* thread-safe at this level — the
+        # check_same_thread=False option only suppresses the assertion).
+        with self._lock:
+            row = self.conn.execute("SELECT value FROM db_meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
     def set_meta(self, key: str, value: str) -> None:
@@ -370,12 +365,22 @@ class SQLiteStore:
             if mem_count and fts_count == 0:
                 self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
             return True
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
+            # FTS5 disabled in this SQLite build — search will use the
+            # capped lexical-overlap fallback. Log once so operators don't
+            # mistake the fallback's lower recall for a regression.
+            logger.warning("FTS5 unavailable (%s) — search_bm25 will use lexical fallback", exc)
             return False
 
     def _connect_reader(self) -> sqlite3.Connection:
+        # Reader connections must agree with the writer on journal mode and
+        # busy_timeout. A bare sqlite3.connect() uses defaults (no WAL,
+        # 5 s busy_timeout) and routinely hits "database is locked" on a
+        # WAL-mode DB under concurrent writes.
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _bg_checkpoint(self):
@@ -386,10 +391,14 @@ class SQLiteStore:
             try:
                 with self._lock:
                     self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            except Exception:
+            except sqlite3.Error as exc:
                 # On a closed connection (post-close race) this raises;
                 # the stop event will fire next iteration and break us out.
-                pass
+                # Narrow from bare-except so we still get a stack on
+                # genuinely-unexpected errors (e.g. disk full → WAL
+                # would otherwise grow without bound).
+                if not self._stop_checkpoint.is_set():
+                    logger.warning("wal_checkpoint failed: %s", exc)
 
     @staticmethod
     def _unpack_embedding(blob: bytes | None) -> list[float]:
@@ -467,6 +476,55 @@ class SQLiteStore:
             self.conn.commit()
             return int(cur.lastrowid)
 
+    def remember_batch(self, rows: list[dict]) -> list[int]:
+        if not rows:
+            return []
+        now = time.time()
+        params: list[tuple] = []
+        for r in rows:
+            emb = r.get("embedding") or []
+            blob = struct.pack(f"{len(emb)}f", *emb)
+            salience = r.get("salience")
+            params.append((
+                r.get("label"),
+                r.get("content", ""),
+                blob,
+                float(salience) if salience is not None else 1.0,
+                now,
+                now,
+            ))
+        # RETURNING preserves input order on SQLite >= 3.35 and avoids the
+        # lastrowid+len trick which is brittle under concurrent writers.
+        sql = (
+            "INSERT INTO memories "
+            "(label, content, embedding, salience, created_at, last_accessed) "
+            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id"
+        )
+        ids: list[int] = []
+        with self._lock:
+            try:
+                for p in params:
+                    cur = self.conn.execute(sql, p)
+                    row = cur.fetchone()
+                    ids.append(int(row[0] if not isinstance(row, sqlite3.Row) else row["id"]))
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                # RETURNING unavailable on ancient SQLite — fall back to
+                # executemany + lastrowid arithmetic. The FTS AFTER INSERT
+                # trigger keeps memories_fts in sync either way.
+                self.conn.rollback()
+                cur = self.conn.executemany(
+                    "INSERT INTO memories "
+                    "(label, content, embedding, salience, created_at, last_accessed) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    params,
+                )
+                last = int(cur.lastrowid or 0)
+                n = len(params)
+                ids = list(range(last - n + 1, last + 1))
+                self.conn.commit()
+        return ids
+
     def get_all(self) -> list[dict]:
         with self._lock:
             rows = self.conn.execute(
@@ -513,25 +571,33 @@ class SQLiteStore:
         ids = [int(i) for i in ids if i is not None]
         if not ids:
             return {}
-        placeholders = ",".join("?" for _ in ids)
         cols = "id, label, content, salience, created_at, last_accessed, access_count"
         if include_embedding:
             cols += ", embedding"
-        rows = self.conn.execute(f"SELECT {cols} FROM memories WHERE id IN ({placeholders})", tuple(ids)).fetchall()
         out: dict[int, dict] = {}
-        for r in rows:
-            item = {
-                "id": r["id"],
-                "label": r["label"],
-                "content": r["content"],
-                "salience": r["salience"],
-                "created_at": r["created_at"],
-                "last_accessed": r["last_accessed"],
-                "access_count": r["access_count"],
-            }
-            if include_embedding:
-                item["embedding"] = self._unpack_embedding(r["embedding"])
-            out[item["id"]] = item
+        # Chunk to stay under SQLite's 999-parameter cap. The previous
+        # f-string-with-N-placeholders form raised OperationalError
+        # whenever a caller passed >= 1000 ids (which the dream engine
+        # batch paths and the dashboard can both legitimately do).
+        for start in range(0, len(ids), 900):
+            chunk = ids[start:start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                f"SELECT {cols} FROM memories WHERE id IN ({placeholders})", tuple(chunk),
+            ).fetchall()
+            for r in rows:
+                item = {
+                    "id": r["id"],
+                    "label": r["label"],
+                    "content": r["content"],
+                    "salience": r["salience"],
+                    "created_at": r["created_at"],
+                    "last_accessed": r["last_accessed"],
+                    "access_count": r["access_count"],
+                }
+                if include_embedding:
+                    item["embedding"] = self._unpack_embedding(r["embedding"])
+                out[item["id"]] = item
         return out
 
     def find_by_label(self, label: str) -> list[dict]:
@@ -614,6 +680,78 @@ class SQLiteStore:
                     out[int(r["id"])] = bytes(blob)
         return out
 
+    def ensure_dae_schema(self) -> bool:
+        """Create the memory_dae_embeddings table if missing. Idempotent.
+
+        Returns True when the table now exists (or already did), False
+        when the license gate refuses DAE. Mirrors the engine-side
+        contract previously implemented in dae.ensure_schema(conn).
+        """
+        try:
+            from dae import ensure_schema as _ensure
+        except Exception:
+            return False
+        with self._lock:
+            return _ensure(self.conn)
+
+    def upsert_dae_vectors(
+        self,
+        rows: "list[tuple[int, bytes, float, int, int, float]]",
+    ) -> int:
+        """Bulk INSERT-OR-REPLACE for DAE rows.
+
+        Each row: (memory_id, vector_blob, self_weight, neighbour_k,
+        schema_version, computed_at). The previous dae_bulk_compute
+        ran this SQL inline against self.store.conn — SQLite-only
+        (`INSERT OR REPLACE`, `?` placeholders). Moving it to the
+        store keeps the compute path backend-agnostic.
+        """
+        if not rows:
+            return 0
+        with self._lock:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO memory_dae_embeddings "
+                "(memory_id, vector, self_weight, neighbour_k, "
+                " schema_version, computed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self.conn.commit()
+        return len(rows)
+
+    def prune_memories_by_label_prefix(self, prefix: str, older_than_ts: float) -> int:
+        """Delete memories whose label starts with `prefix` and whose
+        created_at is older than `older_than_ts`. Returns the row count.
+
+        Lives on the store rather than as raw SQL in dream_engine so
+        the same call works on PostgresStore — the previous form
+        (`store.conn.execute("... LIKE ?...")`) was SQLite-only and
+        silently failed when dream cycles ran against the PG backend
+        (no derived-cluster TTL pruning on PG).
+        """
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM memories WHERE label LIKE ? AND created_at < ?",
+                (prefix + "%", float(older_than_ts)),
+            )
+            n = int(cur.rowcount or 0)
+            self.conn.commit()
+        return n
+
+    def fetch_dae_vectors(self, ids: "list[int]") -> "dict[int, list[float]]":
+        """Backend-agnostic shim used by _dae_score_candidates.
+
+        Delegates to dae.fetch_dae_vectors with the SQLite connection
+        (the historical implementation). PostgresStore has its own
+        method with PG-flavoured SQL; the dispatch happens in
+        Mazemaker._dae_score_candidates via getattr on the store.
+        """
+        try:
+            from dae import fetch_dae_vectors as _fetch
+        except Exception:
+            return {}
+        return _fetch(self.conn, list(ids))
+
     def stream_missing_colbert(self, batch_size: int = 1000, start_after_id: int = 0):
         """Yield (id, content) pairs for memories that don't yet have a
         colbert blob. Used by the migration script. Streams in id order
@@ -632,6 +770,33 @@ class SQLiteStore:
                 yield int(r["id"]), (r["content"] or "")
             last_id = int(rows[-1]["id"])
 
+    def stream_long_memories_for_afe(self, *, min_len: int = 500,
+                                     limit: int = 1000,
+                                     exclude_label_pattern: str = "%::afe::%",
+                                     exclude_ids: "set[int] | None" = None):
+        """Mirror of PostgresStore.stream_long_memories_for_afe for the
+        SQLite backend. Same yield contract: (id, label, content) ordered
+        by content length DESC, with already-AFE'd rows filtered out and
+        an explicit exclude_ids set honoured in Python."""
+        exclude_ids = exclude_ids or set()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id, label, content FROM memories "
+                "WHERE length(content) >= ? "
+                "  AND (label IS NULL OR label NOT LIKE ?) "
+                "ORDER BY length(content) DESC LIMIT ?",
+                (int(min_len), exclude_label_pattern, int(limit) * 2),
+            ).fetchall()
+        kept = 0
+        for r in rows:
+            mid = int(r["id"])
+            if mid in exclude_ids:
+                continue
+            yield mid, (r["label"] or ""), (r["content"] or "")
+            kept += 1
+            if kept >= limit:
+                return
+
     def touch(self, id_: int):
         with self._lock:
             row = self.conn.execute(
@@ -644,7 +809,10 @@ class SQLiteStore:
             old_salience = float(row["salience"] or 1.0)
             last = float(row["last_accessed"] or now)
             idle_days = max(0.0, (now - last) / 86400.0)
-            decayed = old_salience * math.exp(-0.03 * idle_days)
+            # Was hardcoded -0.03; the configured self._salience_decay_k
+            # (used elsewhere by _recompute_salience) was silently ignored
+            # on the touch() path, so the knob was inconsistent.
+            decayed = old_salience * math.exp(-self._salience_decay_k * idle_days)
             access_count = int(row["access_count"] or 0) + 1
             conn_count = int(row["conn_count"] or 0)
             salience = decayed + 0.04 * math.log1p(access_count) + 0.02 * math.log1p(conn_count)
@@ -882,8 +1050,23 @@ class SQLiteStore:
         q = set(re.findall(r"\w+", (query or "").lower()))
         if not q:
             return []
+        # Cap the corpus scan. FTS5 may be unavailable on some SQLite
+        # builds, in which case search_bm25 fell back to scanning every
+        # row in `memories` (an O(n) Python word-set diff on a 195k+
+        # corpus — multiple seconds per call). The cap below makes the
+        # fallback bounded; quality degrades to "most-recent N matched",
+        # which is the right trade vs. blocking a search for seconds.
+        FALLBACK_SCAN_CAP = 10_000
         scored = []
+        scanned = 0
         for m in self.get_all():
+            scanned += 1
+            if scanned > FALLBACK_SCAN_CAP:
+                logger.warning(
+                    "search_bm25 fallback truncated at %d rows (FTS5 unavailable, "
+                    "corpus larger than scan cap)", FALLBACK_SCAN_CAP,
+                )
+                break
             words = set(re.findall(r"\w+", ((m.get("label") or "") + " " + (m.get("content") or "")).lower()))
             overlap = len(q & words)
             if overlap:
@@ -912,9 +1095,21 @@ class SQLiteStore:
                     conn.close()
             except sqlite3.OperationalError:
                 pass
+        # Cap fallback scan — same reason as search_bm25 (FTS5 missing
+        # means we degrade to a Python word-search; on 195k corpora the
+        # uncapped form was a multi-second blocker).
+        ENTITY_FALLBACK_SCAN_CAP = 10_000
         scored = []
+        scanned = 0
         lowered = [e.lower() for e in entities]
         for m in self.get_all():
+            scanned += 1
+            if scanned > ENTITY_FALLBACK_SCAN_CAP:
+                logger.warning(
+                    "search_entity fallback truncated at %d rows (FTS5 unavailable)",
+                    ENTITY_FALLBACK_SCAN_CAP,
+                )
+                break
             text = ((m.get("label") or "") + " " + (m.get("content") or "")).lower()
             hits = [e for e in lowered if e in text]
             if hits:
@@ -922,20 +1117,76 @@ class SQLiteStore:
         scored.sort(key=lambda x: -x["score"])
         return scored[:limit]
 
+    # Temporal cue table — matched as substrings against the lowercased
+    # query. Each row is (cue, window_seconds). Wider than the previous
+    # 3-cue set ("today/yesterday/last week"), which left the channel
+    # returning a generic "most recent N" pool for every non-temporal
+    # query — including "what's the current X?" — and dragged
+    # update_tracking on the 10M bench down to 0.508. The new
+    # "current/latest/now/recently/updated" cues cover the
+    # update-tracking phrasing.
+    _TEMPORAL_CUES = (
+        # (cue, window_seconds_back_from_now)
+        ("today", 86400),
+        ("heute", 86400),
+        ("yesterday", 2 * 86400),
+        ("gestern", 2 * 86400),
+        ("last week", 7 * 86400),
+        ("letzte woche", 7 * 86400),
+        ("this week", 7 * 86400),
+        ("diese woche", 7 * 86400),
+        ("last month", 30 * 86400),
+        ("this month", 30 * 86400),
+        # Update-tracking phrasing: when the user asks about *current*
+        # state of something that may have been updated.
+        ("latest", 30 * 86400),
+        ("newest", 30 * 86400),
+        ("most recent", 30 * 86400),
+        ("currently", 30 * 86400),
+        ("current value", 30 * 86400),
+        ("now what", 30 * 86400),
+        ("recently", 14 * 86400),
+        ("updated", 14 * 86400),
+    )
+
     def search_temporal(self, query: str, limit: int = 50, now: Optional[float] = None) -> list[dict]:
         now = now or time.time()
         q = (query or "").lower()
-        where = ""
-        params: list[Any] = []
-        if any(w in q for w in ("today", "heute")):
-            where = "WHERE created_at >= ?"
-            params.append(now - 86400)
-        elif any(w in q for w in ("yesterday", "gestern")):
+
+        # ISO date anchor: YYYY-MM-DD in the query pins a ±1d window.
+        import re as _re
+        iso_match = _re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", q)
+        window_seconds: Optional[float] = None
+        anchor_ts: Optional[float] = None
+        if iso_match:
+            try:
+                import datetime as _dt
+                y, m, d = int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3))
+                anchor_ts = _dt.datetime(y, m, d).timestamp()
+            except (ValueError, OverflowError):
+                anchor_ts = None
+
+        if anchor_ts is None:
+            for cue, win in self._TEMPORAL_CUES:
+                if cue in q:
+                    window_seconds = float(win)
+                    # "yesterday" / "gestern" semantics: between -2d and -1d.
+                    if cue in ("yesterday", "gestern"):
+                        where = "WHERE created_at BETWEEN ? AND ?"
+                        params = [now - 2 * 86400, now - 86400]
+                        break
+                    where = "WHERE created_at >= ?"
+                    params = [now - window_seconds]
+                    break
+            else:
+                # No temporal cue → empty channel. Was returning
+                # "most recent N" regardless of intent, which polluted
+                # the RRF fusion with recency bias on every query.
+                return []
+        else:
             where = "WHERE created_at BETWEEN ? AND ?"
-            params.extend([now - 2 * 86400, now - 86400])
-        elif "last week" in q or "letzte woche" in q:
-            where = "WHERE created_at >= ?"
-            params.append(now - 7 * 86400)
+            params = [anchor_ts - 86400, anchor_ts + 86400]
+
         rows = self.conn.execute(
             f"SELECT id, created_at, last_accessed FROM memories {where} ORDER BY created_at DESC LIMIT ?",
             tuple(params + [limit]),
@@ -1020,7 +1271,10 @@ class SQLiteStore:
                 "DELETE FROM connections WHERE weight < ?", (float(threshold),)
             )
             self.conn.commit()
-            return int(cur.rowcount or 0)
+            deleted = int(cur.rowcount or 0)
+        if deleted:
+            logger.info("pruned %d connections below weight=%.4f", deleted, float(threshold))
+        return deleted
 
     def close(self):
         # Signal the bg_checkpoint thread to stop and give it a brief window
@@ -1296,35 +1550,120 @@ class Mazemaker:
             if self._gpu is None and not tried_remote:
                 try:
                     from gpu_recall import GpuRecallEngine
-                    eng = GpuRecallEngine()
+                    # Per-DB cache: GpuRecallEngine derives an isolated cache subdir
+                    # from db_path. Backwards compat: production DBs still use the
+                    # global cache dir. Eliminates cross-DB contamination when this
+                    # process opens a benchmark / test / per-conv DB.
+                    eng = GpuRecallEngine(db_path=db_path)
                     if eng.load(embed_fn=self.embedder.embed, embed_batch_fn=getattr(self.embedder, "embed_batch", None)):
-                        self._gpu = eng
-                        _glog.info(
-                            "GPU recall ARMED: %d vectors on %s",
-                            eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0,
-                            eng._device,
-                        )
-                    else:
-                        _glog.warning("GPU recall cache absent — auto-building from %s", db_path)
-                        try:
-                            from build_gpu_cache import build  # type: ignore[import]
-                            from pathlib import Path as _P
-                            build(_P(db_path), _P.home() / ".mazemaker" / "engine" / "gpu_cache")
-                            if eng.load(embed_fn=self.embedder.embed, embed_batch_fn=getattr(self.embedder, "embed_batch", None)):
-                                self._gpu = eng
-                                _glog.info(
-                                    "GPU recall ARMED post-build: %d vectors",
-                                    eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0,
-                                )
-                            else:
+                        # Fingerprint check: cache row count must match the DB's
+                        # current memory count. Mismatch indicates either a stale
+                        # cache from a prior version or accidental sharing — force
+                        # rebuild rather than silently serve wrong embeddings.
+                        cached_n = eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0
+                        # SQLiteStore exposes the connection as `.conn`. The
+                        # previous `.connection()` call raised AttributeError
+                        # every time and was silently swallowed below, so the
+                        # entire fingerprint check was a permanent no-op —
+                        # stale caches always loaded "accept cache".
+                        store_conn = getattr(self.store, "conn", None)
+                        if store_conn is None:
+                            db_n = cached_n  # non-SQLite backend, skip check
+                        else:
+                            try:
+                                db_n = store_conn.execute(
+                                    "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+                                ).fetchone()[0]
+                            except sqlite3.Error as exc_fp:
                                 _glog.warning(
-                                    "GPU recall not loaded after build (db likely empty on fresh install) — recall will run on CPU/numpy until first remember()"
+                                    "GPU cache fingerprint check failed (%s) — accepting cache",
+                                    exc_fp,
                                 )
-                        except BaseException as exc_b:
+                                db_n = cached_n
+                        if cached_n != db_n:
                             _glog.warning(
-                                "GPU recall auto-build skipped (recall will run on CPU/numpy): %s",
-                                exc_b,
+                                "GPU recall cache STALE (cached=%d, db=%d) — rebuilding",
+                                cached_n, db_n,
                             )
+                            try:
+                                from build_gpu_cache import build  # type: ignore[import]
+                                from pathlib import Path as _P
+                                build(_P(db_path), eng.cache_dir)
+                                eng = GpuRecallEngine(db_path=db_path)
+                                if eng.load(embed_fn=self.embedder.embed, embed_batch_fn=getattr(self.embedder, "embed_batch", None)):
+                                    self._gpu = eng
+                                    _glog.info(
+                                        "GPU recall ARMED post-rebuild: %d vectors on %s",
+                                        eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0,
+                                        eng._device,
+                                    )
+                            except Exception as rebuild_exc:
+                                _glog.warning("GPU recall cache rebuild failed: %s", rebuild_exc)
+                        else:
+                            self._gpu = eng
+                            _glog.info(
+                                "GPU recall ARMED: %d vectors on %s (cache dir: %s)",
+                                cached_n, eng._device, eng.cache_dir,
+                            )
+                    else:
+                        # Detect PG-backend: the SQLite gpu_cache+auto-build
+                        # path is structurally inapplicable (db_path is
+                        # /dev/null or any non-SQLite sentinel). Go straight
+                        # to load_from_store — works for any store exposing
+                        # get_all(). Stays silent unless something fails.
+                        is_pg_backend = (
+                            (os.environ.get("MM_DB_BACKEND") or "").strip().lower() == "postgres"
+                            or str(db_path) in ("/dev/null", "")
+                        )
+                        built_from_cache = False
+                        if not is_pg_backend:
+                            _glog.warning(
+                                "GPU recall cache absent — auto-building from %s", db_path,
+                            )
+                            try:
+                                from build_gpu_cache import build  # type: ignore[import]
+                                from pathlib import Path as _P
+                                build(_P(db_path), eng.cache_dir)
+                                if eng.load(embed_fn=self.embedder.embed, embed_batch_fn=getattr(self.embedder, "embed_batch", None)):
+                                    self._gpu = eng
+                                    built_from_cache = True
+                                    _glog.info(
+                                        "GPU recall ARMED post-build: %d vectors (cache dir: %s)",
+                                        eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0,
+                                        eng.cache_dir,
+                                    )
+                            except BaseException as exc_b:
+                                _glog.warning(
+                                    "GPU recall auto-build skipped (cache-build path): %s",
+                                    exc_b,
+                                )
+                        # Backend-direct path. Pulls embeddings straight from
+                        # whatever store is live and uploads them to the GPU
+                        # tensor — works for PG, MSSQL, fresh SQLite, anything
+                        # that exposes store.get_all(). Logged at WARNING level
+                        # so it's visible even when INFO is filtered.
+                        if not built_from_cache and self._gpu is None:
+                            try:
+                                if eng.load_from_store(
+                                    self.store,
+                                    embed_fn=self.embedder.embed,
+                                    embed_batch_fn=getattr(self.embedder, "embed_batch", None),
+                                ):
+                                    self._gpu = eng
+                                    _glog.warning(
+                                        "GPU recall ARMED (load_from_store): %d vectors on %s",
+                                        eng._emb_tensor.shape[0] if eng._emb_tensor is not None else 0,
+                                        eng._device,
+                                    )
+                                else:
+                                    _glog.warning(
+                                        "GPU recall: load_from_store returned False — recall will run on CPU/numpy"
+                                    )
+                            except BaseException as exc_lfs:
+                                _glog.warning(
+                                    "GPU recall load_from_store failed: %s — CPU/numpy fallback",
+                                    exc_lfs,
+                                )
                 except BaseException as exc:
                     _glog.warning(
                         "GPU recall init skipped (recall will run on CPU/numpy): %s", exc
@@ -1641,7 +1980,7 @@ class Mazemaker:
 
     # -- write path -----------------------------------------------------------
 
-    def remember(self, text: str, label: str = "", detect_conflicts: bool = True, auto_connect: bool = True) -> int:
+    def remember(self, text: str, label: str = "", detect_conflicts: bool = True, auto_connect: bool = True, detect_supersedes: bool = True) -> int:
         embedding = self.embedder.embed(text)
         # Hard guard: refuse to write a vector whose dim disagrees with the
         # DB's pinned dim. The alternative (writing it anyway) corrupts every
@@ -1690,8 +2029,27 @@ class Mazemaker:
                     continue
                 if self._content_differs(old_content, text) or old_content.strip() != text.strip():
                     fused = self._fuse_conflict(old_content, text)
+                    # Re-embed the fused content. Previously we stored
+                    # `fused` against `embedding` (the embedding of the
+                    # incoming `text`), so every recall against this memory
+                    # scored against text it no longer contains. Drift
+                    # compounded across repeated fusions. Falls back to the
+                    # incoming embedding only if re-embed raises — the
+                    # original behaviour, but logged.
+                    try:
+                        fused_embedding = self.embedder.embed(fused)
+                        if len(fused_embedding) != self.dim:
+                            raise RuntimeError(
+                                f"re-embed dim mismatch ({len(fused_embedding)} != {self.dim})"
+                            )
+                    except Exception as exc_re:
+                        logger.warning(
+                            "conflict-fuse re-embed failed (%s) — keeping incoming embedding",
+                            exc_re,
+                        )
+                        fused_embedding = embedding
                     self.store.add_revision(int(other["id"]), old_content, text, "conflict_fusion")
-                    self.store.update_memory(int(other["id"]), fused, embedding, label=label)
+                    self.store.update_memory(int(other["id"]), fused, fused_embedding, label=label)
                     # ColBERT tokens were extracted from the OLD content
                     # — re-encode for the fused text so the rerank channel
                     # stays consistent. Same opt-in gate as the fresh-write
@@ -1710,7 +2068,7 @@ class Mazemaker:
                     # recall via store.get_many saw the [CANONICAL]/[PREVIOUSLY]
                     # marker — same memory, two contents, depending on path.
                     self._graph_nodes[int(other["id"])] = {
-                        "embedding": embedding, "label": label,
+                        "embedding": fused_embedding, "label": label,
                         "content": fused, "connections": {},
                     }
                     self._refresh_connections(int(other["id"]))
@@ -1760,7 +2118,181 @@ class Mazemaker:
         if auto_connect:
             self._auto_connect(mem_id, embedding, text)
 
+        # Task 3 — ingest-time SUPERSEDES detection.
+        # After the fresh memory is stored, scan recent memories for
+        # high-similarity pairs with *different* numeric tokens.  This
+        # unifies the ingest-time and dream-time supersession paths so
+        # downstream consumers only need to read the connections table.
+        # Intentionally non-blocking: any exception is logged and ignored
+        # so a DB hiccup can't break a remember() call.
+        if detect_supersedes:
+            self._detect_supersedes_at_ingest(mem_id, embedding, text)
+
         return mem_id
+
+    def remember_batch(
+        self,
+        rows: "list[dict]",
+        *,
+        detect_conflicts: bool = False,
+        auto_connect: bool = False,
+        detect_supersedes: bool = True,
+    ) -> "list[int]":
+        if not rows:
+            return []
+        if detect_conflicts or auto_connect:
+            # Slow-path: per-row remember() preserves conflict-fusion +
+            # auto_connect side-effects. Bulk ingest hot paths leave both
+            # off, so this is for callers that explicitly opted in.
+            logger.warning(
+                "remember_batch: detect_conflicts/auto_connect requested → "
+                "falling back to per-row remember() (slow path)"
+            )
+            out: list[int] = []
+            for r in rows:
+                out.append(self.remember(
+                    r.get("text", ""),
+                    label=r.get("label") or "",
+                    detect_conflicts=detect_conflicts,
+                    auto_connect=auto_connect,
+                    detect_supersedes=detect_supersedes,
+                ))
+            return out
+
+        if not self._dim_locked:
+            raise RuntimeError(
+                f"refusing to write: {self._dim_mismatch_reason} "
+                "Re-open with the original embedding backend, or drop the DB."
+            )
+
+        texts = [r.get("text", "") for r in rows]
+        embed_batch_fn = getattr(self.embedder, "embed_batch", None)
+        if embed_batch_fn is not None:
+            embeddings = embed_batch_fn(texts)
+        else:
+            embeddings = [self.embedder.embed(t) for t in texts]
+
+        if len(embeddings) != len(rows):
+            raise RuntimeError(
+                f"embed_batch returned {len(embeddings)} vectors for "
+                f"{len(rows)} texts"
+            )
+        for emb in embeddings:
+            if len(emb) != self.dim:
+                raise RuntimeError(
+                    f"embedder produced dim={len(emb)}, expected {self.dim} "
+                    f"({self._embed_fingerprint})"
+                )
+
+        self._pin_fingerprint_if_unset()
+
+        store_rows: list[dict] = []
+        for r, emb in zip(rows, embeddings):
+            text = r.get("text", "")
+            label = r.get("label") or text[:60]
+            store_rows.append({
+                "label": label,
+                "content": text,
+                "embedding": emb,
+                "salience": (r.get("metadata") or {}).get("salience"),
+            })
+
+        ids = self.store.remember_batch(store_rows)
+
+        for mem_id, sr in zip(ids, store_rows):
+            self._graph_nodes[int(mem_id)] = {
+                "embedding": sr["embedding"],
+                "label": sr["label"],
+                "content": sr["content"],
+                "connections": {},
+            }
+        self._hnsw_dirty = True
+
+        if self._gpu is not None:
+            for mem_id, sr in zip(ids, store_rows):
+                try:
+                    self._gpu.add_one(int(mem_id), sr["label"], sr["content"], sr["embedding"])
+                except Exception:
+                    logger.warning(
+                        "GPU recall add_one failed for mem_id=%s; cache now stale "
+                        "until next rebuild", mem_id, exc_info=True,
+                    )
+                    break
+
+        return [int(i) for i in ids]
+
+    # -- numeric token extraction shared by ingest + dream paths ----------
+
+    _SUPERSEDES_NUMERIC_RE = re.compile(
+        r"""
+        \$?\d[\d,]*(?:\.\d+)?[KkMmBb]?   # dollar amounts or any number
+        (?:\s*(?:GB|MB|KB|TB|GHz|MHz|kHz|Hz|kg|km|cm|mm|inches|ft|inch|lbs|lb|hrs?|mins?))?
+        \b
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+    _SUPERSEDES_SIM_THRESHOLD: float = 0.85
+    _SUPERSEDES_SCAN_WINDOW: int = 2000  # only scan this many most-recent nodes
+
+    def _extract_numeric_tokens(self, text: str) -> frozenset:
+        """Return normalised numeric tokens from text (strip commas)."""
+        # Fast-path: no digit character at all → skip the full regex.
+        if not re.search(r"\d", text):
+            return frozenset()
+        raw = self._SUPERSEDES_NUMERIC_RE.findall(text)
+        return frozenset(t.replace(",", "").strip() for t in raw)
+
+    def _detect_supersedes_at_ingest(
+        self, new_id: int, new_emb: list[float], new_text: str
+    ) -> None:
+        """Write SUPERSEDES edges from older memories to new_id.
+
+        Embedding-similarity pathway: cosine >= _SUPERSEDES_SIM_THRESHOLD,
+        gated on differing numeric tokens (real update, not a dup) and
+        other memory predating new_id.
+
+        Writes a directed supersedes edge: source=older_id, target=new_id.
+        Idempotent — add_connection skips existing edges via UPDATE.
+        """
+        new_tokens = self._extract_numeric_tokens(new_text)
+        if not new_tokens:
+            return  # no numeric content → skip (nothing to supersede)
+
+        threshold = self._SUPERSEDES_SIM_THRESHOLD
+        new_norm = sum(v * v for v in new_emb) ** 0.5
+        if new_norm == 0.0:
+            return
+
+        # Only scan the most-recent N nodes — supersedes is temporally local
+        # (an updated fact about the same entity).  W/o this window the loop
+        # is O(N²) in the graph size, which kills bulk-ingest throughput.
+        window_nodes = list(self._graph_nodes.items())[-self._SUPERSEDES_SCAN_WINDOW:]
+
+        for other_id, node in window_nodes:
+            other_id = int(other_id)
+            if other_id == new_id:
+                continue
+            if other_id >= new_id:
+                continue
+            other_emb = node.get("embedding") or []
+            if not other_emb or len(other_emb) != len(new_emb):
+                continue
+            other_text = node.get("content") or ""
+            other_tokens = self._extract_numeric_tokens(other_text)
+            if not other_tokens or other_tokens == new_tokens:
+                continue
+            dot = sum(a * b for a, b in zip(new_emb, other_emb))
+            other_norm = sum(v * v for v in other_emb) ** 0.5
+            denom = new_norm * other_norm
+            sim = dot / denom if denom else 0.0
+            if sim < threshold:
+                continue
+            try:
+                self.store.add_connection(
+                    other_id, new_id, sim, edge_type="supersedes"
+                )
+            except Exception:
+                pass
 
     def _auto_connect(self, mem_id: int, embedding: list[float], text: str) -> None:
         """Connect a freshly-stored memory to its semantic neighbours.
@@ -1819,10 +2351,30 @@ class Mazemaker:
                 if sim > 0.70:
                     candidates.append((other_id, sim))
 
+        # Group candidates by edge_type and bulk-write via
+        # add_connections_batch — single COPY+upsert per type instead of
+        # K round-trips. In-memory graph mirror updates unchanged.
+        by_type: dict[str, list[tuple[int, int, float]]] = {}
         for other_id, sim in candidates:
             other_node = self._graph_nodes.get(other_id, {})
             edge_type = self._infer_edge_type(text, other_node.get("content", ""))
-            self.store.add_connection(mem_id, other_id, sim, edge_type=edge_type)
+            by_type.setdefault(edge_type, []).append((mem_id, other_id, sim))
+        if by_type and hasattr(self.store, "add_connections_batch"):
+            for et, pairs in by_type.items():
+                try:
+                    self.store.add_connections_batch(pairs, edge_type=et)
+                except Exception:
+                    for s, t, w in pairs:
+                        try:
+                            self.store.add_connection(s, t, w, edge_type=et)
+                        except Exception:
+                            pass
+        else:
+            for other_id, sim in candidates:
+                other_node = self._graph_nodes.get(other_id, {})
+                edge_type = self._infer_edge_type(text, other_node.get("content", ""))
+                self.store.add_connection(mem_id, other_id, sim, edge_type=edge_type)
+        for other_id, sim in candidates:
             self._graph_nodes.setdefault(other_id, {
                 "embedding": [], "label": f"memory:{other_id}",
                 "content": "", "connections": {},
@@ -1901,7 +2453,19 @@ class Mazemaker:
     # -- retrieval channels ---------------------------------------------------
 
     def _semantic_candidates(self, query: str, query_vec: list[float], limit: int) -> list[dict]:
-        # GPU recall path FIRST when armed — the customer paid for the GPU
+        # Store-native pgvector HNSW FIRST when the store knows how. The
+        # PG path used to fall through to `get_all()` + Python cosine
+        # across the whole corpus — 75 s for a 186 k-row schema. The
+        # HNSW index on `embedding` lives in PG already; let it work.
+        if hasattr(self.store, "search_semantic"):
+            try:
+                res = self.store.search_semantic(query_vec, limit=limit)
+                if res:
+                    return res
+            except Exception:
+                pass
+
+        # GPU recall path next when armed — the customer paid for the GPU
         # variant of the pod (or the host has CUDA), they expect it to be
         # the path that actually runs. HNSW (CPU) is fast on small DBs but
         # leaves the loaded GPU tensor idle, which is wasteful and breaks
@@ -2111,11 +2675,20 @@ class Mazemaker:
         ]
         if not head_ids:
             return {}
-        try:
-            from dae import fetch_dae_vectors
-        except Exception:
+        # Dispatch on the store. Both SQLiteStore and PostgresStore now
+        # expose fetch_dae_vectors(ids) — the previous form (
+        # `fetch_dae_vectors(self.store.conn, ...)`) reached into a
+        # SQLite-only attribute and silently produced empty results on
+        # PG, which is why engine_config.py used to force-disable DAE
+        # whenever MM_DB_BACKEND=postgres.
+        fetch = getattr(self.store, "fetch_dae_vectors", None)
+        if fetch is None:
             return {}
-        vecs = fetch_dae_vectors(self.store.conn, head_ids)
+        try:
+            vecs = fetch(head_ids)
+        except Exception as exc_dae:
+            logger.warning("DAE fetch failed via %s: %s", type(self.store).__name__, exc_dae)
+            return {}
         if not vecs:
             return {}
         out: "dict[int, float]" = {}
@@ -2209,6 +2782,197 @@ class Mazemaker:
                 pass
         return [self.recall(q, k=k) for q in queries]
 
+    def recall_multi(
+        self,
+        queries: "list[str]",
+        k: int = 10,
+        fuse: bool = True,
+        k_per_query: Optional[int] = None,
+    ) -> "list[dict] | list[list[dict]]":
+        """Multi-perspective recall: run N queries in one call and fuse results.
+
+        When ``fuse=True`` (default) results from all queries are merged via
+        Reciprocal Rank Fusion (RRF) and deduplicated, returning a flat list of
+        at most *k* dicts.  Each returned dict includes a unified ``score``
+        field set to the memory's RRF score.
+
+        When ``fuse=False`` the raw per-query results are returned as
+        ``list[list[dict]]`` (same shape as ``recall_batch``), with each dict
+        carrying a ``score`` field copied from ``rerank_score or relevance or
+        combined or similarity``.
+
+        Args:
+            queries:      List of query strings to run in parallel.
+            k:            Maximum results to return (fused mode) or per query
+                          (passthrough mode).
+            fuse:         If True, apply RRF and return a flat deduplicated list.
+            k_per_query:  Candidates fetched per query before fusion.
+                          Defaults to ``2 * k`` so the fused pool is wide
+                          enough to surface high-quality results for every angle.
+
+        Returns:
+            Flat ``list[dict]`` when ``fuse=True``, else ``list[list[dict]]``.
+        """
+        if not queries:
+            return [] if fuse else []
+
+        per_q = k_per_query if k_per_query is not None else k * 2
+        # Use FULL recall() pipeline per query (ColBERT + DAE + hybrid + rerank).
+        # recall_batch() is the REM fast-path — pure-semantic cosine matmul,
+        # not suitable for quality multi-perspective fusion.
+        per_query_results: list[list[dict]] = [
+            self.recall(q, k=per_q, hybrid=True,
+                        enable_colbert=True, colbert_weight=1.5,
+                        enable_dae=True, dae_weight=1.0)
+            for q in queries
+        ]
+
+        if not fuse:
+            # Passthrough — ensure score field present.
+            for qr in per_query_results:
+                for r in qr:
+                    r.setdefault('score', (
+                        r.get('rerank_score') or
+                        r.get('relevance') or
+                        r.get('combined') or
+                        r.get('similarity') or
+                        0.0
+                    ))
+            return per_query_results
+
+        # --- RRF fusion ---
+        # rrf_scores[id] accumulates 1/(60 + rank) summed over all queries.
+        rrf_scores: dict[int, float] = {}
+        id_to_result: dict[int, dict] = {}
+
+        for qr in per_query_results:
+            for rank, r in enumerate(qr):
+                mem_id = r.get('id')
+                if mem_id is None:
+                    continue
+                rrf_scores[mem_id] = rrf_scores.get(mem_id, 0.0) + 1.0 / (60 + rank)
+                if mem_id not in id_to_result:
+                    id_to_result[mem_id] = r
+
+        # Sort by RRF score descending, attach unified score, return top-k.
+        ranked_ids = sorted(rrf_scores, key=lambda i: -rrf_scores[i])
+        fused: list[dict] = []
+        for mem_id in ranked_ids[:k]:
+            result = dict(id_to_result[mem_id])
+            result.pop('embedding', None)
+            result['score'] = round(rrf_scores[mem_id], 8)
+            fused.append(result)
+        return fused
+
+    def recall_with_neighbors(
+        self,
+        query: str,
+        k: int = 10,
+        depth: int = 1,
+        neighbor_weight: float = 0.3,
+        **recall_kwargs,
+    ) -> list[dict]:
+        """Graph-augmented recall: seed set from ``recall()`` + connected memories.
+
+        After fetching a seed set of top-``k*2`` matches, traverse each seed's
+        graph connections (1 or 2 hops) and merge in linked memories that were
+        not in the seed set.  Neighbor scores decay multiplicatively with hop
+        distance and connection weight:
+
+            neighbor_score = neighbor_weight * source_score * connection_weight
+
+        For ``depth=2`` the decay is applied again for each second-hop edge:
+
+            hop2_score = neighbor_weight * hop1_score * connection_weight
+
+        All results are deduplicated by id and sorted descending by score.
+        Each dict carries a ``via`` field — ``"direct"`` for seed memories and
+        ``"neighbor:hop1"`` / ``"neighbor:hop2"`` for graph-expanded ones — so
+        consumers can distinguish how a memory was surfaced.
+
+        Args:
+            query:            Query string for the initial seed recall.
+            k:                Maximum results to return.
+            depth:            Hop depth for graph traversal (1 or 2).
+            neighbor_weight:  Base weight multiplier for neighbour scores.
+            **recall_kwargs:  Extra kwargs forwarded to ``recall()``
+                              (e.g. ``mmr_lambda``, ``score_floor``).
+
+        Returns:
+            Flat ``list[dict]`` of at most *k* results, sorted by score desc.
+        """
+        # --- Seed set ---
+        seeds = self.recall(query, k=k * 2, **recall_kwargs)
+        seen_ids: dict[int, dict] = {}  # id → result dict
+
+        for r in seeds:
+            mem_id = r.get('id')
+            if mem_id is None:
+                continue
+            r = dict(r)
+            r.pop('embedding', None)
+            r.setdefault('score', (
+                r.get('rerank_score') or
+                r.get('relevance') or
+                r.get('combined') or
+                r.get('similarity') or
+                0.0
+            ))
+            r['via'] = 'direct'
+            seen_ids[mem_id] = r
+
+        # --- Graph traversal ---
+        def _expand(frontier: "dict[int, float]", hop_label: str) -> "dict[int, dict]":
+            """Expand one hop from frontier {id: score} and return new nodes."""
+            new_nodes: dict[int, dict] = {}
+            for source_id, source_score in frontier.items():
+                try:
+                    conns = self.connections(source_id)
+                except Exception:
+                    continue
+                for c in conns:
+                    neighbour_id = c.get('id')
+                    if neighbour_id is None or neighbour_id in seen_ids:
+                        continue
+                    conn_weight = float(c.get('weight', 1.0))
+                    n_score = neighbor_weight * source_score * conn_weight
+                    if neighbour_id in new_nodes:
+                        if n_score <= new_nodes[neighbour_id]['score']:
+                            continue
+                    try:
+                        mem = self.store.get(neighbour_id, include_embedding=False)
+                    except Exception:
+                        mem = None
+                    if mem is None:
+                        continue
+                    new_nodes[neighbour_id] = {
+                        'id': neighbour_id,
+                        'label': mem.get('label', ''),
+                        'content': mem.get('content', ''),
+                        'score': round(n_score, 8),
+                        'via': hop_label,
+                        'connections': [],
+                        'created_at': mem.get('created_at'),
+                        'last_accessed': mem.get('last_accessed'),
+                        'access_count': mem.get('access_count', 0),
+                    }
+            return new_nodes
+
+        # Hop 1
+        frontier_scores = {mid: r['score'] for mid, r in seen_ids.items()}
+        hop1_nodes = _expand(frontier_scores, 'neighbor:hop1')
+        seen_ids.update(hop1_nodes)
+
+        # Hop 2
+        if depth >= 2:
+            hop2_frontier = {mid: r['score'] for mid, r in hop1_nodes.items()}
+            hop2_nodes = _expand(hop2_frontier, 'neighbor:hop2')
+            seen_ids.update(hop2_nodes)
+
+        # Sort descending by score, cap at k.
+        ranked = sorted(seen_ids.values(), key=lambda r: -r.get('score', 0.0))
+        return ranked[:k]
+
     def recall(
         self,
         query: str,
@@ -2221,6 +2985,7 @@ class Mazemaker:
         at_time: Optional[float] = None,
         mmr_lambda: Optional[float] = None,
         score_floor: Optional[float] = None,
+        supersedes_traversal: bool = True,
         # score_percentile: drop the bottom X fraction of candidates BY
         # RANK before truncating to k. Calibrated [0,1] alternative to
         # score_floor (which operates on the RRF-derived raw relevance
@@ -2522,6 +3287,94 @@ class Mazemaker:
         if eff_lambda > 0.0 and len(results) > 1 and k > 1:
             results = self._mmr_rerank(results, mems, eff_lambda, k)
 
+        # ── SUPERSEDES traversal ─────────────────────────────────────────
+        # For each result X that has an outgoing 'supersedes' edge to Y
+        # (meaning X is the older/superseded version):
+        #   1. Demote X's score by 0.5 (it's stale — prefer the newer one).
+        #   2. Elevate Y's score to at least X's pre-demotion score.
+        #   3. If Y is not already in results, fetch it and add it.
+        #   4. Tag X with 'superseded_by': Y's id.
+        if supersedes_traversal and results:
+            result_ids = {r["id"] for r in results}
+            # For each result, check for outgoing supersedes edges.
+            # A memory is "the older one" when it is the SOURCE of a
+            # supersedes edge (source=older, target=newer — established by
+            # _phase_supersedes and _detect_conflicts).
+            superseded_map: dict[int, int] = {}  # old_id → new_id
+            for r in results:
+                mid = r["id"]
+                try:
+                    conns = self.store.get_connections(mid)
+                    for c in conns:
+                        if (c.get("edge_type") or c.get("type", "")) != "supersedes":
+                            continue
+                        # Directed: source=older, target=newer
+                        if c["source"] == mid:
+                            newer_id = int(c["target"])
+                            superseded_map[mid] = newer_id
+                except Exception:
+                    pass
+
+            if superseded_map:
+                # Collect newer memory ids not yet in results.
+                missing_newer = {nid for nid in superseded_map.values() if nid not in result_ids}
+                # Fetch missing newer memories in one SQL call.
+                extra_mems: dict[int, dict] = {}
+                if missing_newer:
+                    try:
+                        extra_mems = self.store.get_many(list(missing_newer), include_embedding=True)
+                    except Exception:
+                        pass
+
+                # Build id → result dict for score edits.
+                id_to_result: dict[int, dict] = {r["id"]: r for r in results}
+
+                # Materialise newer memories that aren't already results.
+                for nid, nmem in extra_mems.items():
+                    if not nmem:
+                        continue
+                    nsim = 0.0
+                    if nmem.get("embedding") and query_vec:
+                        nsim = self._cosine_similarity(query_vec, nmem["embedding"])
+                    new_entry: dict = {
+                        "id": nid,
+                        "label": nmem.get("label", ""),
+                        "content": nmem.get("content", ""),
+                        "similarity": round(nsim, 4),
+                        "temporal_score": 0.0,
+                        "salience_factor": 1.0,
+                        "ppr_score": 0.0,
+                        "colbert_score": 0.0,
+                        "combined": 0.0,
+                        "relevance": 0.0,
+                        "channel_scores": {},
+                        "connections": [],
+                        "created_at": nmem.get("created_at"),
+                        "last_accessed": nmem.get("last_accessed"),
+                        "access_count": nmem.get("access_count", 0),
+                        "superseded_by": None,
+                    }
+                    id_to_result[nid] = new_entry
+                    results.append(new_entry)
+
+                for old_id, new_id in superseded_map.items():
+                    old_r = id_to_result.get(old_id)
+                    new_r = id_to_result.get(new_id)
+                    if old_r is None:
+                        continue
+                    pre_demotion = float(old_r.get("relevance") or old_r.get("combined") or 0.0)
+                    demoted = max(0.0, pre_demotion - 0.5)
+                    old_r["relevance"] = round(demoted, 6)
+                    old_r["combined"] = round(demoted, 6)
+                    old_r["superseded_by"] = new_id
+                    if new_r is not None:
+                        cur_new = float(new_r.get("relevance") or new_r.get("combined") or 0.0)
+                        elevated = max(cur_new, pre_demotion + 0.01)
+                        new_r["relevance"] = round(elevated, 6)
+                        new_r["combined"] = round(elevated, 6)
+
+                results.sort(key=lambda x: -x.get("relevance", 0.0))
+
         final = results[:k]
         if touch:
             for r in final:
@@ -2529,6 +3382,17 @@ class Mazemaker:
                     self.store.touch(r["id"])
                 except Exception:
                     pass
+        # Unified convenience field — highest-precedence non-zero score so
+        # consumers don't have to check the rerank/relevance/combined/similarity
+        # cascade themselves.
+        for r in final:
+            r.setdefault('score', (
+                r.get('rerank_score') or
+                r.get('relevance') or
+                r.get('combined') or
+                r.get('similarity') or
+                0.0
+            ))
         return final
 
     def _mmr_rerank(
@@ -2617,13 +3481,31 @@ class Mazemaker:
     def _build_gpu_ppr_adjacency(self) -> bool:
         """Build a row-stochastic sparse adjacency tensor on the GPU device.
         Returns True on success, False if torch/CUDA unavailable. Caller
-        decides whether to fall back or raise."""
+        decides whether to fall back or raise.
+
+        Device selection is independent of GpuRecallEngine: PPR only
+        needs a CUDA handle + the graph adjacency, not the embedding
+        tensor. The previous form required `self._gpu` to be armed,
+        which is only true on SQLite (GpuRecallEngine loads from the
+        SQLite-side gpu_cache). Under MM_DB_BACKEND=postgres the
+        embedding tensor stays unloaded, so this gate was the reason
+        DAE compute fell through to the per-edge SQL path and CPU.
+        """
         try:
             import torch
         except ImportError:
             return False
         device = getattr(self._gpu, "_device", None) if self._gpu else None
-        if device is None or device.type != "cuda":
+        if device is None or getattr(device, "type", None) != "cuda":
+            # No armed GpuRecallEngine — pick the CUDA device directly
+            # if torch can see one. Same effective hardware, just
+            # uncoupled from the recall-side cache.
+            try:
+                if torch.cuda.is_available():
+                    device = torch.device("cuda")
+            except Exception:
+                device = None
+        if device is None or getattr(device, "type", None) != "cuda":
             return False
 
         rows = self.store.weighted_edges()
@@ -2824,9 +3706,13 @@ class Mazemaker:
         need the highest 20-ish, and don't need labels or content.
         Returning the IDs early collapses ~150KB of GPU→CPU transfer per
         think into ~80 bytes, plus skips the store.get_many SQL round-trip
-        downstream callers like think() do for label resolution."""
-        if self._gpu is None:
-            return []
+        downstream callers like think() do for label resolution.
+
+        No longer requires `self._gpu` — _build_gpu_ppr_adjacency picks
+        a CUDA device on its own when GpuRecallEngine isn't armed (e.g.
+        MM_DB_BACKEND=postgres). PPR is graph-only; embedding tensor not
+        needed.
+        """
         try:
             import torch
         except ImportError:

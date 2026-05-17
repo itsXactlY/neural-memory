@@ -13,12 +13,36 @@ dream-specific tables.
 from __future__ import annotations
 
 import logging
+import os
+import re
 import sqlite3
 import struct
 import threading
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# Numeric / quantity token detection for SUPERSEDES heuristic.
+# Matches: plain integers, decimals, dollar amounts, percentages, and
+# common unit suffixes (data sizes, frequencies, weights, distances,
+# durations, screen sizes).  We intentionally stay broad — a false
+# positive (two memories with a common number like "10" that don't
+# represent the same fact) is harmless; the cosine-similarity >= 0.85
+# guard above filters most coincidental numeric overlap.
+_NUMERIC_TOKEN_RE = re.compile(
+    r"""
+    \$\d[\d,]*(?:\.\d+)?[KkMmBb]?   # dollar amounts: $1,200 / $1.2K / $500M
+    | \b\d[\d,]*(?:\.\d+)?           # plain number or decimal (comma-sep allowed)
+      (?:                            # optional unit suffix
+          %
+        | \s*(?:GB|MB|KB|TB|GHz|MHz|kHz|Hz|kg|km|cm|mm|inches|ft|inch|lbs|lb|hrs?|mins?)
+      )?
+    \b
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+from license import has_feature  # Pro feature gate for REM + Insight phases
 
 try:
     import networkx as nx
@@ -27,6 +51,32 @@ except ImportError:
     HAS_NETWORKX = False
 
 logger = logging.getLogger(__name__)
+
+
+def _envf(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _envi(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# REM bridge similarity band. Default (0.3, 0.95) was tuned for paragraph-
+# length episodic memories; AFE-extracted short facts cluster near 0.95+,
+# so dense bench corpora should bump _REM_SIM_HIGH closer to 1.0.
+_REM_SIM_LOW = _envf("MM_REM_SIM_LOW", 0.3)
+_REM_SIM_HIGH = _envf("MM_REM_SIM_HIGH", 0.95)
+
+# Insight community filters. Defaults sized for ~200k organic corpus;
+# for sparse bench corpora drop _INSIGHT_MIN_CLUSTER (e.g. 4).
+_INSIGHT_MIN_CLUSTER = _envi("MM_INSIGHT_MIN_CLUSTER", 10)
+_INSIGHT_MAX_CLUSTERS = _envi("MM_INSIGHT_MAX_CLUSTERS", 50)
 
 # ---------------------------------------------------------------------------
 # Schema extensions for dream tables (SQLite)
@@ -211,6 +261,17 @@ class DreamBackend:
 
     def get_memory_vectors(self, memory_ids: List[int]) -> Dict[int, List[float]]:
         """Return embeddings for memory IDs. Optional backend capability."""
+        return {}
+
+    def get_memory_metadata(self, memory_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Return {id: {"created_at": float, "content": str}} for the ids.
+
+        Backend-agnostic replacement for the previous _phase_supersedes
+        path that called `_backend._connect().execute("... ? ...")` —
+        that path was SQLite-only and silently disabled the
+        supersedes phase under PG. Default impl returns empty so older
+        backends that don't override degrade gracefully.
+        """
         return {}
 
     def set_connection_weight(self, source_id: int, target_id: int,
@@ -558,6 +619,26 @@ class SQLiteDreamBackend(DreamBackend):
         finally:
             conn.close()
 
+    def get_memory_metadata(self, memory_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" * len(memory_ids))
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT id, created_at, content FROM memories WHERE id IN ({placeholders})",
+                tuple(memory_ids),
+            ).fetchall()
+            return {
+                int(r["id"]): {
+                    "created_at": float(r["created_at"] or 0.0),
+                    "content": r["content"] or "",
+                }
+                for r in rows
+            }
+        finally:
+            conn.close()
+
     def set_connection_weight(self, source_id: int, target_id: int,
                               weight: float, reason: str = "semantic_reweight") -> bool:
         conn = self._connect()
@@ -716,31 +797,50 @@ class SQLiteDreamBackend(DreamBackend):
     def batch_weaken_connections(self, threshold: float = 0.05,
                                   delta: float = 0.01,
                                   dream_session_id: Optional[int] = None) -> int:
-        """Bulk weaken all connections above threshold in one UPDATE.
+        """Bulk weaken all connections above threshold in chunked UPDATEs.
 
         Writes ONE summary connection_history row per cycle when
         dream_session_id is given. We don't expand into per-edge rows here
         because batch_weaken can touch tens of thousands of edges per cycle
         — that would inflate connection_history without adding signal.
+
+        Chunked because the previous single UPDATE held the SQLite writer
+        for the duration on multi-million-edge corpora — concurrent
+        mazemaker_remember() calls during the dream cycle blocked for
+        seconds, dropping ingestion throughput on the 10M corpus and
+        starving the multi_session_synthesis path. The chunked form
+        still commits the whole weakening pass per cycle but yields the
+        writer between batches.
         """
+        BATCH_SIZE = 10000
         conn = self._connect()
         try:
-            cursor = conn.execute(
-                "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
-                "WHERE weight > ?",
-                (delta, threshold)
-            )
-            n = cursor.rowcount
-            if n > 0 and dream_session_id is not None:
+            # Id-range chunking: each rowid is visited exactly once, so
+            # the weaken is correct regardless of how many rows have
+            # weight > threshold. The "first N matching" form was a
+            # re-update bug — rows still above threshold after the
+            # delta got hit again next batch.
+            row = conn.execute("SELECT MAX(rowid) FROM connections").fetchone()
+            max_id = int(row[0] or 0)
+            total = 0
+            for start in range(1, max_id + 1, BATCH_SIZE):
+                cursor = conn.execute(
+                    "UPDATE connections SET weight = MAX(weight - ?, 0.0) "
+                    "WHERE weight > ? AND rowid >= ? AND rowid < ?",
+                    (delta, threshold, start, start + BATCH_SIZE),
+                )
+                total += cursor.rowcount or 0
+                conn.commit()
+            if total > 0 and dream_session_id is not None:
                 conn.execute(
                     "INSERT INTO connection_history "
                     "(source_id, target_id, old_weight, new_weight, reason, changed_at, dream_session_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (-1, -1, float(threshold), float(delta),
-                     f"nrem_bulk_weaken:{n}", time.time(), dream_session_id),
+                     f"nrem_bulk_weaken:{total}", time.time(), dream_session_id),
                 )
-            conn.commit()
-            return n
+                conn.commit()
+            return total
         finally:
             conn.close()
 
@@ -865,11 +965,97 @@ class SQLiteDreamBackend(DreamBackend):
         finally:
             conn.close()
 
+    def add_supersedes_batch(
+        self,
+        edges: "List[Tuple[int, int, float]]",
+        dream_session_id: "Optional[int]" = None,
+    ) -> int:
+        """Bulk-insert directed SUPERSEDES edges (source=older, target=newer).
+
+        Unlike add_bridges_batch, SUPERSEDES edges are directed and must NOT
+        be canonicalised to (min, max) — the direction encodes temporal order
+        (source was written before target).  Self-loops and within-batch
+        duplicates are still dropped.  Existing SUPERSEDES edges between the
+        same pair are skipped (idempotent).
+
+        Returns count of newly inserted edges.
+        """
+        if not edges:
+            return 0
+
+        # Within-batch dedup (keep first occurrence for each directed pair)
+        seen: Set[Tuple[int, int]] = set()
+        canon: List[Tuple[int, int, float]] = []
+        for s, t, w in edges:
+            if s == t:
+                continue
+            if (s, t) in seen:
+                continue
+            seen.add((s, t))
+            canon.append((int(s), int(t), max(0.0, min(1.0, float(w)))))
+
+        if not canon:
+            return 0
+
+        conn = self._connect()
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _supersedes_staging "
+                "(source_id INTEGER, target_id INTEGER, weight REAL)"
+            )
+            conn.execute("DELETE FROM _supersedes_staging")
+            conn.executemany(
+                "INSERT INTO _supersedes_staging (source_id, target_id, weight) VALUES (?, ?, ?)",
+                canon,
+            )
+            new_rows = conn.execute("""
+                SELECT s.source_id, s.target_id, s.weight
+                FROM _supersedes_staging s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM connections c
+                    WHERE c.source_id = s.source_id
+                      AND c.target_id = s.target_id
+                      AND c.edge_type = 'supersedes'
+                )
+            """).fetchall()
+
+            if not new_rows:
+                conn.commit()
+                return 0
+
+            now = time.time()
+            conn.executemany(
+                "INSERT INTO connections "
+                "(source_id, target_id, weight, edge_type, created_at) "
+                "VALUES (?, ?, ?, 'supersedes', ?)",
+                [(int(r[0]), int(r[1]), float(r[2]), now) for r in new_rows],
+            )
+            if dream_session_id is not None:
+                conn.executemany(
+                    "INSERT INTO connection_history "
+                    "(source_id, target_id, old_weight, new_weight, reason, "
+                    "changed_at, dream_session_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (int(r[0]), int(r[1]), 0.0, float(r[2]),
+                         "supersedes_detected", now, dream_session_id)
+                        for r in new_rows
+                    ],
+                )
+            conn.commit()
+            return len(new_rows)
+        finally:
+            conn.close()
+
     def prune_weak(self, threshold: float = 0.05) -> int:
         conn = self._connect()
         try:
+            # SUPERSEDES edges must never be pruned by weight — they encode a
+            # temporal fact (X was superseded by Y) that must survive regardless
+            # of the connection weight. Guard here so the threshold-based prune
+            # never accidentally removes a supersession edge.
             count = conn.execute(
-                "DELETE FROM connections WHERE weight < ?",
+                "DELETE FROM connections WHERE weight < ? AND COALESCE(edge_type, 'similar') != 'supersedes'",
                 (threshold,)
             ).rowcount
             conn.commit()
@@ -1057,7 +1243,7 @@ class DreamEngine:
 
     def __init__(
         self,
-        backend: DreamBackend,
+        backend,                            # DreamBackend OR Mazemaker-like instance
         neural_memory: Optional[Any] = None,
         idle_threshold: float = 300.0,     # 5 min idle
         memory_threshold: int = 50,         # dream every N new memories
@@ -1067,6 +1253,32 @@ class DreamEngine:
         sample_random_pct: float = 0.3,
         sample_low_salience_pct: float = 0.2,
     ):
+        # Convenience: accept a Mazemaker / Memory instance as first arg.
+        # DreamEngine(nm) is equivalent to DreamEngine.sqlite(nm._db_path,
+        # neural_memory=nm) — both nm._db_path and nm.db_path are checked.
+        if not isinstance(backend, DreamBackend):
+            nm = backend
+            db_path = (
+                getattr(nm, "_db_path", None)
+                or getattr(nm, "db_path", None)
+            )
+            if db_path is None:
+                # Dig into nested _sqlite_memory if present (mazemaker.Memory)
+                inner = getattr(nm, "_sqlite_memory", None)
+                if inner is not None:
+                    db_path = (
+                        getattr(inner, "_db_path", None)
+                        or getattr(getattr(inner, "store", None), "_db_path", None)
+                    )
+            if db_path is None:
+                raise TypeError(
+                    f"DreamEngine first arg must be a DreamBackend or a "
+                    f"Mazemaker/Memory instance with a _db_path attribute; "
+                    f"got {type(nm).__name__}"
+                )
+            backend = SQLiteDreamBackend(str(db_path))
+            if neural_memory is None:
+                neural_memory = nm
         self._backend = backend
         self._memory = neural_memory        # Mazemaker instance for think/recall
         self._idle_threshold = idle_threshold
@@ -1079,6 +1291,23 @@ class DreamEngine:
         self._sample_recent_pct = sample_recent_pct
         self._sample_random_pct = sample_random_pct
         self._sample_low_salience_pct = sample_low_salience_pct
+
+        # SUPERSEDES detection threshold: pairs with cosine >= this AND
+        # differing numeric tokens are candidates for a supersedes edge.
+        self._supersedes_sim_threshold: float = 0.85
+
+        # DAE compute schedule. dae_bulk_compute is a full-corpus pass —
+        # cheap on bench-scale (≤500 rows) but expensive on a 195k-row
+        # production conv. Recomputing every cycle would dominate the
+        # dream loop; recomputing never leaves the rerank channel
+        # producing nothing. Default: every 5 cycles. Override via
+        # MM_DAE_RECOMPUTE_EVERY. Set to 0 to disable explicitly.
+        try:
+            self._dae_recompute_every = int(
+                os.environ.get("MM_DAE_RECOMPUTE_EVERY", "5")
+            )
+        except ValueError:
+            self._dae_recompute_every = 5
 
         self._stop_event = threading.Event()  # set = stop requested
         self._thread: Optional[threading.Thread] = None
@@ -1130,6 +1359,43 @@ class DreamEngine:
         """Force an immediate dream cycle. Returns stats."""
         return self._run_dream_cycle()
 
+    def run_cycle(self, phases: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Run a dream cycle, optionally restricted to a subset of phases.
+
+        phases: list of phase names to run, e.g. ['nrem'], ['nrem', 'rem'].
+                None (default) runs all phases (nrem + rem + insight).
+                Valid phase names: 'nrem', 'rem', 'insight', 'supersedes'.
+
+        Returns per-phase stats dict. Useful for targeted testing or manual
+        triggering of a single phase without the overhead of a full cycle.
+        """
+        if phases is None:
+            return self._run_dream_cycle()
+        phases_set = {p.lower() for p in phases}
+        with self._lock:
+            start = time.time()
+            total_stats: Dict[str, Any] = {}
+            try:
+                if "nrem" in phases_set:
+                    total_stats["nrem"] = self._phase_nrem()
+                if "supersedes" in phases_set:
+                    total_stats["supersedes"] = self._phase_supersedes()
+                if "rem" in phases_set:
+                    total_stats["rem"] = self._phase_rem()
+                if "insight" in phases_set:
+                    total_stats["insights"] = self._phase_insights()
+                if "afe" in phases_set:
+                    total_stats["afe"] = self._phase_afe()
+                self._dream_count += 1
+                total_stats["duration"] = time.time() - start
+                total_stats["dream_id"] = self._dream_count
+            except Exception as e:
+                logger.error("run_cycle failed: %s", e)
+                total_stats["error"] = str(e)
+            finally:
+                self._last_activity = time.time()
+            return total_stats
+
     # -- Main loop -----------------------------------------------------------
 
     def _dream_loop(self) -> None:
@@ -1174,18 +1440,37 @@ class DreamEngine:
     # -- Dream Cycle ---------------------------------------------------------
 
     def _run_dream_cycle(self) -> Dict[str, Any]:
-        """Execute a full NREM → REM → Insight cycle."""
+        """Execute a full NREM → SUPERSEDES → REM → Insight → AFE → DAE cycle."""
         with self._lock:
             start = time.time()
-            total_stats: Dict[str, Any] = {"nrem": {}, "rem": {}, "insights": {}}
+            total_stats: Dict[str, Any] = {
+                "nrem": {}, "supersedes": {}, "rem": {}, "insights": {},
+                "afe": {}, "dae": {},
+            }
 
             try:
                 total_stats["nrem"] = self._phase_nrem()
+                # SUPERSEDES detection runs after NREM (connection graph is
+                # freshly pruned) but before REM (so bridging can see the
+                # new supersedes edges).  Always runs — no pro gate needed.
+                total_stats["supersedes"] = self._phase_supersedes()
                 # REM + Insight phases gate themselves — community
                 # installs see {"skipped": "pro_feature"} from those
                 # methods.  NREM consolidation always runs.
                 total_stats["rem"] = self._phase_rem()
                 total_stats["insights"] = self._phase_insights()
+                # AFE — Atomic Fact Extraction. Pulls structured atomic facts
+                # out of long (>500 char) memory turns and stores each as a
+                # new short memory linked back to source via SUPPORTS edge.
+                # LLM-free by default (regex + optional NER); LLM fallback
+                # opt-in via MAZEMAKER_AFE_LLM_FALLBACK=1.
+                total_stats["afe"] = self._phase_afe()
+                # DAE — Dream-Augmented Embeddings. Recompute every N
+                # cycles (default 5; MM_DAE_RECOMPUTE_EVERY). Runs LAST
+                # so the graph it averages over already reflects the
+                # cycle's NREM strengthen/prune + REM bridges + Insight
+                # cluster edges. Pro-gated inside _phase_dae.
+                total_stats["dae"] = self._phase_dae()
 
                 self._dream_count += 1
                 if self._memory:
@@ -1357,12 +1642,175 @@ class DreamEngine:
                 logger.debug("Maintenance cleanup error: %s", e)
 
         except Exception as e:
-            logger.debug("NREM phase error: %s", e)
+            logger.warning("NREM phase error: %s", e, exc_info=True)
         finally:
             try:
                 self._backend.finish_session(session_id, stats)
             except Exception as e:
                 logger.debug("NREM finish_session failed: %s", e)
+
+        return stats
+
+    # -- Phase 1.5: SUPERSEDES detection -------------------------------------
+
+    def _phase_supersedes(self) -> Dict[str, Any]:
+        """Detect cross-session supersessions missed at ingest time.
+
+        Scans a broad sample of memories for pairs (X, Y) where:
+          - cosine_similarity >= _supersedes_sim_threshold (same fact/entity)
+          - X.created_at < Y.created_at (Y is newer)
+          - Both X and Y contain at least one numeric/dollar/quantity token
+          - The numeric tokens differ (update, not duplicate)
+
+        Writes a directed 'supersedes' edge: source=X (older), target=Y (newer).
+        Idempotent — existing supersedes edges between the same pair are skipped.
+        """
+        stats: Dict[str, Any] = {"pairs_checked": 0, "supersedes_found": 0, "error": None}
+        session_id = self._backend.start_session("supersedes")
+
+        try:
+            # Use the same mixed sampler as NREM so we don't only scan recent
+            # memories — cross-session supersessions live in the older slices.
+            memories = self._backend.sample_for_dream(
+                self._max_memories,
+                recent_pct=self._sample_recent_pct,
+                random_old_pct=self._sample_random_pct,
+                low_salience_pct=self._sample_low_salience_pct,
+            )
+            if not memories or len(memories) < 2:
+                return stats
+
+            mem_ids = [m["id"] for m in memories]
+
+            # Fetch embeddings + created_at + content in one batch.
+            # get_memory_vectors gives us the float lists; we need created_at
+            # + content separately — fetch those from the backend directly.
+            vectors = self._backend.get_memory_vectors(mem_ids)
+            if not vectors:
+                return stats
+
+            # Fetch created_at and content via the backend-agnostic
+            # get_memory_metadata() — works on both SQLiteDreamBackend
+            # and DreamPostgresStore. Previously this reached for
+            # `_backend._connect()` and bare `? ...` placeholders, which
+            # made the supersedes phase a silent no-op under PG.
+            try:
+                id_meta = self._backend.get_memory_metadata(mem_ids)
+            except Exception as e:
+                logger.debug("SUPERSEDES: get_memory_metadata failed: %s", e)
+                return stats
+            if not id_meta:
+                return stats
+
+            # Build candidate list restricted to memories that have numeric tokens.
+            numeric_ids: List[int] = []
+            numeric_tokens: Dict[int, Set[str]] = {}
+            for mid in mem_ids:
+                if mid not in vectors or mid not in id_meta:
+                    continue
+                content = id_meta[mid]["content"]
+                tokens = set(_NUMERIC_TOKEN_RE.findall(content))
+                # Normalise tokens: strip commas and trailing zeros so "1,200"
+                # and "1200" are treated as the same number.
+                norm_tokens: Set[str] = set()
+                for tok in tokens:
+                    clean = tok.replace(",", "").strip()
+                    try:
+                        # Preserve the string after stripping so units survive
+                        # (e.g. "1.2K" stays "1.2K", not "1.2").
+                        float(clean.rstrip("KkMmBb%"))
+                        norm_tokens.add(clean)
+                    except ValueError:
+                        norm_tokens.add(clean)
+                if norm_tokens:
+                    numeric_ids.append(mid)
+                    numeric_tokens[mid] = norm_tokens
+
+            if len(numeric_ids) < 2:
+                return stats
+
+            # Vectorised pairwise cosine. The previous nested Python
+            # loop did ~180k cosine ops as ~4 µs apiece (one numpy
+            # array allocation per inner iteration would have been even
+            # slower). Stacking the embeddings once into an (N, D)
+            # matrix and computing N×N similarities in one matmul drops
+            # the budget from ~0.7 s to ~10 ms on a 600-vec subset —
+            # the time savings buy room for the supersedes phase to
+            # widen its sample without falling outside the dream cycle.
+            threshold = self._supersedes_sim_threshold
+            candidate_edges: List[Tuple[int, int, float]] = []
+
+            import numpy as _np
+            stacked = _np.asarray(
+                [vectors[nid] for nid in numeric_ids],
+                dtype=_np.float32,
+            )
+            # Row-normalise once; cosine sim then reduces to a dot product.
+            norms = _np.linalg.norm(stacked, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            stacked = stacked / norms
+            sim_matrix = stacked @ stacked.T  # (N, N) cosine sims
+
+            n_numeric = len(numeric_ids)
+            for i in range(n_numeric):
+                xid = numeric_ids[i]
+                xts = id_meta[xid]["created_at"]
+                xtoks = numeric_tokens[xid]
+                for j in range(i + 1, n_numeric):
+                    yid = numeric_ids[j]
+                    ytoks = numeric_tokens[yid]
+                    if xtoks == ytoks:
+                        continue
+                    sim = float(sim_matrix[i, j])
+                    if sim < threshold:
+                        continue
+                    yts = id_meta[yid]["created_at"]
+
+                    stats["pairs_checked"] += 1
+
+                    # Directed: source=older memory, target=newer memory
+                    if xts <= yts:
+                        older_id, newer_id = xid, yid
+                    else:
+                        older_id, newer_id = yid, xid
+
+                    candidate_edges.append((older_id, newer_id, sim))
+
+            if candidate_edges:
+                try:
+                    n = self._backend.add_supersedes_batch(  # type: ignore[attr-defined]
+                        candidate_edges, dream_session_id=session_id
+                    )
+                    stats["supersedes_found"] = n
+                except AttributeError:
+                    # Non-SQLite backend without add_supersedes_batch — fall
+                    # back to add_typed_connection if available.
+                    n = 0
+                    for src, tgt, w in candidate_edges:
+                        try:
+                            if self._backend.add_typed_connection(src, tgt, w, edge_type="supersedes"):
+                                n += 1
+                        except Exception:
+                            pass
+                    stats["supersedes_found"] = n
+
+            if stats["supersedes_found"]:
+                logger.info(
+                    "SUPERSEDES: %d new edges from %d pairs checked",
+                    stats["supersedes_found"], stats["pairs_checked"],
+                )
+
+        except Exception as e:
+            logger.warning("SUPERSEDES phase error: %s", e, exc_info=True)
+            stats["error"] = str(e)
+        finally:
+            try:
+                self._backend.finish_session(session_id, {
+                    "processed": stats.get("pairs_checked", 0),
+                    "bridges": stats.get("supersedes_found", 0),
+                })
+            except Exception as e:
+                logger.debug("SUPERSEDES finish_session failed: %s", e)
 
         return stats
 
@@ -1441,7 +1889,7 @@ class DreamEngine:
                     sim_score = sim.get("similarity", 0.0)
                     if not sim_id or sim_id == mid:
                         continue
-                    if sim_score < 0.3 or sim_score > 0.95:
+                    if sim_score < _REM_SIM_LOW or sim_score > _REM_SIM_HIGH:
                         continue
                     bridge_weight = round(float(sim_score) * 0.3, 3)
                     candidate_bridges.append((int(mid), int(sim_id), bridge_weight))
@@ -1474,7 +1922,7 @@ class DreamEngine:
                             stats["bridges"] += 1
 
         except Exception as e:
-            logger.debug("REM phase error: %s", e)
+            logger.warning("REM phase error: %s", e, exc_info=True)
         finally:
             try:
                 self._backend.finish_session(session_id, stats)
@@ -1598,8 +2046,8 @@ class DreamEngine:
             #     the tail.
             # Communities arrive sorted DESC by size (see _detect_communities)
             # so taking the prefix == taking the largest.
-            MIN_CLUSTER_SIZE = 10
-            MAX_CLUSTERS_PER_CYCLE = 50
+            MIN_CLUSTER_SIZE = _INSIGHT_MIN_CLUSTER
+            MAX_CLUSTERS_PER_CYCLE = _INSIGHT_MAX_CLUSTERS
             # Rotation window: skip communities whose anchor (lowest member
             # id, deterministic) has been emitted within this window.  6h
             # is large enough that the same Top-50 mega-clusters don't
@@ -1607,7 +2055,7 @@ class DreamEngine:
             # eventually cycle back through (after drift) for refresh.
             ANCHOR_REEMIT_WINDOW_S = 6 * 3600
 
-            recent_anchors = self.backend.recent_cluster_anchors(
+            recent_anchors = self._backend.recent_cluster_anchors(
                 ANCHOR_REEMIT_WINDOW_S
             )
 
@@ -1706,7 +2154,7 @@ class DreamEngine:
             )
 
         except Exception as e:
-            logger.debug("Insight phase error: %s", e, exc_info=True)
+            logger.warning("Insight phase error: %s", e, exc_info=True)
         finally:
             try:
                 self._backend.finish_session(session_id, stats)
@@ -1806,12 +2254,26 @@ class DreamEngine:
     def _write_derived_cluster_memory(self, comm: List[int], content: str, confidence: float) -> int | None:
         """Materialize a dream insight as a first-class derived memory.
 
-        Dedup strategy:
-        1) Reuse existing identical derived:cluster content when present.
-        2) Otherwise create a new memory entry (with conflict detection enabled).
+        Dedup strategy: derive a stable cluster fingerprint from the top
+        sorted member ids and store it in the label suffix
+        (`derived:cluster:<fp>`). Looking up that label catches the same
+        cluster across cycles even when Louvain renumbers communities
+        and even when `[cluster:N]` in the content drifts because the
+        member count moved by one. The previous "exact content match"
+        dedup missed the latter case and produced a duplicate every
+        cycle.
         """
         if not self._memory:
             return None
+
+        import hashlib
+        # Top-20 sorted member ids hashed. 20 is large enough to be
+        # cluster-identifying but small enough that adding/removing a
+        # peripheral member doesn't shift the fingerprint. Bigger windows
+        # would make dedup brittle; smaller windows would collide.
+        top = sorted(int(x) for x in comm)[:20]
+        fp = hashlib.sha256(repr(top).encode()).hexdigest()[:12]
+        cluster_label = f"derived:cluster:{fp}"
 
         store = getattr(self._memory, "store", None)
         if store is None and hasattr(self._memory, "_sqlite_memory"):
@@ -1819,24 +2281,18 @@ class DreamEngine:
 
         derived_id: Optional[int] = None
 
-        # Reuse exact duplicate first to prevent unbounded growth.
+        # Reuse the existing derived memory for this fingerprint, if any.
+        # Use the backend-agnostic find_by_label() instead of raw SQL —
+        # both SQLiteStore and PostgresStore expose it, and the previous
+        # `store.conn.execute("... ? ...")` form would crash under PG
+        # (PG uses %s placeholders, not ?).
         if store is not None:
             try:
-                lock = getattr(store, "_lock", None)
-                if lock is not None:
-                    with lock:
-                        row = store.conn.execute(
-                            "SELECT id FROM memories WHERE label = ? AND content = ? ORDER BY id DESC LIMIT 1",
-                            ("derived:cluster", content),
-                        ).fetchone()
-                else:
-                    row = store.conn.execute(
-                        "SELECT id FROM memories WHERE label = ? AND content = ? ORDER BY id DESC LIMIT 1",
-                        ("derived:cluster", content),
-                    ).fetchone()
-
-                if row is not None:
-                    derived_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                rows = store.find_by_label(cluster_label)
+                if rows:
+                    # find_by_label orders by id ASC; we want the most
+                    # recent for dedup so the latest cycle's content wins.
+                    derived_id = int(rows[-1]["id"])
                     try:
                         store.touch(derived_id)
                     except Exception:
@@ -1858,7 +2314,7 @@ class DreamEngine:
             try:
                 created = self._memory.remember(
                     content,
-                    label="derived:cluster",
+                    label=cluster_label,
                     auto_connect=False,
                     detect_conflicts=False,
                 )
@@ -1922,18 +2378,22 @@ class DreamEngine:
         if store is None:
             return 0
         cutoff = time.time() - keep_seconds
+        # LIKE 'derived:cluster%' catches both the legacy plain
+        # 'derived:cluster' rows and the new fingerprinted
+        # 'derived:cluster:<fp>' rows so dedup migration washes out
+        # naturally over the TTL window. Dispatch via the store method
+        # so PostgresStore gets the prune too — the previous raw-SQL
+        # form was SQLite-only and PG dream cycles never garbage-
+        # collected their derived clusters.
         try:
-            with store._lock:
-                cur = store.conn.execute(
-                    "DELETE FROM memories "
-                    "WHERE label = 'derived:cluster' AND created_at < ?",
-                    (cutoff,),
-                )
-                n = int(cur.rowcount or 0)
-                store.conn.commit()
-                return n
+            prune = getattr(store, "prune_memories_by_label_prefix", None)
+            if prune is None:
+                logger.debug("store %s has no prune_memories_by_label_prefix; "
+                             "derived:cluster GC skipped", type(store).__name__)
+                return 0
+            return prune("derived:cluster", cutoff)
         except Exception as exc:
-            logger.debug("derived:cluster prune failed: %s", exc)
+            logger.warning("derived:cluster prune failed: %s", exc)
             return 0
 
     def _extract_theme(self, node_ids: List[int]) -> str:
@@ -2094,6 +2554,352 @@ class DreamEngine:
             if budget <= 0:
                 break
         return " ".join(out_lines).strip()
+
+    def _phase_dae(self) -> Dict[str, Any]:
+        """Compute and persist Dream-Augmented Embeddings.
+
+        Runs every `_dae_recompute_every` cycles (default 5). The DAE
+        embedding is a PPR-weighted mix of each memory's own embedding
+        and the embeddings of its top-k graph neighbours, written to
+        `memory_dae_embeddings` for the rerank channel to consume.
+
+        Gated by:
+          * `has_feature("dae")` — Pro/Enterprise license
+          * `MM_DAE_ENABLED != "0"` — operator override
+          * `_dae_recompute_every > 0`
+
+        Returns a stats dict identical to dae.dae_bulk_compute output.
+        On gate misses, returns {"skipped": "<reason>"} so the cycle
+        summary stays observable.
+        """
+        if self._dae_recompute_every <= 0:
+            return {"skipped": "disabled_in_engine"}
+        if (os.environ.get("MM_DAE_ENABLED") or "1").strip() == "0":
+            return {"skipped": "mm_dae_enabled_off"}
+        # Only on the cadence boundary. _dream_count is incremented
+        # AFTER phases run, so dream_count==0 the first time through —
+        # we want the first cycle on a fresh process to populate too.
+        cycle_index = self._dream_count
+        if cycle_index > 0 and cycle_index % self._dae_recompute_every != 0:
+            return {"skipped": "off_cadence", "cycle": cycle_index,
+                    "every": self._dae_recompute_every}
+        if self._memory is None:
+            return {"skipped": "no_memory"}
+        try:
+            from dae import dae_bulk_compute, is_enabled
+        except Exception as exc:
+            return {"skipped": f"import_failed: {exc}"}
+        if not is_enabled():
+            return {"skipped": "pro_feature"}
+        t0 = time.time()
+        try:
+            stats = dae_bulk_compute(self._memory)
+        except Exception as exc:
+            logger.warning("DAE compute crashed: %s", exc)
+            return {"skipped": "crashed", "error": str(exc)}
+        stats["elapsed_s"] = round(time.time() - t0, 2)
+        if stats.get("ok"):
+            logger.info(
+                "DAE compute: cycle=%d wrote=%d skipped=%d errors=%d in %.1fs",
+                cycle_index, stats.get("written", 0), stats.get("skipped", 0),
+                stats.get("errors", 0), stats["elapsed_s"],
+            )
+        return stats
+
+    def _phase_afe(self) -> Dict[str, Any]:
+        """Atomic Fact Extraction phase — pure-Python, LLM-free by default.
+
+        For each long memory (>500 chars), extract atomic facts via regex
+        (Stage A) → spaCy NER (Stage B fallback) → optional tiny-LLM
+        (Stage C, opt-in via MAZEMAKER_AFE_LLM_FALLBACK=1).
+
+        Each extracted fact becomes a NEW short memory linked back to the
+        source via a 'supports' connection edge. Idempotent — memories
+        with label suffix `::afe::N` are skipped on re-runs.
+
+        Returns stats dict: { processed, source_long_memories,
+                              facts_extracted, written, by_stage }.
+        """
+        stats: Dict[str, Any] = {
+            "processed": 0,
+            "source_long_memories": 0,
+            "facts_extracted": 0,
+            "written": 0,
+            "by_stage": {"A": 0, "B": 0, "C": 0},
+            "error": None,
+        }
+        if self._memory is None:
+            stats["error"] = "no_memory_attached"
+            return stats
+
+        # Config knobs
+        try:
+            import os as _os
+            enable_ner = _os.environ.get("MAZEMAKER_AFE_NER", "1") not in ("0", "false", "False")
+            enable_llm = _os.environ.get("MAZEMAKER_AFE_LLM_FALLBACK", "0") not in ("0", "false", "False")
+            llm_model = _os.environ.get("MAZEMAKER_AFE_MODEL",
+                                        "DeepHermes-3-Llama-3-3B-Preview")
+            max_sources = int(_os.environ.get("MAZEMAKER_AFE_MAX_PER_CYCLE", "500"))
+            min_len = int(_os.environ.get("MAZEMAKER_AFE_MIN_LEN", "500"))
+        except Exception:
+            enable_ner, enable_llm = True, False
+            llm_model = "DeepHermes-3-Llama-3-3B-Preview"
+            max_sources, min_len = 500, 500
+
+        try:
+            from afe import extract_atomic_facts
+        except Exception as e:
+            stats["error"] = f"afe_import_failed: {e}"
+            return stats
+
+        # Get the underlying store. Backend-agnostic: SQLiteStore and
+        # PostgresStore both expose get_meta/set_meta/remember_batch/
+        # add_connections_batch/stream_long_memories_for_afe — so the AFE
+        # phase no longer needs raw `.conn` SQL access and works on PG
+        # without the SQLite gate that used to abort the phase.
+        inner = getattr(self._memory, "_sqlite_memory", None) or self._memory
+        store = getattr(inner, "store", None)
+        if store is None:
+            stats["error"] = "no_store_handle"
+            return stats
+        if not hasattr(store, "stream_long_memories_for_afe"):
+            stats["error"] = (
+                f"store {type(store).__name__} missing "
+                "stream_long_memories_for_afe — run-time too old"
+            )
+            return stats
+
+        try:
+            # Idempotency tracked via meta('afe_processed_ids'). On the
+            # PG backend `meta` is the canonical table; on SQLite it's
+            # `db_meta` but both stores expose the same get_meta/set_meta
+            # contract so we don't care which.
+            done_key = "afe_processed_ids"
+            done_raw = store.get_meta(done_key) or ""
+            done_ids: set = set()
+            if done_raw:
+                try:
+                    done_ids = set(int(x) for x in done_raw.split(",") if x)
+                except Exception:
+                    done_ids = set()
+
+            candidates = list(
+                store.stream_long_memories_for_afe(
+                    min_len=min_len,
+                    limit=max_sources,
+                    exclude_ids=done_ids,
+                )
+            )
+            stats["source_long_memories"] = len(candidates)
+
+            # ---- Step 1: extract ALL facts from ALL sources upfront ----
+            # flat list of (src_id, src_label, fact_text, stage, idx)
+            all_facts: list[tuple[int, str, str, str, int]] = []
+            new_done_ids = set(done_ids)
+
+            for src_id, src_label, src_content in candidates:
+                stats["processed"] += 1
+                try:
+                    facts = extract_atomic_facts(
+                        src_content,
+                        min_content_length=min_len,
+                        enable_ner=enable_ner,
+                        enable_llm_fallback=enable_llm,
+                        llm_model=llm_model,
+                    )
+                except Exception as e:
+                    logger.warning("AFE extract failed on memory %d: %s", src_id, e)
+                    facts = []
+
+                for idx, fact in enumerate(facts):
+                    stage = fact.get("stage", "A")
+                    stats["by_stage"][stage] = stats["by_stage"].get(stage, 0) + 1
+                    all_facts.append((src_id, src_label or f"mem{src_id}", fact["text"], stage, idx))
+
+                stats["facts_extracted"] += len(facts)
+                new_done_ids.add(src_id)
+
+            if not all_facts:
+                # Nothing to write — persist done set and return early.
+                store.set_meta(done_key, ",".join(str(i) for i in new_done_ids))
+            else:
+                # ---- Step 2: batch embed ALL fact texts in ONE call ----
+                fact_texts = [f[2] for f in all_facts]
+
+                # Resolve embedder: prefer NeuralMemory on inner, then Memory
+                _embedder = None
+                _inner_nm = getattr(self._memory, "_sqlite_memory", None) or self._memory
+                _embedder = getattr(_inner_nm, "embedder", None)
+                if _embedder is None:
+                    _embedder = getattr(self._memory, "embedder", None)
+
+                embed_batch_fn = getattr(_embedder, "embed_batch", None) if _embedder else None
+                embed_fn = getattr(_embedder, "embed", None) if _embedder else None
+
+                # Embed in chunks to stay within the socket server's 10s
+                # timeout (a 17k-text mega-batch would time out). 512 texts
+                # per chunk is fast (<2s each on CUDA BGE-M3) and keeps the
+                # IPC count low (35 trips for 17k facts vs 17k individual embeds).
+                _EMBED_CHUNK = 512
+
+                # Fail-loud embed: under contention the shared client now
+                # retries 5× with exponential backoff (embed_provider.py
+                # SharedEmbedClient._send_with_retry). If that still fails
+                # we raise — silently writing 0 facts after extracting
+                # thousands is a worse failure mode than aborting the cycle.
+                _embed_failures: list[tuple[int, int, str]] = []  # (start, end, err)
+
+                def _embed_chunk_with_retry(chunk: list[str], start_idx: int) -> list:
+                    """Up to 3 in-AFE retries with backoff around chunk-level
+                    failures (separate from the client-level retry budget,
+                    which handles single-call transients). Each attempt has
+                    its own client-level retry budget, so a chunk gets up to
+                    15 socket attempts total before AFE gives up."""
+                    import time as _time
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            vecs = embed_batch_fn(chunk)
+                            if len(vecs) != len(chunk):
+                                raise RuntimeError(
+                                    f"embed_batch returned {len(vecs)} vecs "
+                                    f"for {len(chunk)} texts"
+                                )
+                            return vecs
+                        except Exception as e:
+                            last_err = e
+                            logger.warning(
+                                "AFE embed_batch chunk %d-%d attempt %d failed: %s",
+                                start_idx, start_idx + len(chunk), attempt + 1, e,
+                            )
+                            if attempt < 2:
+                                _time.sleep(1.0 * (2 ** attempt))  # 1s, 2s
+                    _embed_failures.append(
+                        (start_idx, start_idx + len(chunk), str(last_err))
+                    )
+                    raise RuntimeError(
+                        f"AFE embed_batch chunk {start_idx}-"
+                        f"{start_idx + len(chunk)} failed after 3 retries: "
+                        f"{last_err}"
+                    )
+
+                if embed_batch_fn is None:
+                    if embed_fn is None:
+                        raise RuntimeError(
+                            "AFE: no embedder available (neither embed_batch "
+                            "nor embed) — cannot persist facts"
+                        )
+                    all_embeddings = [embed_fn(ft) for ft in fact_texts]
+                else:
+                    all_embeddings = []
+                    for _ci in range(0, len(fact_texts), _EMBED_CHUNK):
+                        _chunk = fact_texts[_ci: _ci + _EMBED_CHUNK]
+                        all_embeddings.extend(
+                            _embed_chunk_with_retry(_chunk, _ci)
+                        )
+
+                # ---- Step 3: bulk INSERT memories via store.remember_batch ----
+                # Backend-agnostic: SQLiteStore and PostgresStore both
+                # accept a list of {label, content, embedding, salience}
+                # dicts and return ids in order. No raw SQL, no
+                # per-backend INSERT shape, works on PG with HNSW
+                # auto-update and on SQLite with FTS5 triggers.
+                dim = getattr(_inner_nm, "dim", None)
+
+                batch_rows: list[dict] = []
+                fact_meta: list[tuple[int, str, str, list[float]]] = []
+                # (src_id, fact_label, fact_text, embedding_floats)
+
+                _dropped = 0
+                for (src_id, src_label_base, fact_text, stage, idx), emb in zip(all_facts, all_embeddings):
+                    if emb is None or (dim is not None and len(emb) != dim):
+                        # After fail-loud retries, this should only happen
+                        # if dim mismatches — log so the operator sees it.
+                        _dropped += 1
+                        continue
+                    fact_label = f"{src_label_base}::afe::{stage}{idx}"
+                    batch_rows.append({
+                        "label": fact_label,
+                        "content": fact_text,
+                        "embedding": list(emb),
+                        "salience": 0.95,
+                    })
+                    fact_meta.append((src_id, fact_label, fact_text, list(emb)))
+
+                if _dropped:
+                    logger.warning(
+                        "AFE: %d/%d facts dropped due to embed/dim mismatch",
+                        _dropped, len(all_facts),
+                    )
+                if not batch_rows:
+                    # Hard refusal: don't mark these sources "done" if no
+                    # facts made it through. Future cycles will retry them.
+                    raise RuntimeError(
+                        f"AFE: extracted {len(all_facts)} facts but 0 made "
+                        "it through embedding/dim filter — not marking "
+                        "sources done so they're retried"
+                    )
+                else:
+                    try:
+                        inserted_ids = list(store.remember_batch(batch_rows))
+                        if len(inserted_ids) != len(batch_rows):
+                            raise RuntimeError(
+                                f"remember_batch returned {len(inserted_ids)} ids "
+                                f"for {len(batch_rows)} rows"
+                            )
+
+                        # ---- Step 4: bulk 'supports' edges via store API ----
+                        edge_pairs = [
+                            (int(new_mem_id), int(src_id), 0.95)
+                            for new_mem_id, (src_id, _fl, _ft, _emb)
+                            in zip(inserted_ids, fact_meta)
+                        ]
+                        if edge_pairs and hasattr(store, "add_connections_batch"):
+                            store.add_connections_batch(edge_pairs, edge_type="supports")
+
+                        store.set_meta(done_key, ",".join(str(i) for i in new_done_ids))
+                        stats["written"] = len(inserted_ids)
+
+                        # ---- Step 5: bulk update GpuRecallEngine tensor ----
+                        # Single torch.cat over the whole batch instead
+                        # of N cats in a loop. Each torch.cat on GPU
+                        # reallocates the entire (N+1, D) tensor; doing
+                        # that 17k times fragments GPU memory and is the
+                        # slowest part of AFE write. Stacking the new
+                        # rows once and concatenating once is ~2 ops
+                        # total regardless of batch size.
+                        _gpu = getattr(_inner_nm, "_gpu", None)
+                        if _gpu is not None and getattr(_gpu, "_loaded", False) and inserted_ids:
+                            try:
+                                import torch
+                                device = getattr(_gpu, "_device", None) or torch.device("cpu")
+                                new_rows = torch.tensor(
+                                    [meta[3] for meta in fact_meta],
+                                    device=device, dtype=torch.float32,
+                                )
+                                _gpu._emb_tensor = torch.cat([_gpu._emb_tensor, new_rows], dim=0)
+                                for new_mem_id, (src_id, fact_label, fact_text, _emb) in zip(inserted_ids, fact_meta):
+                                    _gpu._ids.append(int(new_mem_id))
+                                    _gpu._labels.append(fact_label)
+                                    _gpu._contents.append(fact_text)
+                                _gpu._emb_tensor_normed = None
+                            except Exception as e:
+                                logger.warning("AFE GPU tensor update failed (cache stale until rebuild): %s", e)
+
+                    except Exception:
+                        raise
+
+        except Exception as e:
+            logger.error("_phase_afe failed: %s", e)
+            stats["error"] = str(e)
+
+        logger.info(
+            "AFE: %d sources, %d facts extracted (A=%d B=%d C=%d), %d written",
+            stats["processed"], stats["facts_extracted"],
+            stats["by_stage"]["A"], stats["by_stage"]["B"], stats["by_stage"]["C"],
+            stats["written"],
+        )
+        return stats
 
     def get_stats(self) -> Dict[str, Any]:
         """Get dream engine statistics."""

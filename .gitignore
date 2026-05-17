@@ -36,3 +36,8 @@ benchmarks/external/logs/
 benchmarks/external/.demolition-venv/
 benchmarks/track_a_*.log
 .wrangler/
+snapshots/
+smoke/
+probing_eval/
+external/benchmarks/logs/
+benchmarks/logs/

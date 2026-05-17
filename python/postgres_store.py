@@ -67,8 +67,19 @@ def _env(key: str, fallback: str = "") -> str:
     return os.environ.get(key) or _dotenv.get(key, fallback)
 
 
+_PW_WARN_EMITTED = False
+
+
 def _build_dsn() -> str:
-    """Resolve a DSN from env, .env, or discrete fields."""
+    """Resolve a DSN from env, .env, or discrete fields.
+
+    Returns a URI-form DSN (`postgresql://user:pw@host:port/db`) with
+    user and password percent-encoded. The previous keyword-DSN form
+    interpolated the raw password into an f-string, which broke for
+    passwords containing spaces, single quotes, '#', or '\\' — libpq
+    keyword values need shell-style quoting that we were not doing.
+    """
+    global _PW_WARN_EMITTED
     dsn = _env("MM_POSTGRES_DSN", "")
     if dsn:
         return dsn
@@ -78,14 +89,21 @@ def _build_dsn() -> str:
     user = _env("MM_POSTGRES_USER", "mazemaker")
     password = _env("MM_POSTGRES_PASSWORD", "")
     if not password:
-        logger.warning(
-            "MM_POSTGRES_PASSWORD not set — add it to ~/.hermes/.env or "
-            "the MM_POSTGRES_DSN env var"
-        )
-    # Use keyword DSN (libpq syntax) — psycopg accepts it directly.
-    return (
-        f"host={host} port={port} dbname={db} user={user} password={password}"
-    )
+        # Empty password is fine when pg_hba.conf maps the local user to
+        # `trust`/`peer` auth (the default for a single-operator host). Warn
+        # only once per process so multi-connection pipelines don't spam the
+        # log, and demote to INFO so it doesn't look like an error.
+        if not _PW_WARN_EMITTED:
+            _PW_WARN_EMITTED = True
+            logger.info(
+                "MM_POSTGRES_PASSWORD empty — relying on local trust/peer "
+                "auth. If PG rejects the connection, add the password to "
+                "~/.hermes/.env or MM_POSTGRES_DSN."
+            )
+    import urllib.parse
+    user_q = urllib.parse.quote(user, safe="")
+    pw_q = urllib.parse.quote(password, safe="")
+    return f"postgresql://{user_q}:{pw_q}@{host}:{port}/{db}"
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_conn_target ON connections(target_id);
 CREATE INDEX IF NOT EXISTS idx_conn_weight ON connections(weight);
 CREATE INDEX IF NOT EXISTS idx_conn_edge_type_weight ON connections(edge_type, weight);
 CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON memories
-    USING gin (to_tsvector('simple', coalesce(content, '')));
+    USING gin (to_tsvector('english', coalesce(content, '')));
 CREATE INDEX IF NOT EXISTS idx_memories_label ON memories(label);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
 """
@@ -189,6 +207,8 @@ class PostgresStore:
     cursors fast. The pool is lazily opened on construction and closed
     by close().
     """
+
+    _SCHEMA_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
 
     def __init__(self, dsn: str | None = None, min_size: int = 1, max_size: int = 8):
         try:
@@ -205,6 +225,13 @@ class PostgresStore:
         self._dsn = dsn or _build_dsn()
         self._register_vector = register_vector
         self._lock = threading.Lock()
+        schema = _env("MM_POSTGRES_SCHEMA", "public") or "public"
+        if not self._SCHEMA_RE.match(schema):
+            raise ValueError(
+                f"MM_POSTGRES_SCHEMA={schema!r} rejected: must match "
+                f"[A-Za-z0-9_]{{1,32}}"
+            )
+        self._schema = schema
         # The pool's `configure` hook registers the vector adapter on each
         # new connection so list[float]<->vector conversion works without
         # per-call casts.
@@ -223,6 +250,14 @@ class PostgresStore:
 
     def _configure_conn(self, conn) -> None:
         """Register pgvector adapter on a freshly-opened connection."""
+        # search_path is set BEFORE register_vector so any DDL/queries the
+        # adapter issues during type lookup land in the operator-scoped
+        # schema. Identifier is regex-validated in __init__ — safe to inline.
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path = {self._schema}, public")
+        except Exception:
+            pass
         # CREATE EXTENSION must already have run for register_vector to find
         # the vector OID; _ensure_schema() runs that on the first borrow.
         try:
@@ -245,12 +280,40 @@ class PostgresStore:
     def _ensure_schema(self) -> None:
         """Create base tables, extension, and re-register vector adapter."""
         with self._cursor() as (conn, cur):
+            # CREATE SCHEMA before search_path can land us anywhere useful.
+            # _configure_conn already set search_path on this borrowed conn,
+            # so re-issue SET after the CREATE in case the schema is brand
+            # new (search_path silently no-ops on missing schemas in PG14+).
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {self._schema}")
+            cur.execute(f"SET search_path = {self._schema}, public")
             cur.execute(_BASE_SCHEMA)
             # Idempotent migration for pre-existing DBs that predate the
             # colbert_tokens column. Postgres's IF NOT EXISTS clause makes
             # this no-op when already applied.
             cur.execute(
                 "ALTER TABLE memories ADD COLUMN IF NOT EXISTS colbert_tokens BYTEA"
+            )
+            # DAE table mirrors the SQLite layout: vector is the
+            # float32-packed BYTEA blob (same wire format as SQLite's
+            # BLOB column so the dream engine's compute path stays
+            # backend-agnostic). engine_config.py used to disable DAE
+            # on PG because this table was missing — now both backends
+            # carry it and Mazemaker._dae_score_candidates dispatches
+            # via store.fetch_dae_vectors().
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS memory_dae_embeddings (
+                    memory_id        BIGINT PRIMARY KEY,
+                    vector           BYTEA NOT NULL,
+                    self_weight      DOUBLE PRECISION NOT NULL,
+                    neighbour_k      INTEGER NOT NULL,
+                    schema_version   INTEGER NOT NULL,
+                    computed_at      DOUBLE PRECISION NOT NULL,
+                    FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+                )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dae_computed_at "
+                "ON memory_dae_embeddings(computed_at)"
             )
             # Re-register vector now that the extension definitely exists,
             # in case _configure_conn ran before CREATE EXTENSION.
@@ -259,10 +322,16 @@ class PostgresStore:
             except Exception:
                 pass
             # Cache embedding dim if the column already exists (existing DB).
+            # Schema-scoped: pg_attribute has no namespace filter by default,
+            # so unqualified `relname = 'memories'` would surface ANY schema's
+            # memories.embedding and break MM_POSTGRES_SCHEMA isolation.
             cur.execute(
-                "SELECT atttypmod FROM pg_attribute "
-                " JOIN pg_class ON attrelid = pg_class.oid "
-                " WHERE relname = 'memories' AND attname = 'embedding'"
+                "SELECT atttypmod FROM pg_attribute a "
+                " JOIN pg_class c ON a.attrelid = c.oid "
+                " JOIN pg_namespace n ON c.relnamespace = n.oid "
+                " WHERE c.relname = 'memories' AND a.attname = 'embedding' "
+                "   AND n.nspname = %s",
+                (self._schema,),
             )
             row = cur.fetchone()
             if row is not None and row[0] is not None and row[0] > 0:
@@ -280,9 +349,12 @@ class PostgresStore:
                 return
             with self._cursor() as (conn, cur):
                 cur.execute(
-                    "SELECT atttypmod FROM pg_attribute "
-                    " JOIN pg_class ON attrelid = pg_class.oid "
-                    " WHERE relname = 'memories' AND attname = 'embedding'"
+                    "SELECT atttypmod FROM pg_attribute a "
+                    " JOIN pg_class c ON a.attrelid = c.oid "
+                    " JOIN pg_namespace n ON c.relnamespace = n.oid "
+                    " WHERE c.relname = 'memories' AND a.attname = 'embedding' "
+                    "   AND n.nspname = %s",
+                    (self._schema,),
                 )
                 row = cur.fetchone()
                 if row is not None and row[0] is not None and row[0] > 0:
@@ -295,13 +367,18 @@ class PostgresStore:
                         f"but current backend produces dim={dim}. Drop or "
                         f"migrate the DB before switching models."
                     )
-                # Add the column + HNSW cosine index.
+                # Add the column. HNSW index creation is deferred when
+                # MM_DEFER_HNSW=1 so bulk-ingest paths can drop the
+                # O(M log N) per-insert overhead and rebuild the index
+                # once at the end of the batch. Without that env the
+                # index is created eagerly (correctness for ad-hoc writers).
                 cur.execute(f"ALTER TABLE memories ADD COLUMN embedding vector({dim})")
-                cur.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw "
-                    "ON memories USING hnsw (embedding vector_cosine_ops) "
-                    "WITH (m=16, ef_construction=64)"
-                )
+                if os.environ.get("MM_DEFER_HNSW", "").strip() not in ("1", "true", "True"):
+                    cur.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw "
+                        "ON memories USING hnsw (embedding vector_cosine_ops) "
+                        "WITH (m=16, ef_construction=64)"
+                    )
                 self._embedding_dim = dim
 
     # -- writes -------------------------------------------------------------
@@ -346,6 +423,218 @@ class PostgresStore:
                 (int(id_),),
             )
             return int(id_)
+
+    # -- bulk-ingest helpers (godbench / large-corpus loaders) --------------
+    #
+    # Three ingest fast-paths cooperate:
+    #   1. `drop_bulk_indexes()` removes the HNSW vector index, the GIN FTS
+    #      index, and the cheap btrees that PG would otherwise maintain on
+    #      every INSERT.  CREATE INDEX on a populated table is parallel and
+    #      orders of magnitude cheaper than incremental maintenance.
+    #   2. `remember_batch_copy()` (engaged automatically when MM_PG_COPY=1
+    #      or rows >= MM_PG_COPY_THRESHOLD, default 1000) bypasses INSERT …
+    #      VALUES and streams via `COPY memories FROM STDIN` after claiming
+    #      a contiguous id range from the BIGSERIAL sequence.
+    #   3. `create_bulk_indexes(dim)` rebuilds the indexes after ingest.
+    #      pg_hint here uses parallel-workers and increased
+    #      maintenance_work_mem for the HNSW build.
+
+    # HNSW intentionally excluded — pgvector's parallel CREATE INDEX on a
+    # populated 333k×1024-d table takes ~25 min with 3 workers fighting
+    # over the shared graph layers, vs ~5 min of incremental maintenance
+    # during INSERT-from-SELECT.  Leave the HNSW index live during ingest
+    # and let the bulk INSERT update it row-by-row.
+    _BULK_INDEXES = (
+        "idx_memories_content_fts",
+        "idx_memories_label",
+        "idx_memories_created_at",
+    )
+
+    def drop_bulk_indexes(self) -> list[str]:
+        """Drop all ingest-cost indexes on `memories`.
+
+        Returns the list of index names actually dropped.  Idempotent — a
+        missing index is silently skipped.  Caller must invoke
+        `create_bulk_indexes(dim)` after bulk ingest completes.
+        """
+        dropped: list[str] = []
+        with self._cursor() as (_conn, cur):
+            for idx in self._BULK_INDEXES:
+                cur.execute(f"DROP INDEX IF EXISTS {idx}")
+                dropped.append(idx)
+        return dropped
+
+    def create_bulk_indexes(self, dim: Optional[int] = None) -> None:
+        """Recreate the ingest-cost indexes on `memories`.
+
+        Run after a `drop_bulk_indexes()` + bulk-ingest cycle.  The HNSW
+        index is only created when `dim` is provided and the column exists.
+        """
+        with self._cursor() as (_conn, cur):
+            # Bump maintenance memory + parallelism for this session only
+            # so the HNSW + GIN builds use the full machine.
+            try:
+                cur.execute("SET LOCAL maintenance_work_mem = '2GB'")
+                cur.execute("SET LOCAL max_parallel_maintenance_workers = 8")
+            except Exception:
+                pass
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_label "
+                "ON memories(label)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_created_at "
+                "ON memories(created_at DESC)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_content_fts "
+                "ON memories USING gin (to_tsvector('english', "
+                "coalesce(content, '')))"
+            )
+            if dim is not None and (self._embedding_dim or dim) > 0:
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw "
+                    "ON memories USING hnsw (embedding vector_cosine_ops) "
+                    "WITH (m=16, ef_construction=64)"
+                )
+
+    def remember_batch_copy(self, rows: list[dict]) -> list[int]:
+        """COPY-based bulk ingest path.
+
+        Pre-claims a contiguous id range from `memories_id_seq`, then
+        streams the rows through `COPY memories (...) FROM STDIN` using
+        psycopg3's binary copy with the pgvector adapter.  Roughly 4–8×
+        faster than multi-row INSERT for >1k rows on a populated table,
+        and even more when paired with `drop_bulk_indexes()`.
+
+        Returns the assigned ids in input order.
+        """
+        if not rows:
+            return []
+        dim = len(rows[0].get("embedding") or [])
+        if dim == 0:
+            raise ValueError("remember_batch_copy: first row has empty embedding")
+        for r in rows:
+            emb = r.get("embedding") or []
+            if len(emb) != dim:
+                raise ValueError(
+                    f"remember_batch_copy: mixed embedding dims "
+                    f"({len(emb)} != {dim})"
+                )
+        self._ensure_embedding_column(dim)
+
+        n = len(rows)
+        with self._cursor() as (_conn, cur):
+            # Claim n contiguous ids in one round-trip.  Returns them in
+            # ascending order so we can zip back with `rows`.
+            cur.execute(
+                "SELECT nextval(pg_get_serial_sequence('memories','id')) "
+                "FROM generate_series(1, %s)",
+                (n,),
+            )
+            ids = [int(r[0]) for r in cur.fetchall()]
+
+            # pgvector accepts the text format `[v1,v2,…]` in COPY but
+            # NOT psycopg's default array form `{v1,v2,…}`.  psycopg3 also
+            # doesn't register a binary send adapter for the `vector` type
+            # (binary COPY raises ProtocolViolation), so we serialise the
+            # embedding by hand and stream as text COPY.
+            with cur.copy(
+                "COPY memories (id, label, content, embedding, vector_dim, salience) "
+                "FROM STDIN"
+            ) as cp:
+                for mid, r in zip(ids, rows):
+                    sal = r.get("salience")
+                    emb = r.get("embedding") or []
+                    emb_text = "[" + ",".join(repr(float(v)) for v in emb) + "]"
+                    cp.write_row((
+                        mid,
+                        r.get("label"),
+                        r.get("content", ""),
+                        emb_text,
+                        dim,
+                        float(sal) if sal is not None else 1.0,
+                    ))
+
+            # Bump the sequence past the claimed range.  setval with
+            # is_called=true means the next nextval() returns max(ids)+1.
+            cur.execute(
+                "SELECT setval(pg_get_serial_sequence('memories','id'), %s)",
+                (ids[-1],),
+            )
+        return ids
+
+    def remember_batch(self, rows: list[dict]) -> list[int]:
+        if not rows:
+            return []
+        # Bulk-ingest fast path.  Engaged automatically when the caller
+        # opts in via MM_PG_COPY=1 (always-on) or the row count crosses
+        # MM_PG_COPY_THRESHOLD (default 1000 — below that, the multi-row
+        # INSERT below already round-trips once and isn't the bottleneck).
+        copy_flag = (os.environ.get("MM_PG_COPY", "").strip() in ("1", "true", "True"))
+        try:
+            threshold = int(os.environ.get("MM_PG_COPY_THRESHOLD", "1000"))
+        except ValueError:
+            threshold = 1000
+        if copy_flag or len(rows) >= threshold:
+            return self.remember_batch_copy(rows)
+
+        dim = len(rows[0].get("embedding") or [])
+        if dim == 0:
+            raise ValueError("remember_batch: first row has empty embedding")
+        for r in rows:
+            emb = r.get("embedding") or []
+            if len(emb) != dim:
+                raise ValueError(
+                    f"remember_batch: mixed embedding dims "
+                    f"({len(emb)} != {dim})"
+                )
+        self._ensure_embedding_column(dim)
+
+        params: list[tuple] = []
+        for r in rows:
+            salience = r.get("salience")
+            params.append((
+                r.get("label"),
+                r.get("content", ""),
+                r.get("embedding") or [],
+                dim,
+                float(salience) if salience is not None else 1.0,
+            ))
+
+        # Single multi-row INSERT … VALUES (..), (..), … RETURNING id.
+        # Avoids psycopg3's executemany(returning=True) which opens an
+        # implicit pipeline that wasn't reliably closing across multiple
+        # PostgresStore instances in one process (pipeline=ON leaked,
+        # subsequent INSERTs hit pipeline-aborted state).
+        #
+        # PG's bind-parameter ceiling is 65535. With 5 params/row the
+        # call breaks above ~13k rows, so chunk before issuing the
+        # INSERT. Chunk of 10k = 50k params, well under the ceiling
+        # and one round-trip per chunk — still O(rows / 10k) calls,
+        # not O(rows) like executemany.
+        PARAM_CEIL = 65000
+        params_per_row = 5
+        chunk_size = max(1, PARAM_CEIL // params_per_row)
+        ids: list[int] = []
+        with self._cursor() as (conn, cur):
+            for start in range(0, len(params), chunk_size):
+                slab = params[start:start + chunk_size]
+                values_clause = ", ".join(["(%s, %s, %s, %s, %s)"] * len(slab))
+                flat: list = []
+                for p in slab:
+                    flat.extend(p)
+                cur.execute(
+                    f"INSERT INTO memories (label, content, embedding, vector_dim, salience) "
+                    f"VALUES {values_clause} RETURNING id",
+                    flat,
+                )
+                ids.extend(int(r[0]) for r in cur.fetchall())
+        if len(ids) != len(rows):
+            raise RuntimeError(
+                f"remember_batch: expected {len(rows)} ids, got {len(ids)}"
+            )
+        return ids
 
     def touch(self, id_: int) -> None:
         with self._cursor() as (_conn, cur):
@@ -441,13 +730,68 @@ class PostgresStore:
             "access_count": access,
         }
 
-    def get_all(self) -> list[dict]:
+    def search_semantic(self, query_vec: "list[float]",
+                        limit: int = 50) -> list[dict]:
+        """pgvector HNSW cosine search. Sub-50 ms on a 200 k-row corpus
+        because the `idx_memories_embedding_hnsw` index does the kNN.
+
+        Mazemaker._semantic_candidates falls through to ``get_all()`` +
+        Python cosine when none of {GPU recall, HNSW (Python), C++} are
+        armed — which on the PG backend was burning ~75 s/query scanning
+        186 k rows in Python. The store knows how to ask Postgres for the
+        same answer in milliseconds; this method exposes it.
+
+        Returns list of dicts with id, score (cosine similarity), similarity,
+        channel — same shape Mazemaker._semantic_candidates expects so it
+        can drop the result straight into the RRF fusion.
+        """
+        import psycopg
+        try:
+            from pgvector.psycopg import register_vector  # type: ignore
+        except Exception:
+            register_vector = None
+
+        # pgvector wants its own type adapter — register it on the borrowed
+        # connection. The pool may return a conn that hasn't been
+        # registered yet for vector input.
+        emb_str = "[" + ",".join(f"{v:.7g}" for v in query_vec) + "]"
         with self._cursor() as (_conn, cur):
-            cur.execute(
-                "SELECT id, label, content, embedding, vector_dim, salience, "
-                "created_at, last_accessed, access_count "
-                "FROM memories ORDER BY id"
-            )
+            try:
+                cur.execute(
+                    "SELECT id, 1 - (embedding <=> %s::vector) AS sim "
+                    "FROM memories "
+                    "WHERE embedding IS NOT NULL "
+                    "ORDER BY embedding <=> %s::vector "
+                    "LIMIT %s",
+                    (emb_str, emb_str, int(limit)),
+                )
+                rows = cur.fetchall()
+            except psycopg.errors.UndefinedColumn:
+                return []
+        return [
+            {
+                "id": int(r[0]),
+                "score": float(r[1]) if r[1] is not None else 0.0,
+                "similarity": float(r[1]) if r[1] is not None else 0.0,
+                "channel": "semantic",
+            }
+            for r in rows
+        ]
+
+    def get_all(self) -> list[dict]:
+        # Fresh schema has no `embedding` column yet (added lazily on first
+        # write once the dim is known). Treat that as an empty table — the
+        # column will appear after the first remember_batch().
+        import psycopg
+        with self._cursor() as (_conn, cur):
+            try:
+                cur.execute(
+                    "SELECT id, label, content, embedding, vector_dim, salience, "
+                    "created_at, last_accessed, access_count "
+                    "FROM memories ORDER BY id"
+                )
+            except psycopg.errors.UndefinedColumn:
+                return []
             return [self._row_to_dict(r, with_embedding=True) for r in cur.fetchall()]
 
     def get(self, id_: int, include_embedding: bool = True) -> Optional[dict]:
@@ -628,6 +972,29 @@ class PostgresStore:
                 (blob, int(memory_id)),
             )
 
+    def set_colbert_tokens_many(self, rows) -> int:
+        """Bulk-write ColBERT blobs via COPY into a temp table + single
+        UPDATE FROM. ~50–100× faster than looping set_colbert_tokens for
+        large batches: one COPY + one UPDATE per call instead of N
+        round-trips. rows is an iterable of (memory_id, blob) pairs."""
+        rows = [(int(mid), bytes(blob)) for (mid, blob) in rows if blob is not None]
+        if not rows:
+            return 0
+        with self._cursor() as (_conn, cur):
+            cur.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _cb_stage "
+                "(id BIGINT PRIMARY KEY, blob BYTEA) ON COMMIT PRESERVE ROWS"
+            )
+            cur.execute("TRUNCATE _cb_stage")
+            with cur.copy("COPY _cb_stage (id, blob) FROM STDIN") as cp:
+                for mid, blob in rows:
+                    cp.write_row((mid, blob))
+            cur.execute(
+                "UPDATE memories SET colbert_tokens = s.blob "
+                "FROM _cb_stage s WHERE memories.id = s.id"
+            )
+            return int(cur.rowcount or 0)
+
     def get_colbert_tokens_many(self, ids: "list[int]") -> "dict[int, bytes]":
         ids = [int(i) for i in ids if i is not None]
         if not ids:
@@ -643,6 +1010,116 @@ class PostgresStore:
                 blob = r[1]
                 if blob:
                     out[int(r[0])] = bytes(blob)
+        return out
+
+    def ensure_dae_schema(self) -> bool:
+        """The PG `memory_dae_embeddings` table is created by
+        `_ensure_schema()` on first connect (see _BASE_SCHEMA + the
+        inline DAE block). Nothing to do here beyond confirming the
+        license gate — the table either exists or the operator isn't
+        on a Pro tier in which case the read path returns {}.
+        """
+        try:
+            from dae import is_enabled
+            return bool(is_enabled())
+        except Exception:
+            return False
+
+    def upsert_dae_vectors(
+        self,
+        rows: "list[tuple[int, bytes, float, int, int, float]]",
+    ) -> int:
+        """PG counterpart of SQLiteStore.upsert_dae_vectors.
+
+        Uses ON CONFLICT (memory_id) DO UPDATE so the operation has the
+        same upsert semantics as SQLite's INSERT OR REPLACE.
+        """
+        if not rows:
+            return 0
+        # Convert blobs to memoryview / bytes so psycopg uploads them
+        # as BYTEA without a redundant copy.
+        payload = [
+            (
+                int(mid),
+                bytes(blob) if not isinstance(blob, (bytes, memoryview)) else blob,
+                float(self_w),
+                int(nk),
+                int(sv),
+                float(ts),
+            )
+            for (mid, blob, self_w, nk, sv, ts) in rows
+        ]
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.executemany(
+                    "INSERT INTO memory_dae_embeddings "
+                    "(memory_id, vector, self_weight, neighbour_k, "
+                    " schema_version, computed_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (memory_id) DO UPDATE SET "
+                    "  vector         = EXCLUDED.vector, "
+                    "  self_weight    = EXCLUDED.self_weight, "
+                    "  neighbour_k    = EXCLUDED.neighbour_k, "
+                    "  schema_version = EXCLUDED.schema_version, "
+                    "  computed_at    = EXCLUDED.computed_at",
+                    payload,
+                )
+        except Exception as exc:
+            logger.warning("PG upsert_dae_vectors failed: %s", exc)
+            return 0
+        return len(payload)
+
+    def prune_memories_by_label_prefix(self, prefix: str, older_than_ts: float) -> int:
+        """PG counterpart to SQLiteStore.prune_memories_by_label_prefix."""
+        from datetime import datetime, timezone
+        # PG `memories.created_at` is TIMESTAMPTZ; convert epoch → datetime.
+        cutoff = datetime.fromtimestamp(float(older_than_ts), tz=timezone.utc)
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.execute(
+                    "DELETE FROM memories WHERE label LIKE %s AND created_at < %s",
+                    (prefix + "%", cutoff),
+                )
+                return int(cur.rowcount or 0)
+        except Exception as exc:
+            logger.warning("PG prune_memories_by_label_prefix failed: %s", exc)
+            return 0
+
+    def fetch_dae_vectors(self, ids: "list[int]") -> "dict[int, list[float]]":
+        """Backend-agnostic DAE vector fetch — Postgres flavour.
+
+        Mirrors dae.fetch_dae_vectors but uses PG syntax (`ANY(%s)`,
+        BYTEA → bytes) so Mazemaker._dae_score_candidates can dispatch
+        the same call against either backend. The blob wire format is
+        identical to SQLite's: float32-packed little-endian, decoded
+        with struct.unpack.
+        """
+        ids = [int(i) for i in ids if i is not None]
+        if not ids:
+            return {}
+        import struct
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.execute(
+                    "SELECT memory_id, vector FROM memory_dae_embeddings "
+                    "WHERE memory_id = ANY(%s)",
+                    (ids,),
+                )
+                rows = cur.fetchall()
+        except Exception as exc:
+            logger.warning("PG fetch_dae_vectors failed: %s", exc)
+            return {}
+        out: dict[int, list[float]] = {}
+        for r in rows:
+            mid, blob = int(r[0]), r[1]
+            if not blob:
+                continue
+            try:
+                data = bytes(blob)
+                n = len(data) // 4
+                out[mid] = list(struct.unpack(f"{n}f", data))
+            except Exception:
+                continue
         return out
 
     def stream_missing_colbert(self, batch_size: int = 1000, start_after_id: int = 0):
@@ -661,6 +1138,48 @@ class PostgresStore:
             for r in rows:
                 yield int(r[0]), (r[1] or "")
             last_id = int(rows[-1][0])
+
+    def stream_long_memories_for_afe(self, *, min_len: int = 500,
+                                     limit: int = 1000,
+                                     exclude_label_pattern: str = "%::afe::%",
+                                     exclude_ids: "set[int] | None" = None):
+        """Backend-agnostic enumeration of long memories that need AFE
+        extraction. Skips rows whose label already carries the AFE
+        marker, plus any explicitly-excluded ids from the processed-set.
+
+        Yields ``(id, label, content)`` ordered by content length DESC.
+        Caller handles the in-Python exclude_ids filter so we don't have
+        to materialise a giant temp table for the NOT-IN list.
+        """
+        exclude_ids = exclude_ids or set()
+        # Push exclude_ids into the SQL when non-trivial. The earlier
+        # design fetched `limit*2` rows and filtered in Python, which
+        # silently capped progress once `len(exclude_ids) > limit*2`: a
+        # full conv looked drained even with thousands of sources left.
+        # `id != ALL(%s::int[])` handles 10k+ ids in PG without a temp
+        # table or expression-blowup.
+        with self._cursor() as (_conn, cur):
+            if exclude_ids:
+                cur.execute(
+                    "SELECT id, label, content FROM memories "
+                    "WHERE length(content) >= %s "
+                    "  AND (label IS NULL OR label NOT LIKE %s) "
+                    "  AND id <> ALL(%s::int[]) "
+                    "ORDER BY length(content) DESC LIMIT %s",
+                    (int(min_len), exclude_label_pattern,
+                     list(exclude_ids), int(limit)),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, label, content FROM memories "
+                    "WHERE length(content) >= %s "
+                    "  AND (label IS NULL OR label NOT LIKE %s) "
+                    "ORDER BY length(content) DESC LIMIT %s",
+                    (int(min_len), exclude_label_pattern, int(limit)),
+                )
+            rows = cur.fetchall()
+        for r in rows:
+            yield int(r[0]), (r[1] or ""), (r[2] or "")
 
     def add_connections_batch(self, pairs, edge_type: str = "similar") -> int:
         """Bulk-upsert undirected weighted edges in a single transaction.
@@ -699,17 +1218,29 @@ class PostgresStore:
         if not normalised:
             return 0
 
-        sql = (
-            "INSERT INTO connections (source_id, target_id, weight, edge_type) "
-            "VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (source_id, target_id) DO UPDATE SET "
-            "  weight = GREATEST(connections.weight, EXCLUDED.weight), "
-            "  edge_type = EXCLUDED.edge_type"
-        )
+        # COPY into a temp staging table, then a SINGLE upsert from staging.
+        # Replaces an executemany loop (N round-trips) with two statements
+        # for any batch size. ~50–100× faster on batches of 1k+ edges.
         with self._cursor() as (_conn, cur):
-            cur.executemany(
-                sql,
-                [(s, t, w, edge_type) for (s, t, w) in normalised],
+            cur.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS _conn_stage "
+                "(source_id BIGINT, target_id BIGINT, "
+                " weight DOUBLE PRECISION, edge_type TEXT) "
+                "ON COMMIT PRESERVE ROWS"
+            )
+            cur.execute("TRUNCATE _conn_stage")
+            with cur.copy(
+                "COPY _conn_stage (source_id, target_id, weight, edge_type) "
+                "FROM STDIN"
+            ) as cp:
+                for s, t, w in normalised:
+                    cp.write_row((s, t, w, edge_type))
+            cur.execute(
+                "INSERT INTO connections (source_id, target_id, weight, edge_type) "
+                "SELECT source_id, target_id, weight, edge_type FROM _conn_stage "
+                "ON CONFLICT (source_id, target_id) DO UPDATE SET "
+                "  weight = GREATEST(connections.weight, EXCLUDED.weight), "
+                "  edge_type = EXCLUDED.edge_type"
             )
         return len(normalised)
 
@@ -770,7 +1301,7 @@ class PostgresStore:
     def search_bm25(self, query: str, limit: int = 50) -> list[dict]:
         """tsvector-based lexical search. Equivalent of SQLiteStore.search_bm25.
 
-        Postgres uses ts_rank_cd over to_tsvector('simple', content) — the
+        Postgres uses ts_rank_cd over to_tsvector('english', content) — the
         idx_memories_content_fts GIN index from _BASE_SCHEMA serves the
         match. Score field mirrors SQLiteStore: reciprocal-rank
         (1/(i+1)) so RRF fusion in memory_client._parallel_retrieve keeps
@@ -783,10 +1314,10 @@ class PostgresStore:
         with self._cursor() as (_conn, cur):
             cur.execute(
                 "SELECT id, "
-                "  ts_rank_cd(to_tsvector('simple', coalesce(content, '')), "
-                "             to_tsquery('simple', %s)) AS rank "
+                "  ts_rank_cd(to_tsvector('english', coalesce(content, '')), "
+                "             to_tsquery('english', %s)) AS rank "
                 "FROM memories "
-                "WHERE to_tsvector('simple', coalesce(content, '')) @@ to_tsquery('simple', %s) "
+                "WHERE to_tsvector('english', coalesce(content, '')) @@ to_tsquery('english', %s) "
                 "ORDER BY rank DESC LIMIT %s",
                 (tsq, tsq, int(limit)),
             )
@@ -815,7 +1346,7 @@ class PostgresStore:
         with self._cursor() as (_conn, cur):
             cur.execute(
                 "SELECT id FROM memories "
-                "WHERE to_tsvector('simple', coalesce(content, '')) @@ to_tsquery('simple', %s) "
+                "WHERE to_tsvector('english', coalesce(content, '')) @@ to_tsquery('english', %s) "
                 "LIMIT %s",
                 (tsq, int(limit)),
             )
@@ -830,22 +1361,77 @@ class PostgresStore:
             for i, r in enumerate(rows)
         ]
 
+    # Mirrors SQLiteStore._TEMPORAL_CUES. Kept in sync with the SQLite
+    # side; if you add a phrase here, add it there. The PG variant of
+    # search_temporal used to short-circuit with only "today/yesterday/
+    # last week" and return "most recent N" when nothing matched, which
+    # polluted the RRF fusion with recency bias on every query and is
+    # half the reason update_tracking sat at 0.508 in the v5 matrix.
+    _TEMPORAL_CUES = (
+        ("today", 86400),
+        ("heute", 86400),
+        ("yesterday", 2 * 86400),
+        ("gestern", 2 * 86400),
+        ("last week", 7 * 86400),
+        ("letzte woche", 7 * 86400),
+        ("this week", 7 * 86400),
+        ("diese woche", 7 * 86400),
+        ("last month", 30 * 86400),
+        ("this month", 30 * 86400),
+        ("latest", 30 * 86400),
+        ("newest", 30 * 86400),
+        ("most recent", 30 * 86400),
+        ("currently", 30 * 86400),
+        ("current value", 30 * 86400),
+        ("now what", 30 * 86400),
+        ("recently", 14 * 86400),
+        ("updated", 14 * 86400),
+    )
+
     def search_temporal(self, query: str, limit: int = 50,
                         now: Optional[float] = None) -> list[dict]:
-        """Time-window scan keyed off temporal phrases in the query."""
+        """Time-window scan keyed off temporal phrases in the query.
+
+        Returns [] when no temporal cue is present. The previous form
+        returned an unfiltered most-recent-N pool regardless of intent;
+        on the RRF fusion that meant every query — including pure
+        semantic ones — got a recency bias dragging the wrong answers
+        up the ranking. See [[bug-search-temporal-recency-bias]] in
+        the SQLite side (memory_client.py); this is the PG parity fix.
+        """
+        import re as _re
         now = now or time.time()
         q = (query or "").lower()
+
+        # ISO date anchor: YYYY-MM-DD pins a ±1d window.
+        iso_match = _re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", q)
+        anchor_ts: Optional[float] = None
+        if iso_match:
+            try:
+                import datetime as _dt
+                y, m, d = int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3))
+                anchor_ts = _dt.datetime(y, m, d).timestamp()
+            except (ValueError, OverflowError):
+                anchor_ts = None
+
         where = ""
         params: list[Any] = []
-        if any(w in q for w in ("today", "heute")):
-            where = "WHERE created_at >= to_timestamp(%s)"
-            params.append(now - 86400)
-        elif any(w in q for w in ("yesterday", "gestern")):
+        if anchor_ts is None:
+            for cue, win in self._TEMPORAL_CUES:
+                if cue in q:
+                    if cue in ("yesterday", "gestern"):
+                        where = "WHERE created_at BETWEEN to_timestamp(%s) AND to_timestamp(%s)"
+                        params = [now - 2 * 86400, now - 86400]
+                    else:
+                        where = "WHERE created_at >= to_timestamp(%s)"
+                        params = [now - float(win)]
+                    break
+            else:
+                return []
+        else:
             where = "WHERE created_at BETWEEN to_timestamp(%s) AND to_timestamp(%s)"
-            params.extend([now - 2 * 86400, now - 86400])
-        elif "last week" in q or "letzte woche" in q:
-            where = "WHERE created_at >= to_timestamp(%s)"
-            params.append(now - 7 * 86400)
+            params = [anchor_ts - 86400, anchor_ts + 86400]
+
         with self._cursor() as (_conn, cur):
             cur.execute(
                 f"SELECT id, created_at, last_accessed FROM memories "
