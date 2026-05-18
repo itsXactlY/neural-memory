@@ -48,22 +48,26 @@ def _download_js(url: str, cache_file: Path, label: str, min_size: int = 100_000
     import urllib.request
     js = None
 
-    # Try urllib first
+    # Try urllib with normal certificate validation. The previous code
+    # disabled hostname + cert validation outright (ssl.CERT_NONE),
+    # which made the build pipeline MitM-able. Operators behind a
+    # corporate proxy with a custom CA bundle can set SSL_CERT_FILE
+    # to their bundle — urllib honours it.
     try:
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(url, headers={"User-Agent": "mazemaker-dashboard/3.0"})
         with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
             js = resp.read().decode("utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"  urllib download failed ({exc}); trying curl")
 
-    # Fallback: curl
+    # Fallback: curl. WITHOUT --insecure — if the verified urllib call
+    # failed for a real cert reason, curl should fail the same way
+    # rather than silently bypass the check.
     if not js or len(js) < min_size:
         try:
             result = subprocess.run(
-                ["curl", "-sSL", "--insecure", url],
+                ["curl", "-sSL", url],
                 capture_output=True, text=True, timeout=60
             )
             js = result.stdout
@@ -134,12 +138,23 @@ def read_sqlite(db_path: str) -> dict:
     hub_ids = [n["id"] for n in nodes[:120]]
     id_set = set(hub_ids)
 
-    # Connections between hubs
-    cur.execute("SELECT source_id, target_id, weight FROM connections")
-    edges = []
-    for r in cur.fetchall():
-        if r[0] in id_set and r[1] in id_set:
-            edges.append({"source": r[0], "target": r[1], "weight": round(r[2], 4)})
+    # Connections between hubs — push the hub filter into SQL instead
+    # of loading every edge and filtering in Python. On a 1 M-edge
+    # corpus the previous SELECT-then-filter form pulled 100 MB+ into
+    # the dashboard process every refresh.
+    if hub_ids:
+        placeholders = ",".join("?" for _ in hub_ids)
+        cur.execute(
+            f"SELECT source_id, target_id, weight FROM connections "
+            f"WHERE source_id IN ({placeholders}) AND target_id IN ({placeholders})",
+            tuple(hub_ids) + tuple(hub_ids),
+        )
+        edges = [
+            {"source": r[0], "target": r[1], "weight": round(r[2], 4)}
+            for r in cur.fetchall()
+        ]
+    else:
+        edges = []
 
     # Category distribution
     cur.execute("""

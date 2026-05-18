@@ -14,19 +14,27 @@ Usage:
 """
 import argparse
 import asyncio
-import fcntl
 import json
 import logging
 import os
-import pty
 import struct
 import sys
-import termios
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# pty/termios/fcntl are POSIX-only and only used for the embedded
+# terminal handler. Import lazily so the dashboard at least boots on
+# Windows for read-only views; routes that need a PTY fail gracefully.
+try:
+    import fcntl  # noqa: F401  POSIX
+    import pty  # noqa: F401   POSIX
+    import termios  # noqa: F401  POSIX
+    _HAS_PTY = True
+except ImportError:
+    _HAS_PTY = False
 
 logger = logging.getLogger("neural-live")
 logging.basicConfig(
@@ -64,21 +72,25 @@ _DB_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="db-worker")
 # rows; the metadata_json LIKE-GROUP-BY scans them all (~1.4s) and the
 # distribution barely shifts between polls. Caching 60s drops the steady
 # state to ~150ms.
+import threading as _threading
 _mssql_cache: dict = {}
+_mssql_cache_lock = _threading.Lock()
 
 
 def _cache_get(key: str, ttl: float):
-    entry = _mssql_cache.get(key)
-    if entry is None:
-        return None
-    expires_at, value = entry
-    if time.time() > expires_at:
-        return None
-    return value
+    with _mssql_cache_lock:
+        entry = _mssql_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if time.time() > expires_at:
+            return None
+        return value
 
 
 def _cache_set(key: str, value, ttl: float) -> None:
-    _mssql_cache[key] = (time.time() + ttl, value)
+    with _mssql_cache_lock:
+        _mssql_cache[key] = (time.time() + ttl, value)
 
 
 CACHE_TTL_CATS = 60.0      # categories — drift slowly

@@ -16,7 +16,7 @@ What it does (in order):
 Usage:
   python3 neural_memory_production_upgrade.py [--db PATH] [--dry-run] [--history-days 7] [--skip-backup]
 
-  --db PATH          Path to SQLite database (default: ~/.hermes/hermes-agent/plugins/memory/neural/neural_memory.db)
+  --db PATH          Path to SQLite database (default: ~/.mazemaker/data/memory.db)
   --dry-run          Show what would change without modifying anything
   --history-days N   Keep connection_history entries from last N days (default: 7)
   --skip-backup      Skip backup creation (NOT recommended)
@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sqlite3
 import sys
 import time
@@ -80,10 +79,23 @@ def freelist_info(conn: sqlite3.Connection) -> tuple[int, int, int]:
 # ---------------------------------------------------------------------------
 
 def backup_db(db_path: str) -> str:
-    """Create timestamped backup."""
+    """Create timestamped backup using sqlite3's online backup API.
+
+    File-copying a WAL-mode SQLite database while writes are in flight
+    yields an inconsistent snapshot — the -wal file may be mid-write.
+    sqlite3.Connection.backup() is the supported way to clone a live DB.
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = f"{db_path}.bak.{ts}"
-    shutil.copy2(db_path, backup_path)
+    src = sqlite3.connect(db_path)
+    try:
+        dst = sqlite3.connect(backup_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
     return backup_path
 
 
@@ -410,7 +422,7 @@ def main():
         description="Mazemaker SQLite Production Upgrade — PoC → Production"
     )
     parser.add_argument(
-        "--db", default=os.path.expanduser("~/.hermes/hermes-agent/plugins/memory/neural/neural_memory.db"),
+        "--db", default=os.path.expanduser("~/.mazemaker/data/memory.db"),
         help="Path to SQLite database (default: ~/.hermes/hermes-agent/plugins/memory/neural/neural_memory.db)"
     )
     parser.add_argument(
