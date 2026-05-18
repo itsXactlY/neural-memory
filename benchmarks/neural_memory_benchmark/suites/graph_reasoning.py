@@ -254,12 +254,16 @@ class GraphReasoningBenchmark:
         # exact regression Codex found: auto_connect creating A↔C shortcuts
         # or skipping chain edges entirely.
         # ------------------------------------------------------------------
+        # F73 fix (audit 2026-05-13): the previous code did
+        # `fetchone()["n"]` which assumes Row factory is set; otherwise
+        # it raises TypeError. Index by position instead — robust regardless
+        # of the connection's row_factory state.
         edge_count = nm.store.conn.execute(
             "SELECT COUNT(*) AS n FROM connections WHERE source_id IN "
             "(SELECT id FROM memories WHERE label LIKE 'chain:%')"
             "   OR target_id IN "
             "(SELECT id FROM memories WHERE label LIKE 'chain:%')"
-        ).fetchone()["n"]
+        ).fetchone()[0]
         expected_edges = 2 * self.n_chains
         print(f"  chain edges    : {edge_count} (expected {expected_edges})")
         assert edge_count == expected_edges, (
@@ -324,7 +328,18 @@ class GraphReasoningBenchmark:
             seeds = nm.recall(q, k=3)
             if not seeds:
                 return []
-            start_id = int(seeds[0]["id"])
+            # F74 fix (audit 2026-05-13): recall may return either an
+            # `id` or `memory_id` field, and the value may be int OR
+            # string. Use whichever is present and only int() if it
+            # looks numeric.
+            seed = seeds[0]
+            raw = seed.get("id") if seed.get("id") is not None else seed.get("memory_id")
+            if raw is None:
+                return []
+            try:
+                start_id = int(raw)
+            except (TypeError, ValueError):
+                start_id = raw  # leave as-is; nm.think handles strings on PG
             activated = nm.think(start_id, depth=3, decay=0.85)
             # Render labels into content so anchor-match works.
             ids = [a["id"] for a in activated]
@@ -365,12 +380,13 @@ class GraphReasoningBenchmark:
             # the random edges. If any leftover edges (e.g. from a future
             # auto_connect bug) still touch chain memories, fail loudly so
             # the control isn't silently invalidated.
+            # F73 fix: index by position, not Row factory key.
             residual = nm.store.conn.execute(
                 "SELECT COUNT(*) AS n FROM connections WHERE source_id IN "
                 "(SELECT id FROM memories WHERE label LIKE 'chain:%') "
                 "   OR target_id IN "
                 "(SELECT id FROM memories WHERE label LIKE 'chain:%')"
-            ).fetchone()["n"]
+            ).fetchone()[0]
             assert residual == 0, (
                 f"shuffle control: chain not fully disconnected after delete "
                 f"({residual} edges remain) — random pairings would not be "
@@ -378,10 +394,21 @@ class GraphReasoningBenchmark:
             )
             # Invalidate the in-memory graph cache so think()/recall_multihop
             # re-read the (now empty/random) edge set from SQLite.
-            try:
+            # F35 fix (audit 2026-05-13): the previous code silently
+            # swallowed cache-invalidation failures, leaving stale chain
+            # edges in the in-memory graph and producing false-positive
+            # shuffle-control numbers. RAISE on failure so it's loud
+            # (the suite cannot honestly proceed without invalidation).
+            if hasattr(nm, "_graph_nodes"):
                 nm._graph_nodes.clear()
-            except Exception:
-                pass
+            else:
+                raise RuntimeError(
+                    "graph_reasoning: nm._graph_nodes not found — the engine's "
+                    "in-memory graph cache cannot be invalidated; shuffle "
+                    "control would be measuring the cached chain, not the "
+                    "randomised edges. Update the suite to match the engine's "
+                    "current cache attribute."
+                )
 
             # Random pairings: same edge count as the real chain (2*n).
             rng_ctrl = random.Random(self.seed + 7)

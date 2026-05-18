@@ -32,6 +32,10 @@ def run_bfs(
     layers = {0: set(start_ids)}
     elapsed_times = []
 
+    # F70 fix (audit 2026-05-13): validate that we extracted a real id
+    # before adding it to the frontier, otherwise BFS wastes effort on
+    # None/empty values that the next `nm.connections(None)` will
+    # quietly reject.
     for d in range(1, depth + 1):
         t0 = time.perf_counter()
         next_frontier = set()
@@ -39,8 +43,10 @@ def run_bfs(
             try:
                 connections = nm.connections(node_id)
                 for conn in connections:
-                    cid = conn.get("id", conn.get("target_id", conn.get("memory_id")))
-                    if cid and cid not in visited:
+                    cid = conn.get("id") or conn.get("target_id") or conn.get("memory_id")
+                    if cid is None or cid == "":
+                        continue
+                    if cid not in visited:
                         next_frontier.add(cid)
                         visited.add(cid)
             except Exception:
@@ -136,20 +142,36 @@ class GraphBenchmark:
         memories: List[Dict[str, Any]],
         output_dir: Optional[Path] = None,
         depths: List[int] = None,
+        start_nodes_per_depth: int = 20,
     ):
+        # F44 fix (audit 2026-05-13): accept start_nodes_per_depth so the
+        # config value actually controls something.
         self.db_path = db_path
         self.memories = memories
         self.output_dir = output_dir or Path.home() / ".neural_memory_benchmark" / "results"
         self.depths = depths or [2, 3, 5, 8]
+        self.start_nodes_per_depth = start_nodes_per_depth
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.nm = None
 
     def setup(self) -> Dict[str, Any]:
-        print(f"  [setup] Storing {len(self.memories)} memories...")
+        # F71 fix (audit 2026-05-13): print progress every 5000 inserts
+        # so 100k+ corpus runs don't appear hung. Time the setup so the
+        # operator can estimate completion.
+        n = len(self.memories)
+        print(f"  [setup] Storing {n} memories...")
         self.nm = Mazemaker(db_path=self.db_path, embedding_backend="auto")
-        for m in self.memories:
+        _t0 = time.perf_counter()
+        _last = _t0
+        for i, m in enumerate(self.memories, 1):
             self.nm.remember(m["text"], label=m["label"], auto_connect=True)
-        print(f"  [setup] Done")
+            if i % 5000 == 0 or i == n:
+                _now = time.perf_counter()
+                rate = i / (_now - _t0) if _now > _t0 else 0
+                eta = (n - i) / max(rate, 1e-6) / 60
+                print(f"    [setup] {i}/{n}  {rate:.1f}/s  ETA {eta:.1f} min")
+                _last = _now
+        print(f"  [setup] Done ({n} in {(time.perf_counter()-_t0):.1f}s)")
         return self.nm.stats()
 
     def run(self) -> Dict[str, Any]:
@@ -159,9 +181,12 @@ class GraphBenchmark:
         stats = self.setup()
         results = {"db_stats": stats, "bfs": {}, "think": {}, "ppr": {}}
 
-        # Get some starting node IDs (use recent memories)
+        # Get some starting node IDs (use recent memories). F44 fix
+        # (audit 2026-05-13): cap at `start_nodes_per_depth` so the config
+        # knob is actually honoured.
+        n_starts = max(1, int(self.start_nodes_per_depth))
         try:
-            sample = self.nm.recall(".", k=50)
+            sample = self.nm.recall(".", k=n_starts)
             start_ids = [
                 r.get("id", r.get("memory_id"))
                 for r in sample
@@ -171,9 +196,10 @@ class GraphBenchmark:
                 print("  No start IDs found, using memory IDs from DB directly")
                 import sqlite3
                 conn = sqlite3.connect(self.db_path)
-                cur = conn.execute("SELECT id FROM memories LIMIT 50")
+                cur = conn.execute("SELECT id FROM memories LIMIT ?", (n_starts,))
                 start_ids = [r[0] for r in cur.fetchall()]
                 conn.close()
+            start_ids = start_ids[:n_starts]
         except Exception as e:
             print(f"  Error getting start IDs: {e}")
             return results

@@ -22,7 +22,12 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+
+# F36 fix (audit 2026-05-13): tz-aware timestamps so cross-machine
+# comparison of run start/finish times is unambiguous.
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,17 +78,33 @@ def banner(text: str, width: int = 70) -> str:
 # Suites that have a module-level `run_<name>_benchmark` function are routed
 # through it for backward compatibility.
 
-def _new_db() -> str:
+def _new_db(cfg=None) -> str:
+    """Resolve the DB path for a suite. If cfg.memory.db_path is set and not
+    the hot-path DB, honour it (suites share one DB so cross-suite continuity
+    actually works). Otherwise mint a unique temp file.
+
+    F1 fix (audit 2026-05-13): the previous unconditional temp-file dance made
+    cfg.memory.db_path dead config — every suite got isolation, breaking any
+    write-here-read-there flow.
+    """
+    if cfg is not None and getattr(getattr(cfg, "memory", None), "db_path", None):
+        path = str(cfg.memory.db_path)
+        _assert_not_hotpath(path)
+        return path
+    # F39 (audit 2026-05-13): no _assert_not_hotpath here — a freshly
+    # minted NamedTemporaryFile path can never resolve to the production
+    # ~/.neural_memory/memory.db, so the check was dead code that
+    # provided a false sense of security. The guard is real where it
+    # matters: above, on the caller-supplied path.
     with tempfile.NamedTemporaryFile(suffix=".db", prefix="nmb-", delete=False) as f:
         path = f.name
-    _assert_not_hotpath(path)
     return path
 
 
 def _run_retrieval(cfg, memories, queries):
     from suites.retrieval import RetrievalBenchmark
     bm = RetrievalBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         queries=queries,
         modes=cfg.retrieval.modes,
@@ -99,7 +120,7 @@ def _run_retrieval(cfg, memories, queries):
 def _run_dream(cfg, memories, queries):
     from suites.dream import DreamBenchmark
     bm = DreamBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         test_queries=queries,
         output_dir=cfg.paths.results_dir,
@@ -130,11 +151,13 @@ def _run_scalability(cfg, memories, queries):
 
 def _run_graph(cfg, memories, queries):
     from suites.graph import GraphBenchmark
+    # F44 fix (audit 2026-05-13): pass start_nodes_per_depth through.
     bm = GraphBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         output_dir=cfg.paths.results_dir,
         depths=cfg.graph.depths,
+        start_nodes_per_depth=cfg.graph.start_nodes_per_depth,
     )
     return bm.run()
 
@@ -151,7 +174,7 @@ def _run_concurrent(cfg, memories, queries):
 def _run_conflict(cfg, memories, queries):
     from suites.conflict import ConflictBenchmark
     bm = ConflictBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         output_dir=cfg.paths.results_dir,
         conflict_groups=cfg.conflict.conflict_groups,
@@ -162,7 +185,7 @@ def _run_conflict(cfg, memories, queries):
 def _run_agentic(cfg, memories, queries):
     from suites.agentic import AgenticBenchmark
     bm = AgenticBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         output_dir=cfg.paths.results_dir,
         num_sessions=cfg.agentic.sessions,
@@ -176,7 +199,7 @@ def _run_qa(cfg, memories, queries):
     # The QA suite is intentionally driven by its own pre-canned (question,
     # context, needle) facts — distractors come from the synthetic dataset.
     bm = QABenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         output_dir=cfg.paths.results_dir,
         modes=cfg.retrieval.modes if cfg.retrieval.modes else ["semantic", "hybrid"],
@@ -188,7 +211,7 @@ def _run_qa(cfg, memories, queries):
 def _run_diversity(cfg, memories, queries):
     from suites.diversity import DiversityBenchmark
     bm = DiversityBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         queries=queries,
         output_dir=cfg.paths.results_dir,
@@ -199,7 +222,7 @@ def _run_diversity(cfg, memories, queries):
 def _run_lstm_knn(cfg, memories, queries):
     from suites.lstm_knn import LSTMKnnBenchmark
     bm = LSTMKnnBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         queries=queries,
         output_dir=cfg.paths.results_dir,
@@ -210,7 +233,7 @@ def _run_lstm_knn(cfg, memories, queries):
 def _run_continuity(cfg, memories, queries):
     from suites.continuity import ContinuityBenchmark
     bm = ContinuityBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         output_dir=cfg.paths.results_dir,
         target_facts=50,
         noise_tiers=[0, 200, 1000, 5000],
@@ -222,7 +245,7 @@ def _run_continuity(cfg, memories, queries):
 def _run_conflict_quality(cfg, memories, queries):
     from suites.conflict_quality import ConflictQualityBenchmark
     bm = ConflictQualityBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         output_dir=cfg.paths.results_dir,
         n_pairs=30,
         seed=cfg.dataset.seed,
@@ -242,7 +265,7 @@ def _run_lean_skynet(cfg, memories, queries):
 def _run_baseline(cfg, memories, queries):
     from suites.baseline import BaselineComparisonBenchmark
     bm = BaselineComparisonBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         queries=queries,
         output_dir=cfg.paths.results_dir,
@@ -253,7 +276,7 @@ def _run_baseline(cfg, memories, queries):
 def _run_graph_reasoning(cfg, memories, queries):
     from suites.graph_reasoning import GraphReasoningBenchmark
     return GraphReasoningBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         output_dir=cfg.paths.results_dir,
         n_chains=30,
         seed=cfg.dataset.seed,
@@ -263,7 +286,7 @@ def _run_graph_reasoning(cfg, memories, queries):
 def _run_channel_ablation(cfg, memories, queries):
     from suites.channel_ablation import ChannelAblationBenchmark
     return ChannelAblationBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         memories=memories,
         queries=queries,
         output_dir=cfg.paths.results_dir,
@@ -289,7 +312,7 @@ def _run_dream_derived_fact(cfg, memories, queries):
     # (1 derived fact vs ~300 distractors at k=3 is a 1% population fit;
     # at k=5 it's 1.7%, still tight but a fairer test).
     return DreamDerivedFactBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         output_dir=cfg.paths.results_dir,
         n_premises=75,
         k_strict=5,
@@ -301,7 +324,7 @@ def _run_dream_derived_fact(cfg, memories, queries):
 def _run_continuity_controls(cfg, memories, queries):
     from suites.continuity_controls import ContinuityControlsBenchmark
     return ContinuityControlsBenchmark(
-        db_path=_new_db(),
+        db_path=_new_db(cfg),
         output_dir=cfg.paths.results_dir,
         target_facts=50,
         noise_tiers=[0, 200, 1000, 5000],
@@ -361,7 +384,7 @@ class NeuralMemoryBenchmark:
         self.start_time = time.perf_counter()
         self.results = {
             "meta": {
-                "started_at": datetime.now().isoformat(),
+                "started_at": _now_iso(),
                 "version": "1.0.0",
                 "config": {
                     "memory_db": self.cfg.memory.db_path,
@@ -374,14 +397,14 @@ class NeuralMemoryBenchmark:
 
     def run(self) -> Dict[str, Any]:
         # Hot-path guard: refuse to start if any configured path resolves to the
-        # production DB. Each suite uses _new_db() which double-checks too.
+        # production DB. Each suite uses _new_db(cfg) which double-checks too.
         _assert_not_hotpath(self.cfg.memory.db_path)
 
         print(banner("NEURAL MEMORY BENCHMARK SUITE"))
         print(f"Output: {self.cfg.paths.output_dir}")
         print(f"DB:     {self.cfg.memory.db_path}")
         print(f"Suites: {self.cfg.suites or 'ALL'}")
-        print(f"Started: {datetime.now().isoformat()}")
+        print(f"Started: {_now_iso()}")
 
         print(banner("Generating Dataset"))
         # Realistic mode: real prose from the project itself (.md + .py).
@@ -412,14 +435,23 @@ class NeuralMemoryBenchmark:
             memories, queries = pgen.generate(n)
             # Top up with classic memories so suites that need scale
             # (scalability, concurrent) still have a corpus to chew on.
+            # F11 fix (audit 2026-05-13): dedupe by id so paraphrase IDs
+            # (`para-*`) and classic IDs (`episodic-*`, `factual-*`) cannot
+            # accidentally collide if a future refactor makes id schemes
+            # overlap. The extras also carry a flag so quality suites can
+            # filter them out when measuring paraphrase-specific signals.
             ds = MasterDataset(seed=self.cfg.dataset.seed)
             extras = ds.generate(
                 episodic=self.cfg.dataset.episodic_count // 4,
                 factual=self.cfg.dataset.factual_count // 4,
                 temporal=0, conversational=0, graph=0, adversarial=0,
             )
+            for m in extras:
+                m.setdefault("metadata", {})["is_extra"] = True
+            seen_ids = {m["id"] for m in memories}
+            extras = [m for m in extras if m["id"] not in seen_ids]
             memories = memories + extras
-            print(f"Generated {len(memories)} memories ({n} paraphrase + {len(extras)} extras)")
+            print(f"Generated {len(memories)} memories ({n} paraphrase + {len(extras)} extras, deduped)")
             print(f"Generated {len(queries)} paraphrase queries (1:1 ground truth, disjoint vocab)")
         else:
             ds = MasterDataset(seed=self.cfg.dataset.seed)
@@ -437,14 +469,21 @@ class NeuralMemoryBenchmark:
             queries = qgen.generate_recall_queries(count=self.cfg.dataset.queries_per_tier)
             print(f"Generated {len(queries)} recall queries")
 
-        suites_to_run = self.cfg.suites if self.cfg.suites else ALL_SUITES
+        # F12 fix (audit 2026-05-13): explicit empty list `[]` should mean
+        # "run no suites", not "run all". Use `is None` so only an unset
+        # / None falls back to ALL_SUITES.
+        suites_to_run = ALL_SUITES if self.cfg.suites is None else self.cfg.suites
 
         for suite in suites_to_run:
             t0 = time.perf_counter()
             try:
                 result = run_suite(suite, self.cfg, memories, queries)
                 elapsed = time.perf_counter() - t0
-                status = "error" if isinstance(result, dict) and "error" in result and len(result) <= 2 else "ok"
+                # F9 fix (audit 2026-05-13): the old "len(result) <= 2" check
+                # was a fragile heuristic — a valid 2-key result with an
+                # "error" string would be misclassified. Use a strict
+                # presence check on a dedicated error field.
+                status = "error" if isinstance(result, dict) and result.get("error") else "ok"
                 self.results["suites"][suite] = {
                     "result": result,
                     "elapsed_s": round(elapsed, 2),
@@ -467,7 +506,7 @@ class NeuralMemoryBenchmark:
                 self.results["errors"][suite] = str(e)
                 print(f"\n[ERROR] {suite}: {e}")
 
-        self.results["meta"]["finished_at"] = datetime.now().isoformat()
+        self.results["meta"]["finished_at"] = _now_iso()
         self.results["meta"]["total_elapsed_s"] = round(
             time.perf_counter() - self.start_time, 2
         )
@@ -489,14 +528,19 @@ def main():
         description="Mazemaker Benchmark Suite",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  python -m benchmarks.neural_memory_benchmark.runner
-  python -m benchmarks.neural_memory_benchmark.runner --suite retrieval
-  python -m benchmarks.neural_memory_benchmark.runner --suite retrieval --suite gpu
-  python -m benchmarks.neural_memory_benchmark.runner --dry-run
-  python -m benchmarks.neural_memory_benchmark.runner --output-dir /tmp/results
-  python -m benchmarks.neural_memory_benchmark.runner --seed 0
-  python -m benchmarks.neural_memory_benchmark.runner --list
+Examples (run via the runner script which sets sys.path correctly):
+  python benchmarks/neural_memory_benchmark/runner.py
+  python benchmarks/neural_memory_benchmark/runner.py --suite retrieval
+  python benchmarks/neural_memory_benchmark/runner.py --suite retrieval --suite gpu
+  python benchmarks/neural_memory_benchmark/runner.py --dry-run
+  python benchmarks/neural_memory_benchmark/runner.py --output-dir /tmp/results
+  python benchmarks/neural_memory_benchmark/runner.py --seed 0
+  python benchmarks/neural_memory_benchmark/runner.py --list
+
+# F41 fix (audit 2026-05-13): the previous epilog showed
+# `python -m benchmarks.neural_memory_benchmark.runner` which is NOT
+# how this benchmark is launched — the module isn't on the import
+# path as a package, and runner.py uses importlib to load benchmark.py.
         """,
     )
     parser.add_argument("--suite", action="append", dest="suites", metavar="NAME",
@@ -529,7 +573,12 @@ Examples:
             print(f"  - {s}")
         return
 
-    cfg = BenchmarkConfig.from_args()
+    # F40 fix (audit 2026-05-13): the previous code called
+    # `BenchmarkConfig.from_args()` and then immediately threw the return
+    # value away by re-mutating it field by field. With from_args() now
+    # honoring the argparse Namespace (F15), we pass it through and only
+    # override the fields argparse cannot represent cleanly.
+    cfg = BenchmarkConfig.from_args(args=args)
     if args.output_dir is not None:
         cfg.paths.output_dir = args.output_dir
         cfg.paths.results_dir = args.output_dir / "results"
@@ -538,7 +587,8 @@ Examples:
     if args.db_path is not None:
         cfg.memory.db_path = args.db_path
     cfg.dataset.seed = args.seed
-    cfg.suites = args.suites or []
+    # F12 (audit): preserve explicit empty list, treat None as default.
+    cfg.suites = args.suites if args.suites is not None else None
     cfg.dry_run = args.dry_run
     cfg.paraphrase = bool(args.paraphrase)
     cfg.realistic = bool(args.realistic)

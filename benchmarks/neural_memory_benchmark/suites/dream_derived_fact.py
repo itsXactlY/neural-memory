@@ -172,11 +172,22 @@ def _measure(nm: Mazemaker, queries: List[Dict[str, Any]], k: int = 5,
     sem_derived = 0
     mh_derived = 0
     n = len(queries) or 1
+    # F65 fix (audit 2026-05-13): the silent `except Exception` masked
+    # both "API not implemented" and "API broken" — both got 0 hits and
+    # the report blamed the engine. Distinguish: probe once up-front;
+    # if missing, record availability=False so the report can interpret
+    # the numbers correctly.
+    multihop_available = hasattr(nm, "recall_multihop")
+    multihop_first_error: Optional[str] = None
     for q in queries:
-        # Try multihop first — graph-aware.
-        try:
-            mh = nm.recall_multihop(q["query"], k=k, hops=2)
-        except Exception:
+        if multihop_available:
+            try:
+                mh = nm.recall_multihop(q["query"], k=k, hops=2)
+            except Exception as e:
+                mh = []
+                if multihop_first_error is None:
+                    multihop_first_error = f"{type(e).__name__}: {e}"
+        else:
             mh = []
         if _both_tokens_present(mh, q["a_tok"], q["b_tok"]):
             multihop_both += 1
@@ -252,6 +263,14 @@ class DreamDerivedFactBenchmark:
         # queries have to discriminate the right entity from a noisy corpus.
         # Distractors land under a 'distractor:' label so they are excluded
         # from the premise-count metric and easy to filter in analysis.
+        #
+        # F66 fix (audit 2026-05-13): distractors used to ingest with
+        # `auto_connect=True`, creating uncontrolled random edges to
+        # the premise memories and contaminating the graph the dream
+        # engine then operates on. Disable auto-connect for distractors
+        # so the graph the engine sees is the controlled premise graph
+        # only — distractors influence semantic recall but not graph
+        # traversal.
         if self.n_distractors > 0:
             pg = ParaphraseGenerator(seed=self.seed + 9001)
             distractor_mems, _ = pg.generate(self.n_distractors)
@@ -259,9 +278,9 @@ class DreamDerivedFactBenchmark:
                 nm.remember(
                     dm["text"],
                     label=f"distractor:{dm.get('label', 'paraphrase')}",
-                    auto_connect=True,
+                    auto_connect=False,
                 )
-            print(f"  Injected {self.n_distractors} paraphrase distractors")
+            print(f"  Injected {self.n_distractors} paraphrase distractors (no auto-connect)")
 
         for m in memories:
             nm.remember(m["text"], label=m["label"], auto_connect=True)

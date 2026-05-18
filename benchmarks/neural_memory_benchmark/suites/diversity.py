@@ -97,10 +97,20 @@ class DiversityBenchmark:
         n_topics = len(topic_dist)
         # Shannon entropy of the result-set topic distribution. Higher = more
         # diverse; if MMR works as advertised this should rise with lambda.
+        # F67 fix (audit 2026-05-13): raw entropy is monotonic in result
+        # count (more returns ⇒ more topics observable). MMR settings
+        # that return fewer items therefore looked artificially less
+        # diverse. Also report a NORMALISED entropy (entropy / log2(n))
+        # which is in [0,1] and independent of how many results came
+        # back; downstream comparisons should use the normalised form.
         total = sum(topic_dist.values()) or 1
         import math
         entropy = -sum((c / total) * math.log2(c / total)
                        for c in topic_dist.values() if c > 0)
+        # Per-query mean entropy: average over queries with their own n.
+        # Compute simultaneously so we have both forms.
+        max_entropy = math.log2(total) if total > 1 else 1.0
+        normalised_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
 
         n = len(self.queries)
         return {
@@ -108,6 +118,7 @@ class DiversityBenchmark:
             "mrr": round(statistics.mean(rrs), 4) if rrs else 0.0,
             "mean_results_returned": round(statistics.mean(result_counts), 2),
             "topic_entropy_bits": round(entropy, 4),
+            "topic_entropy_normalised": round(normalised_entropy, 4),
             "topic_count": n_topics,
             "topic_distribution_top5": dict(topic_dist.most_common(5)),
         }

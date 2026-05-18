@@ -61,28 +61,41 @@ def _graph_snapshot(db_path: str) -> Dict[str, int]:
         "derived_facts": 0,
         "max_weight_edges": 0,
     }
+    # F64 fix (audit 2026-05-13): the snapshot opened a raw sqlite3
+    # connection while the dream engine was potentially mid-write,
+    # producing inconsistent reads. Use `BEGIN IMMEDIATE` to force a
+    # write-lock snapshot (waits for any in-flight transaction to
+    # finish before we read), and the timeout=5 prevents indefinite
+    # waits if the engine is actively writing.
+    # F103 fix: log exceptions instead of swallowing them silently so
+    # schema drift (renamed table, dropped column) is loud.
     try:
-        conn = sqlite3.connect(db_path)
-        out["memories"] = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-        out["connections"] = conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
-        out["isolated"] = conn.execute(
-            "SELECT COUNT(*) FROM memories m WHERE NOT EXISTS "
-            "(SELECT 1 FROM connections c WHERE c.source_id = m.id OR c.target_id = m.id)"
-        ).fetchone()[0]
-        out["bridges"] = conn.execute(
-            "SELECT COUNT(*) FROM connections WHERE COALESCE(edge_type,'similar') = 'bridge'"
-        ).fetchone()[0]
-        out["derived_facts"] = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE label LIKE 'derived:%'"
-        ).fetchone()[0]
-        # >0.7 weight edges are the "consolidated" ones — should grow during NREM
-        # if anything is being strengthened, drop during REM only if pruning fires.
-        out["max_weight_edges"] = conn.execute(
-            "SELECT COUNT(*) FROM connections WHERE weight >= 0.7"
-        ).fetchone()[0]
-        conn.close()
-    except Exception:
-        pass
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            out["memories"] = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+            out["connections"] = conn.execute("SELECT COUNT(*) FROM connections").fetchone()[0]
+            out["isolated"] = conn.execute(
+                "SELECT COUNT(*) FROM memories m WHERE NOT EXISTS "
+                "(SELECT 1 FROM connections c WHERE c.source_id = m.id OR c.target_id = m.id)"
+            ).fetchone()[0]
+            out["bridges"] = conn.execute(
+                "SELECT COUNT(*) FROM connections WHERE COALESCE(edge_type,'similar') = 'bridge'"
+            ).fetchone()[0]
+            out["derived_facts"] = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE label LIKE 'derived:%'"
+            ).fetchone()[0]
+            out["max_weight_edges"] = conn.execute(
+                "SELECT COUNT(*) FROM connections WHERE weight >= 0.7"
+            ).fetchone()[0]
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        # Schema drift or lock timeout — surface so the operator can act.
+        import sys as _sys
+        print(f"  [dream._graph_snapshot] WARN: {type(e).__name__}: {e}",
+              file=_sys.stderr)
     return out
 
 
@@ -153,10 +166,15 @@ class DreamBenchmark:
         )
         # auto_connect=True so the graph has structure for NREM to consolidate
         # — without edges the dream engine has nothing to strengthen.
+        # F104 fix (audit 2026-05-13): for small corpora (<500) the
+        # original code produced no progress output. Print at completion
+        # too, and at the 500-row checkpoint when the corpus is large
+        # enough to benefit.
+        n = len(self.memories)
         for i, m in enumerate(self.memories, 1):
             self.nm.remember(m["text"], label=m["label"], auto_connect=True)
-            if i % 500 == 0:
-                print(f"    {i}/{len(self.memories)}")
+            if i % 500 == 0 or i == n:
+                print(f"    {i}/{n}")
 
         # DreamEngine wraps the same SQLite store the Mazemaker just wrote to.
         self.engine = DreamEngine.sqlite(
@@ -242,6 +260,25 @@ class DreamBenchmark:
 
     def save(self, results: Dict[str, Any]) -> Path:
         out = self.output_dir / "dream_results.json"
-        out.write_text(json.dumps(results, indent=2, default=str))
+        # F105 fix (audit 2026-05-13): blanket `default=str` silently
+        # coerced anything non-serialisable to its repr, hiding real
+        # bugs (e.g. accidentally storing a Path or datetime in
+        # results). Restrict the converter to known-safe types and
+        # leave anything else to raise the standard TypeError so it
+        # surfaces during development.
+        def _safe_encoder(o):
+            from datetime import datetime, date
+            from pathlib import Path as _Path
+            if isinstance(o, (datetime, date)):
+                return o.isoformat()
+            if isinstance(o, _Path):
+                return str(o)
+            if isinstance(o, set):
+                return sorted(o)
+            raise TypeError(
+                f"dream.save: object of type {type(o).__name__} is not "
+                "JSON serialisable; add a branch to _safe_encoder"
+            )
+        out.write_text(json.dumps(results, indent=2, default=_safe_encoder))
         print(f"\n  [saved] {out}")
         return out

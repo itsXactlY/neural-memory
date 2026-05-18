@@ -157,10 +157,14 @@ class RetrievalBenchmark:
                 hits.append(1.0 if result["hit_rank"] > 0 else 0.0)
 
                 if qi < 3:  # Print first few for inspection
+                    # F110 fix (audit 2026-05-13): `result['results']`
+                    # can be None / missing on an empty recall; the old
+                    # `result['results'][:3]` crashed on None.
+                    _r = result.get("results") or []
                     print(
                         f"    {key}: query={q['query'][:40]!r}, "
                         f"hit_rank={result['hit_rank']}, "
-                        f"top_labels={[r.get('label','') for r in result['results'][:3]]}"
+                        f"top_labels={[r.get('label','') for r in _r[:3]]}"
                     )
 
             recall_score = statistics.mean(recalls) if recalls else 0.0
@@ -176,19 +180,36 @@ class RetrievalBenchmark:
             print(f"    {key}: R={recall_score:.4f}, MRR={mrr_score:.4f}, Hit={hit_rate:.4f}")
 
         # ── Latency ─────────────────────────────────────────────────────────
+        # F32 fix (audit 2026-05-13): the recall-quality pass above warmed
+        # every embedding + retrieval cache, so this latency block measured
+        # WARM-cache performance while being labelled as cold. Two changes:
+        #   1. Sample queries that the quality pass DID NOT touch (different
+        #      slice / shuffled order) so each measured query has a chance
+        #      of being a true cache miss.
+        #   2. Annotate the result with `cache_state="warm"` so downstream
+        #      consumers know not to call this cold latency.
+        # F83 fix: increase sample size so percentiles are meaningful.
         latencies = []
+        import random as _rand
+        _rand_seeds = _rand.Random(0xCAFE)
+        # Pull a 100-query sample (or whatever's available) at random,
+        # different from the first-20 the quality pass hammered.
+        _pool = self.queries[20:] if len(self.queries) > 40 else self.queries
+        _sample = _rand_seeds.sample(_pool, k=min(100, len(_pool)))
         for _ in range(self.latency_runs):
             t0 = time.perf_counter()
-            for q in self.queries[:20]:  # Sample for speed
+            for q in _sample:
                 self.neural_mem.recall(q["query"], k=10)
             elapsed = time.perf_counter() - t0
-            latencies.append(elapsed / min(20, len(self.queries)))
+            latencies.append(elapsed / max(1, len(_sample)))
 
         mode_stats["latency"] = {
             "p50_ms": round(percentile(latencies, 50) * 1000, 2),
             "p95_ms": round(percentile(latencies, 95) * 1000, 2),
             "p99_ms": round(percentile(latencies, 99) * 1000, 2),
             "mean_ms": round(statistics.mean(latencies) * 1000, 2),
+            "cache_state": "warm",
+            "n_queries_sampled": len(_sample) * self.latency_runs,
         }
         print(f"    Latency: p50={mode_stats['latency']['p50_ms']}ms, "
               f"p95={mode_stats['latency']['p95_ms']}ms, "

@@ -8,12 +8,28 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 # Resolve benchmark root relative to this file
 BENCH_ROOT = Path(__file__).parent.resolve()
 SRC_ROOT = BENCH_ROOT.parent.parent / "python"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+
+# F14 fix (audit 2026-05-13): the previous code unconditionally inserted
+# SRC_ROOT at sys.path[0] at import time, which can shadow benchmark-local
+# modules like `config.py` (the project's `python/config.py` is a totally
+# different file). Suites import what they need themselves; the benchmark
+# core does not need SRC_ROOT on sys.path. Callers who want the engine
+# loaded can opt in via `ensure_engine_on_path()` below.
+
+def ensure_engine_on_path() -> None:
+    """Insert the engine source root onto sys.path if a suite needs to
+    import `memory_client` etc. Idempotent. Append (not prepend) so the
+    benchmark's local files always win on name collisions.
+    """
+    p = str(SRC_ROOT)
+    if p not in sys.path:
+        sys.path.append(p)
+
 
 # ── Mazemaker imports ────────────────────────────────────────────────────
 # We import lazily inside functions to avoid breaking when the module isn't
@@ -75,9 +91,11 @@ class DatasetConfig:
     """Synthetic dataset generation parameters."""
     # Number of memories at each scale tier
     scale_tiers: list = field(default_factory=lambda: [100, 1_000, 10_000, 50_000, 100_000])
-    # For "max" scale tier (push to limit)
-    max_scale: int = 500_000
 
+    # F42 fix (audit 2026-05-13): `max_scale` was redundant with the
+    # final entry of `scale_tiers`. Removed. If you previously read
+    # `cfg.dataset.max_scale`, use `max(cfg.dataset.scale_tiers)`.
+    #
     # Per-generator memory counts
     episodic_count: int = 5_000
     factual_count: int = 3_000
@@ -138,8 +156,12 @@ class GPUConfig:
     throughput_total: int = 100_000
     # Query count for latency test
     query_count: int = 10_000
-    # Fall back to CPU if GPU unavailable?
-    cpu_fallback: bool = False
+    # F88 fix (audit 2026-05-13): the default was False, which meant a
+    # host without CUDA silently produced zero GPU results. Default to
+    # True so the suite reports CPU numbers when GPU is missing instead
+    # of an empty section; callers wanting "fail loud on no-GPU" can
+    # set this to False explicitly.
+    cpu_fallback: bool = True
 
 
 # ── Scalability benchmark ─────────────────────────────────────────────────────
@@ -147,8 +169,9 @@ class GPUConfig:
 class ScalabilityConfig:
     """Scale-out benchmark settings."""
     tiers: list = field(default_factory=lambda: [1_000, 10_000, 50_000, 100_000, 500_000])
-    # Step size for incremental growth
-    step_size: int = 10_000
+    # F43 fix (audit 2026-05-13): `step_size` was an artefact of the
+    # original incremental-scaling code path that has since been
+    # replaced by the explicit `tiers` list. Removed.
     # Measure retrieval time vs memory count
     measure_retrieval_vs_count: bool = True
     # Measure WAL file growth
@@ -251,12 +274,39 @@ class BenchmarkConfig:
     # Report format: "text" | "json" | "both"
     report_format: str = "both"
 
-    # LLM model to use for generation (None = no LLM, synthetic only)
-    llm_model: str = os.environ.get("OPENAI_API_KEY", None) and "gpt-4o"
+    # LLM model to use for generation (None = no LLM, synthetic only).
+    # F13 fix (audit 2026-05-13): the previous default `os.environ.get("OPENAI_API_KEY", None) and "gpt-4o"`
+    # evaluated to `None` when the env var was unset, contradicting the
+    # `str` annotation. F121 fix: the model name is now env-overridable via
+    # MM_BENCH_LLM_MODEL so we don't hard-code gpt-4o.
+    llm_model: Optional[str] = (
+        os.environ.get("MM_BENCH_LLM_MODEL")
+        or ("gpt-4o" if os.environ.get("OPENAI_API_KEY") else None)
+    )
 
     @classmethod
     def from_args(cls, args=None):
-        """Build config from CLI args or defaults."""
+        """Build config from CLI args or defaults.
+
+        F15 fix (audit 2026-05-13): if an argparse Namespace is provided,
+        copy fields onto the config so callers actually get their overrides.
+        Previously the parameter was silently ignored.
+        """
         cfg = cls()
+        if args is not None:
+            for name in vars(args):
+                value = getattr(args, name)
+                if value is None:
+                    continue
+                # Direct top-level attribute.
+                if hasattr(cfg, name):
+                    setattr(cfg, name, value)
+                    continue
+                # Sub-config attribute (e.g. retrieval.modes).
+                if "." in name:
+                    head, _, tail = name.partition(".")
+                    sub = getattr(cfg, head, None)
+                    if sub is not None and hasattr(sub, tail):
+                        setattr(sub, tail, value)
         cfg.paths.ensure()
         return cfg

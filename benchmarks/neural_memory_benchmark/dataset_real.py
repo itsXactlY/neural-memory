@@ -52,6 +52,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Cap to keep the corpus deterministic and small. Adjust if you want a
 # larger real-text experiment.
+#
+# F10 fix (audit 2026-05-13): the previous cap of 600 silently truncated
+# any caller request larger than that. RealTextGenerator.generate(n) now
+# raises the ceiling to MAX(default, n), so callers can ask for the
+# corpus they actually want.
 _MAX_CHUNKS = 600
 _CHUNK_MIN = 60
 _CHUNK_MAX = 400
@@ -108,10 +113,12 @@ def _chunk_text(text: str) -> List[str]:
         cleaned = " ".join(non_code_lines).strip()
         if len(cleaned) < 20:
             continue
-        # Heuristic: skip code-heavy chunks. Markdown prose has < 0.05
-        # density of [={};] characters per word.
+        # F18 fix (audit 2026-05-13): the comment said "0.05 density" but
+        # the threshold was 0.5 — a 10× discrepancy that let code-heavy
+        # paragraphs slip into the prose corpus. Tightened to 0.05 to
+        # match the comment's intent.
         density = sum(1 for c in cleaned if c in "={};") / max(1, len(cleaned.split()))
-        if density > 0.5:
+        if density > 0.05:
             continue
         if len(buf) + len(cleaned) + 1 <= _CHUNK_MAX:
             buf = (buf + " " + cleaned).strip() if buf else cleaned
@@ -212,36 +219,82 @@ class RealTextGenerator:
 
     def __init__(self, project_root: Optional[Path] = None, seed: int = 42):
         self._rng = random.Random(seed)
+        # F50 fix (audit 2026-05-13): resolve project root via env var first,
+        # then fall back to the three-levels-up heuristic. Lets installed
+        # / relocated copies override the assumption without code edits.
+        import os as _os
+        env_root = _os.environ.get("MM_BENCH_PROJECT_ROOT")
         self._project_root = (
             project_root
             if project_root is not None
-            else Path(__file__).resolve().parent.parent.parent  # repo root
+            else (Path(env_root) if env_root else Path(__file__).resolve().parent.parent.parent)
         )
         # Used per-instance and cleared on each generate() call so two
         # generations from the same instance are independent.
         self._used_anchors: set[str] = set()
+        # Set by generate() so _build_pool can size the pool to demand.
+        self._target_count: int = 0
 
     def _build_pool(self) -> List[Tuple[str, Path]]:
         """Walk the project root and produce a list of (chunk, source) pairs."""
         files = _walk_corpus(self._project_root)
         pool: List[Tuple[str, Path]] = []
+        # F52 fix (audit 2026-05-13): the previous loop appended ALL chunks
+        # of one file before moving on; if the first file was huge, the
+        # pool became dominated by it and the rest of the project was
+        # underrepresented. Round-robin one chunk per file per pass so
+        # the pool is balanced even when sizes vary.
+        # F51 fix (audit 2026-05-13): `errors="ignore"` silently dropped
+        # malformed bytes — producing corrupted snippets that became
+        # garbage embeddings. Use `errors="replace"` instead so we get
+        # U+FFFD replacement chars (visible in inspection) AND we skip
+        # any file whose text ends up >50% replacement chars.
+        per_file: List[List[str]] = []
+        n_skipped_corrupt = 0
         for f in files:
             try:
-                text = f.read_text(errors="ignore")
+                text = f.read_text(errors="replace")
             except (OSError, UnicodeDecodeError):
+                per_file.append([])
                 continue
-            for chunk in _chunk_text(text):
-                pool.append((chunk, f))
-                if len(pool) >= _MAX_CHUNKS * 4:
-                    return pool
+            if text:
+                bad = text.count("�")
+                if bad > 0 and bad / len(text) > 0.5:
+                    n_skipped_corrupt += 1
+                    per_file.append([])
+                    continue
+            per_file.append(list(_chunk_text(text)))
+        if n_skipped_corrupt:
+            import sys as _sys
+            print(f"  [dataset_real] skipped {n_skipped_corrupt} files with "
+                  f">50% encoding-replacement chars", file=_sys.stderr)
+
+        target_size = max(self._target_count or _MAX_CHUNKS, _MAX_CHUNKS) * 4
+        idx = 0
+        active = True
+        while active and len(pool) < target_size:
+            active = False
+            for fi, chunks in enumerate(per_file):
+                if idx < len(chunks):
+                    pool.append((chunks[idx], files[fi]))
+                    active = True
+                    if len(pool) >= target_size:
+                        break
+            idx += 1
         return pool
 
     def generate(self, count: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Return (memories, queries). count is an upper bound; the
         function may return fewer if the project doesn't yield enough
         chunks with unique anchors.
+
+        F10 fix (audit 2026-05-13): remember the requested count so
+        _build_pool can expand the pool when callers ask for more than
+        the historic 600-chunk default — previously any request > 600
+        was silently truncated.
         """
         self._used_anchors.clear()
+        self._target_count = count
         pool = self._build_pool()
         memories: List[Dict[str, Any]] = []
         queries: List[Dict[str, Any]] = []

@@ -92,7 +92,14 @@ class LSTMKnnBenchmark:
         # _enhance_recall actually live.  The prior suite imported
         # Mazemaker and looked for _lstm_knn_ready, which always returned
         # False because that attribute doesn't exist there.
-        mem = Memory(db_path=self.db_path, embedding_backend="auto")
+        # F79 fix (audit 2026-05-13): the previous code reused
+        # self.db_path between runs, so prior-run memories + access
+        # logs polluted subsequent measurements. Mint a fresh temp DB
+        # for each invocation and clean it up in run()'s finally.
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix=".lstm_knn.db", delete=False) as _f:
+            self._tmp_db = _f.name
+        mem = Memory(db_path=self._tmp_db, embedding_backend="auto")
         for m in self.memories:
             mem.remember(m["text"], label=m["label"], auto_connect=True)
 
@@ -124,18 +131,40 @@ class LSTMKnnBenchmark:
             for q in self.queries:
                 mem.recall(q["query"], k=self.k)
 
-        # Toggle off and re-measure on the same Memory instance + DB so the
-        # only changing variable is _enhance_recall firing or not.
+        # F28 fix (audit 2026-05-13): the original order was
+        #   warmup → baseline (off) → enhanced (on)
+        # which let the enhanced arm benefit from the baseline pass's
+        # recall history as additional training data. Run baseline and
+        # enhanced from the SAME warmup snapshot by capturing access
+        # state, measuring one arm, restoring it, then measuring the
+        # other.
+        _logger = getattr(mem, "_access_logger", None)
+        _snapshot = None
+        if _logger is not None and hasattr(_logger, "snapshot"):
+            try:
+                _snapshot = _logger.snapshot()
+            except Exception:
+                _snapshot = None
+
+        def _restore_logger():
+            if _snapshot is not None and hasattr(_logger, "restore"):
+                try:
+                    _logger.restore(_snapshot)
+                except Exception:
+                    pass
+
         prior = mem._lstm_knn_ready
         try:
             mem._lstm_knn_ready = False
-            print("  [baseline] LSTM+kNN forced OFF...")
+            print("  [baseline] LSTM+kNN forced OFF (from warmup snapshot)...")
             results["baseline"] = _measure(mem, self.queries, self.k)
         finally:
             mem._lstm_knn_ready = prior
+        _restore_logger()
 
-        print("  [enhanced] LSTM+kNN active...")
+        print("  [enhanced] LSTM+kNN active (from same warmup snapshot)...")
         results["enhanced"] = _measure(mem, self.queries, self.k)
+        _restore_logger()
 
         results["delta"] = {
             "recall_at_k": round(
@@ -159,3 +188,11 @@ class LSTMKnnBenchmark:
         out = self.output_dir / "lstm_knn_results.json"
         out.write_text(json.dumps(results, indent=2))
         print(f"  [saved] {out}")
+        # F79 cleanup: drop the temp DB we minted in run().
+        tmp_db = getattr(self, "_tmp_db", None)
+        if tmp_db:
+            for ext in ("", "-wal", "-shm"):
+                try:
+                    Path(tmp_db + ext).unlink(missing_ok=True)
+                except Exception:
+                    pass

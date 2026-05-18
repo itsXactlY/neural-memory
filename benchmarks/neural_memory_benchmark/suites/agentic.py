@@ -104,11 +104,22 @@ class AgentWorkflow:
                 turn_timings["graph"].append(time.perf_counter() - t0)
 
             else:  # multi
+                # F21 fix (audit 2026-05-13): the previous code timed the
+                # composite remember+recall as a single block and then
+                # halved it across both buckets, fabricating per-op
+                # latencies that didn't reflect reality. Time each
+                # operation independently and log it to a dedicated
+                # `multi_*` bucket so the "multi" action keeps its own
+                # composite latency too.
                 t0 = time.perf_counter()
                 self.nm.remember(self._random_memory_text(), label="multi", auto_connect=False)
+                rem_dt = time.perf_counter() - t0
+                t1 = time.perf_counter()
                 self.nm.recall(self._random_query(), k=3)
-                turn_timings["remember"].append((time.perf_counter() - t0) / 2)
-                turn_timings["recall"].append((time.perf_counter() - t0) / 2)
+                rec_dt = time.perf_counter() - t1
+                turn_timings.setdefault("multi_remember", []).append(rem_dt)
+                turn_timings.setdefault("multi_recall", []).append(rec_dt)
+                turn_timings.setdefault("multi_total", []).append(rem_dt + rec_dt)
 
         # Summarize timings
         summary = {}

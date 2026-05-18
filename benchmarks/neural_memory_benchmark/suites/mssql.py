@@ -39,7 +39,17 @@ def simulate_sync_batch(
     batch_size: int,
     total_records: int,
 ) -> Dict[str, Any]:
-    """Simulate MSSQL batch sync and measure throughput."""
+    """Drive a real MSSQL batch sync via MSSQLBridge and measure throughput.
+
+    F27 fix (audit 2026-05-13): the previous implementation pretended to
+    "simulate" sync by running `_ = len(batch)` inside a timing block —
+    a literal no-op that measured Python's list-length cost (microseconds).
+    Reported `records_per_second` was therefore millions/sec and totally
+    meaningless. The function is now honest: it requires the MSSQLBridge
+    AND a configured MSSQL endpoint; absent either, it returns a clear
+    skip note instead of fake numbers. F80 fix: drop the embedding BLOB
+    from the SELECT — we never used it and it ballooned memory by ~40MB.
+    """
     try:
         from sync_bridge import MSSQLBridge
         bridge_available = True
@@ -49,15 +59,24 @@ def simulate_sync_batch(
     if not bridge_available:
         return {
             "batch_size": batch_size,
-            "error": "MSSQLBridge not available",
-            "note": "sync_bridge.py not importable",
+            "skipped": True,
+            "reason": "MSSQLBridge not available (sync_bridge.py not importable)",
         }
 
-    # Get records from SQLite
+    import os as _os
+    if not _os.environ.get("MSSQL_SERVER") and not _os.environ.get("MSSQL_DSN"):
+        return {
+            "batch_size": batch_size,
+            "skipped": True,
+            "reason": "MSSQL endpoint not configured (MSSQL_SERVER / MSSQL_DSN unset)",
+        }
+
+    # Get records from SQLite — DO NOT pull the embedding BLOB; we don't
+    # send it to MSSQL and the column is ~4KB per row.
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
-        "SELECT id, content, label, embedding, salience, created_at "
+        "SELECT id, content, label, salience, created_at "
         "FROM memories LIMIT ?",
         (total_records,)
     )
@@ -67,22 +86,42 @@ def simulate_sync_batch(
     if not records:
         return {"error": "No records to sync", "batch_size": batch_size}
 
-    # Measure batched write throughput
+    # Open the bridge and time real round-trips.
+    try:
+        bridge = MSSQLBridge()
+    except Exception as e:
+        return {
+            "batch_size": batch_size,
+            "skipped": True,
+            "reason": f"MSSQLBridge init failed: {e}",
+        }
+
     t0 = time.perf_counter()
     batches = [records[i:i+batch_size] for i in range(0, len(records), batch_size)]
+    n_written = 0
     for batch in batches:
-        # Simulate batch write (no actual MSSQL needed)
-        _ = len(batch)
+        try:
+            bridge.write_batch(batch)
+            n_written += len(batch)
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            return {
+                "batch_size": batch_size,
+                "error": f"write_batch failed: {e}",
+                "records_attempted": len(records),
+                "records_written": n_written,
+                "elapsed_s": round(elapsed, 4),
+            }
     elapsed = time.perf_counter() - t0
-    rate = len(records) / elapsed if elapsed > 0 else 0
+    rate = n_written / elapsed if elapsed > 0 else 0
 
     return {
         "batch_size": batch_size,
-        "total_records": len(records),
+        "total_records": n_written,
         "num_batches": len(batches),
         "elapsed_s": round(elapsed, 4),
         "records_per_second": round(rate, 1),
-        "ms_per_record": round(elapsed / len(records) * 1000, 4) if records else 0,
+        "ms_per_record": round(elapsed / max(1, n_written) * 1000, 4),
     }
 
 

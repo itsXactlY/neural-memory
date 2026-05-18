@@ -17,10 +17,22 @@ from typing import Any, Dict, Optional
 
 
 def load_results(results_path: Path) -> Dict[str, Any]:
-    """Load benchmark results from JSON."""
+    """Load benchmark results from JSON.
+
+    F38 fix (audit 2026-05-13): tolerate truncated / corrupted JSON (e.g.
+    when the bench crashed mid-write) by emitting a user-friendly error
+    instead of crashing the entire report.
+    """
     if not results_path.exists():
         return {}
-    return json.loads(results_path.read_text())
+    try:
+        return json.loads(results_path.read_text())
+    except json.JSONDecodeError as e:
+        import sys as _sys
+        print(f"WARN: {results_path} is not valid JSON ({e}); "
+              f"returning empty results — report will be sparse.",
+              file=_sys.stderr)
+        return {}
 
 
 def color_score(score: float, inverse: bool = False) -> str:
@@ -125,11 +137,20 @@ class ReportGenerator:
             details = ", ".join(f"{k}={v}" for k, v in pdata.items() if k != "elapsed_s")
             lines.append(f"  {phase.upper():<10} {elapsed:>10.2f}s   {details[:40]}")
 
+        # F5 fix (audit 2026-05-13): missing delta keys default to '?'
+        # (string), which crashes ":+d" and ":+.4f". Coerce or fall back
+        # to a literal '?' so the report renders even on incomplete data.
+        def _fmt_int(v):
+            return f"{v:+d}" if isinstance(v, int) else f"{v}"
+
+        def _fmt_float(v):
+            return f"{v:+.4f}" if isinstance(v, (int, float)) else f"{v}"
+
         deltas = data.get("deltas", {})
         lines.append(f"\n  Delta after dream consolidation:")
-        lines.append(f"    Connections: {deltas.get('connections_delta', '?'):+d}")
-        lines.append(f"    Isolated:    {deltas.get('isolated_delta', '?'):+d}")
-        lines.append(f"    Recall@5:    {deltas.get('recall_delta', '?'):+.4f}")
+        lines.append(f"    Connections: {_fmt_int(deltas.get('connections_delta', '?'))}")
+        lines.append(f"    Isolated:    {_fmt_int(deltas.get('isolated_delta', '?'))}")
+        lines.append(f"    Recall@5:    {_fmt_float(deltas.get('recall_delta', '?'))}")
 
         return "\n".join(lines)
 
@@ -295,13 +316,19 @@ class ReportGenerator:
     # ── Agentic ───────────────────────────────────────────────────────────
 
     def render_agentic(self, data: Dict) -> str:
+        # F8 fix (audit 2026-05-13): the previous code did `:.1f` and `:>8.1f`
+        # on values that default to '?' (string) when missing — any missing
+        # field crashed the entire report. Coerce or fall back literally.
+        def _fmt_f(v, spec):
+            return format(v, spec) if isinstance(v, (int, float)) else str(v)
+
         lines = []
         lines.append(section("AGENTIC WORKFLOW BENCHMARK"))
 
         summary = data.get("summary", {})
         lines.append(f"\n  Sessions run:       {summary.get('num_sessions', '?')}")
         lines.append(f"  Total actions:     {summary.get('total_actions', '?')}")
-        lines.append(f"  Avg throughput:     {summary.get('avg_actions_per_second', '?'):.1f} actions/s")
+        lines.append(f"  Avg throughput:     {_fmt_f(summary.get('avg_actions_per_second', '?'), '.1f')} actions/s")
         lines.append(f"  Min/Max:           {summary.get('min_aps', '?')}/{summary.get('max_aps', '?')} actions/s")
 
         agg = summary.get("action_aggregates", {})
@@ -312,8 +339,8 @@ class ReportGenerator:
             for action, adata in agg.items():
                 lines.append(
                     f"  {action:>10} "
-                    f"{adata.get('avg_mean_ms', 0):>10.2f} "
-                    f"{adata.get('avg_p95_ms', 0):>10.2f}"
+                    f"{_fmt_f(adata.get('avg_mean_ms', 0), '>10.2f')} "
+                    f"{_fmt_f(adata.get('avg_p95_ms', 0), '>10.2f')}"
                 )
 
         return "\n".join(lines)
@@ -324,15 +351,17 @@ class ReportGenerator:
         """Render complete console report."""
         lines = []
 
-        # Header
+        # Header. F8 fix: coerce so a partial meta dict can't crash the header.
         meta = self.results.get("meta", {})
+        _rt = meta.get('total_elapsed_s', '?')
+        _rt_s = f"{_rt:>8.1f}" if isinstance(_rt, (int, float)) else f"{_rt:>8}"
         lines.append(f"""
 ╔══════════════════════════════════════════════════════════╗
 ║       NEURAL MEMORY BENCHMARK — RESULTS REPORT           ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Started:  {meta.get('started_at', '?'):<42}║
 ║  Finished: {meta.get('finished_at', '?') if meta.get('finished_at') else 'running':<42}║
-║  Runtime:  {meta.get('total_elapsed_s', '?'):>8.1f}s{' '*33}║
+║  Runtime:  {_rt_s}s{' '*33}║
 ╚══════════════════════════════════════════════════════════╝""")
 
         # Suite renderers
@@ -350,6 +379,17 @@ class ReportGenerator:
 
         errors = self.results.get("errors", {})
 
+        # F37 fix (audit 2026-05-13): warn about any suite present in the
+        # results JSON that has no registered renderer so users know they
+        # are silently missing output.
+        unrendered = [n for n in suites
+                      if n not in renderers and suites[n].get("status") != "error"]
+        if unrendered:
+            lines.append(
+                f"\nNOTE: {len(unrendered)} suite(s) have results but no "
+                f"renderer (won't appear below): {', '.join(unrendered)}"
+            )
+
         for name, sdata in suites.items():
             status = sdata.get("status", "?")
             elapsed = sdata.get("elapsed_s", 0)
@@ -363,7 +403,8 @@ class ReportGenerator:
                 try:
                     result = sdata.get("result", {})
                     lines.append(renderer(result))
-                    lines.append(f"  [Completed in {elapsed:.1f}s]")
+                    _el = f"{elapsed:.1f}" if isinstance(elapsed, (int, float)) else f"{elapsed}"
+                    lines.append(f"  [Completed in {_el}s]")
                 except Exception as e:
                     lines.append(f"\n  ERROR rendering {name}: {e}")
 
@@ -388,7 +429,7 @@ class ReportGenerator:
         # JSON (already done by benchmark, but include metadata)
         json_path = out_dir / "report.json"
         meta = self.results.get("meta", {})
-        meta["report_generated_at"] = datetime.now().isoformat()
+        meta["report_generated_at"] = datetime.now(timezone.utc).isoformat()
         json_path.write_text(json.dumps(self.results, indent=2, default=str))
         print(f"  JSON report: {json_path}")
 
@@ -409,11 +450,34 @@ def generate_report(results_path: Path, output_dir: Optional[Path] = None) -> st
     return output
 
 
+def _default_results_path() -> Path:
+    """Locate the benchmark's most recent results JSON.
+
+    F113 fix (audit 2026-05-13): the previous default pointed at
+    `~/.neural_memory_benchmark/results/` but `benchmark.py` writes to
+    `cfg.paths.results_dir` which the bench's own config resolves to
+    `benchmarks/results/` (or `$NEURAL_BENCH_OUTPUT_DIR/results`).
+    Try the env var first, then the in-repo results dir, then the
+    legacy home-dir location for backwards compat.
+    """
+    candidates = []
+    env = os.environ.get("NEURAL_BENCH_OUTPUT_DIR")
+    if env:
+        candidates.append(Path(env) / "results" / "full_benchmark_results.json")
+    here = Path(__file__).resolve().parent.parent  # benchmarks/
+    candidates.append(here / "results" / "full_benchmark_results.json")
+    candidates.append(Path.home() / ".neural_memory_benchmark" / "results" / "full_benchmark_results.json")
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Generate benchmark report")
-    parser.add_argument("results", nargs="?", type=Path,
-                        default=Path.home() / ".neural_memory_benchmark" / "results" / "full_benchmark_results.json")
+    parser.add_argument("results", nargs="?", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
-    generate_report(args.results, args.output_dir)
+    results_path = args.results or _default_results_path()
+    generate_report(results_path, args.output_dir)

@@ -27,9 +27,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "python"))
 from memory_client import Mazemaker  # noqa: E402
 
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("NEURAL_BENCH_QA_MODEL", "gpt-oss:120b-cloud")
-QA_TIMEOUT_S = float(os.environ.get("NEURAL_BENCH_QA_TIMEOUT", "60"))
+# F33 fix (audit 2026-05-13): the previous code captured OLLAMA_URL /
+# OLLAMA_MODEL at import time, so any env override done AFTER `import qa`
+# was silently ignored. Replace constants with functions that read the
+# environment on every call.
+def _ollama_url() -> str:
+    return os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+
+def _ollama_model() -> str:
+    # Default switched to a model that's actually available on the local
+    # ollama install used by the bench host; old default `gpt-oss:120b-cloud`
+    # was an external cloud alias that was failing silently.
+    return os.environ.get("NEURAL_BENCH_QA_MODEL", "qwen2.5:14b-instruct")
+
+
+def _qa_timeout_s() -> float:
+    return float(os.environ.get("NEURAL_BENCH_QA_TIMEOUT", "60"))
+
+
+# Back-compat module-level names — kept for callers that read them
+# directly. Each is now a no-arg callable mirroring the function above.
+OLLAMA_URL = _ollama_url
+OLLAMA_MODEL = _ollama_model
+QA_TIMEOUT_S = _qa_timeout_s
 
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
@@ -83,10 +104,15 @@ QA_FACTS: List[tuple] = [
 # ── Ollama client ────────────────────────────────────────────────────────────
 
 def ollama_chat(question: str, context_text: str,
-                model: str = OLLAMA_MODEL,
-                timeout: float = QA_TIMEOUT_S) -> Dict[str, Any]:
+                model: Optional[str] = None,
+                timeout: Optional[float] = None) -> Dict[str, Any]:
     """Call ollama /api/chat with the given context+question. Returns
     {answer, latency_s, eval_count, error}."""
+    # Resolve from env at call time so late env overrides take effect.
+    if model is None:
+        model = _ollama_model()
+    if timeout is None:
+        timeout = _qa_timeout_s()
     system = (
         "You answer the user's question using ONLY the provided memory context. "
         "Reply with the shortest possible answer, ideally a single phrase. "
@@ -104,7 +130,7 @@ def ollama_chat(question: str, context_text: str,
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        f"{OLLAMA_URL}/api/chat",
+        f"{_ollama_url()}/api/chat",
         data=body,
         headers={"Content-Type": "application/json"},
     )
@@ -130,7 +156,7 @@ def ollama_chat(question: str, context_text: str,
 
 def ollama_available() -> bool:
     try:
-        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as r:
+        with urllib.request.urlopen(f"{_ollama_url()}/api/tags", timeout=3) as r:
             return r.status == 200
     except Exception:
         return False
@@ -138,8 +164,37 @@ def ollama_available() -> bool:
 
 # ── Scoring ──────────────────────────────────────────────────────────────────
 
+_NEGATION_PATTERNS = (
+    "don't think", "do not think", "isn't", "is not", "not the",
+    "not in", "not mentioned", "no information", "unknown", "cannot",
+    "can't", "doesn't", "does not",
+)
+
+
 def needle_in(text: str, needle: str) -> bool:
-    return (needle or "").lower() in (text or "").lower()
+    """Case-insensitive substring match — with negation-aware filtering.
+
+    F82 fix (audit 2026-05-13): the previous version would accept
+    "I don't think it's fastembed" as a match for needle "fastembed",
+    inflating QA accuracy on hallucinated-but-negated answers. Reject
+    matches that occur inside a negation pattern within a ±50-char
+    window. Not bulletproof but catches the obvious overpermissive cases.
+    """
+    if not needle:
+        return False
+    text_l = (text or "").lower()
+    needle_l = needle.lower()
+    idx = text_l.find(needle_l)
+    if idx < 0:
+        return False
+    # Inspect the local context for negation cues; if any are present in
+    # the window preceding the needle, treat as a miss.
+    window_start = max(0, idx - 50)
+    window = text_l[window_start: idx]
+    for pat in _NEGATION_PATTERNS:
+        if pat in window:
+            return False
+    return True
 
 
 def percentile(data: List[float], p: float) -> float:
@@ -162,7 +217,7 @@ class QABenchmark:
         output_dir: Optional[Path] = None,
         modes: Optional[List[str]] = None,
         top_k: int = 5,
-        model: str = OLLAMA_MODEL,
+        model: Optional[str] = None,
     ):
         self.db_path = db_path
         self.distractor_memories = memories or []
@@ -243,7 +298,7 @@ class QABenchmark:
         print("\n=== QA Benchmark (Ollama LLM-judged) ===")
         if not ollama_available():
             return {
-                "error": f"Ollama not reachable at {OLLAMA_URL}. "
+                "error": f"Ollama not reachable at {_ollama_url()}. "
                          f"Skipping QA suite.",
             }
 

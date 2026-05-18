@@ -42,11 +42,14 @@ def run_concurrent_writers(
 ) -> Dict[str, Any]:
     """Run N concurrent writers inserting memories."""
 
+    # F60 fix (audit 2026-05-13): the previous code captured
+    # start_time = [time.perf_counter()] BEFORE the executor was set up,
+    # so the measured elapsed window included executor construction +
+    # future submission overhead. Use plain local variables and start
+    # the clock immediately before the work begins.
     errors = []
     completed = [0]
     lock = threading.Lock()
-    start_time = [time.perf_counter()]
-    end_time = [None]
 
     def writer_task(writer_id: int):
         try:
@@ -67,12 +70,20 @@ def run_concurrent_writers(
                 errors.append(f"writer_{writer_id}: {e}")
 
     with ThreadPoolExecutor(max_workers=num_writers) as ex:
+        # F98 fix (audit 2026-05-13): submit + wait for results. The
+        # `as_completed` iteration in the original was harmless but
+        # silently discarded any exceptions raised inside writer_task.
+        # Pull each future to surface failures into `errors`.
         futures = [ex.submit(writer_task, i) for i in range(num_writers)]
-        for f in as_completed(futures):
-            pass  # Wait for completion
+        t_start = time.perf_counter()
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                with lock:
+                    errors.append(f"executor: {e}")
+        elapsed = time.perf_counter() - t_start
 
-    end_time[0] = time.perf_counter()
-    elapsed = end_time[0] - start_time[0]
     total_ops = completed[0]
     rate = total_ops / elapsed if elapsed > 0 else 0
 
@@ -93,20 +104,30 @@ def run_concurrent_readers(
     ops_per_reader: int,
     query_texts: List[str],
 ) -> Dict[str, Any]:
-    """Run N concurrent readers querying memories."""
-    nm = Mazemaker(db_path=db_path, embedding_backend="auto")
+    """Run N concurrent readers querying memories.
 
+    F22 fix (audit 2026-05-13): the previous implementation shared one
+    Mazemaker instance across all reader threads. Mazemaker's internal
+    state (FTS5 connections, embedding caches, HNSW handles) is not
+    thread-safe under concurrent recall(). Each reader now owns its
+    own Mazemaker instance against the same DB — sqlite handles
+    parallel readers natively under WAL mode, which is what this suite
+    is actually trying to measure.
+    """
     latencies = []
     errors = []
     lock = threading.Lock()
 
     def reader_task(reader_id: int):
         local_latencies = []
+        # Per-thread Mazemaker against the shared DB. WAL handles
+        # concurrent SELECTs cleanly.
+        nm_local = Mazemaker(db_path=db_path, embedding_backend="auto")
         try:
             for i in range(ops_per_reader):
                 q = query_texts[i % len(query_texts)]
                 t0 = time.perf_counter()
-                nm.recall(q, k=10)
+                nm_local.recall(q, k=10)
                 local_latencies.append(time.perf_counter() - t0)
         except Exception as e:
             with lock:
@@ -114,6 +135,10 @@ def run_concurrent_readers(
         finally:
             with lock:
                 latencies.extend(local_latencies)
+            try:
+                nm_local.close()
+            except Exception:
+                pass
 
     threads = [threading.Thread(target=reader_task, args=(i,)) for i in range(num_readers)]
     t0 = time.perf_counter()

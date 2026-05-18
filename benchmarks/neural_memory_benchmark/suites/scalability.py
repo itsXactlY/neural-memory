@@ -103,15 +103,45 @@ class ScalabilityBenchmark:
             nm = Mazemaker(db_path=tier_db, embedding_backend="auto")
 
             # How many memories from our pool?
-            pool = self.memories * ((tier // max(len(self.memories), 1)) + 1)
-            pool = pool[:tier]
+            # F25 fix (audit 2026-05-13): `self.memories * N` shallow-replicates
+            # the same dict references, so the embedding cache hits on EVERY
+            # duplicate — measuring cache speed, not real-world ingestion.
+            # F26 fix: checkpoint WAL periodically during the loop so disk
+            # usage stays bounded on 500k-row tiers.
+            import copy as _copy
+            base = self.memories or []
+            repeats = (tier // max(len(base), 1)) + 1
+            pool: List[Dict[str, Any]] = []
+            for r in range(repeats):
+                if len(pool) >= tier:
+                    break
+                for src in base:
+                    if len(pool) >= tier:
+                        break
+                    mem = _copy.deepcopy(src)
+                    # Suffix the text so identical inputs become distinct
+                    # cache keys; embedding pipeline now sees unique work.
+                    mem["text"] = f"{mem.get('text','')} [rep{r}]"
+                    mem["id"] = f"{mem.get('id','mem')}-r{r}-{len(pool):07d}"
+                    pool.append(mem)
 
-            # Measure insert rate
+            # Measure insert rate. Per PERF_STRATEGY.md, throughput suites
+            # use auto_connect=False + detect_conflicts=False so we measure
+            # bare-ingest cost. Graph-aware ingest is covered by graph.py.
             t0 = time.perf_counter()
+            _checkpoint_every = 50_000
             for i, m in enumerate(pool):
-                nm.remember(m["text"], label=m["label"])
+                nm.remember(m["text"], label=m["label"],
+                            auto_connect=False, detect_conflicts=False)
                 if (i + 1) % 5000 == 0:
                     print(f"    inserted {i+1}/{tier}...")
+                if (i + 1) % _checkpoint_every == 0:
+                    try:
+                        _conn = sqlite3.connect(tier_db)
+                        _conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        _conn.close()
+                    except Exception:
+                        pass
             insert_time = time.perf_counter() - t0
             insert_rate = tier / insert_time if insert_time > 0 else 0
 
@@ -123,8 +153,15 @@ class ScalabilityBenchmark:
             except Exception:
                 pass
 
-            # Measure retrieval latency
-            sample_queries = [m["text"][:80] for m in pool[:min(100, len(pool))]]
+            # Measure retrieval latency.
+            # F84 fix (audit 2026-05-13): the previous query sample was the
+            # FIRST 100 entries of the pool, biasing toward most-recent
+            # writes. Use a deterministic random sample across the entire
+            # pool so latency reflects steady-state retrieval.
+            import random as _random
+            _qrng = _random.Random(self.cfg_seed if hasattr(self, "cfg_seed") else 42 + tier)
+            _sample_idx = _qrng.sample(range(len(pool)), min(100, len(pool)))
+            sample_queries = [pool[i]["text"][:80] for i in _sample_idx]
             t0 = time.perf_counter()
             for q in sample_queries:
                 nm.recall(q, k=10)
@@ -146,16 +183,22 @@ class ScalabilityBenchmark:
                   f"DB: {stats.get('db_size_mb', '?')}MB, "
                   f"WAL: {stats.get('wal_size_mb', '?')}MB")
 
-            # Cleanup
+            # Cleanup — F85 fix (audit 2026-05-13): the previous block
+            # wrapped close + unlink in one try/except, so a `close()`
+            # failure caused `unlink()` to be skipped, leaking the temp
+            # DB on disk. Each step now lives in its own except so
+            # cleanup is best-effort but won't be short-circuited.
             try:
                 nm.close()
-                os.unlink(tier_db)
-                for ext in ["-wal", "-shm"]:
-                    p = tier_db + ext
-                    if os.path.exists(p):
-                        os.unlink(p)
             except Exception:
                 pass
+            for ext in ("", "-wal", "-shm"):
+                p = tier_db + ext
+                try:
+                    if os.path.exists(p):
+                        os.unlink(p)
+                except Exception:
+                    pass
 
         # Summary: does retrieval rate degrade?
         tier_results = results["tiers"]

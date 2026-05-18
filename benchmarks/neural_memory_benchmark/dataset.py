@@ -14,6 +14,7 @@ Dataset types:
 """
 import hashlib
 import json
+import os
 import random
 import re
 import time
@@ -262,7 +263,10 @@ class FactualGenerator(BaseGenerator):
     ]
 
     def generate(self, count: int) -> Generator[Dict[str, Any], None, None]:
-        # Cycle through entity groups with variations
+        # F2 fix (audit 2026-05-13): honour the `count` argument from the
+        # caller (was previously ignoring it in favour of self.count, which
+        # made corpus-size knobs dead). F45 fix: clamp the alphabetic
+        # qualifier so chr(65+variation) doesn't wander past 'Z' into '['.
         for i in range(count):
             base_idx = i % len(self.ENTITIES)
             entity, predicate, object_ = self.ENTITIES[base_idx]
@@ -270,9 +274,10 @@ class FactualGenerator(BaseGenerator):
             # Add variations to make each unique
             variation = i // len(self.ENTITIES)
             if variation > 0:
+                _alpha = chr(65 + (variation % 26))  # F45: wrap at Z
                 qualifiers = [
                     f"at scale tier {variation}",
-                    f"in project {chr(65+variation)}",
+                    f"in project {_alpha}",
                     f"after {variation} iterations",
                     f"with {variation} concurrent users",
                 ]
@@ -720,6 +725,14 @@ class QueryGenerator:
     """
     Generates ground-truth queries from stored memories.
     Each query has a known set of relevant memories for recall measurement.
+
+    F46 caveat (audit 2026-05-13): queries are constructed by sampling
+    tokens from the source memory text. That gives BM25/FTS retrievers a
+    trivial lexical overlap — recall numbers from this generator are
+    upper bounds, not realistic. For honest semantic retrieval
+    measurement use `dataset_v2.ParaphraseGenerator` (disjoint
+    vocabulary) or `dataset_real.RealTextGenerator` (real prose with
+    anchored entities and rephrased queries).
     """
 
     def __init__(self, memories: List[Dict[str, Any]], seed: int = 42):
@@ -755,16 +768,30 @@ class QueryGenerator:
             else:
                 query_text = text[:60]
 
+            # F16 fix (audit 2026-05-13): the previous implementation
+            # treated EVERY memory under the label as relevant — for a
+            # label with 500 entries Recall@1 became near-meaningless
+            # (any of 500 hits scored 1.0). The true relevant target is
+            # the specific memory the query was derived from; we record
+            # all same-label memories as `related_ids` for callers that
+            # want a wider recall pool, but the primary ground truth is
+            # the singular source.
             queries.append({
                 "query": query_text,
                 "label": label,
-                "ground_truth_ids": [m["id"] for m in candidates],
-                "num_relevant": len(candidates),
+                "ground_truth_ids": [source["id"]],
+                "related_ids": [m["id"] for m in candidates if m["id"] != source["id"]],
+                "num_relevant": 1,
             })
         return queries
 
+    # F47 fix (audit 2026-05-13): `generate_temporal_queries` was never
+    # called anywhere — kept here as a public helper for ad-hoc temporal
+    # probing, but it is no longer wired into the main benchmark flow.
+    # If you find yourself wanting time-range queries, call this directly
+    # and feed the result to a suite that understands `timestamp`.
     def generate_temporal_queries(self, count: int = 20) -> List[Dict[str, Any]]:
-        """Generate time-range and recency queries."""
+        """Generate time-range and recency queries (helper, not on the main path)."""
         temporal_memories = [
             m for m in self.memories
             if m.get("metadata", {}).get("type") == "temporal"
@@ -792,6 +819,11 @@ class MasterDataset:
     for recall queries.
     """
 
+    # F48 fix (audit 2026-05-13): the GENERATORS dict was unused — the
+    # actual generator instantiation lives in `generate()` as an explicit
+    # spec list (F17 fix). Repurpose this as a public registry so external
+    # callers can introspect / extend, and `generate()` reads from it
+    # rather than carrying duplicate type info.
     GENERATORS = {
         "episodic": EpisodicGenerator,
         "factual": FactualGenerator,
@@ -815,18 +847,24 @@ class MasterDataset:
         graph: int = 500,
         adversarial: int = 500,
     ) -> List[Dict[str, Any]]:
-        """Generate all memories and return as a flat list."""
+        """Generate all memories and return as a flat list.
+
+        F17 fix (audit 2026-05-13): the previous implementation used
+        `locals()[name]` to map generator names back to their count
+        parameter — fragile because any added local variable matching a
+        generator name silently changed corpus size. Bind explicitly.
+        """
         all_memories = []
-        generators = {
-            "episodic": EpisodicGenerator(seed=self.seed, count=episodic),
-            "factual": FactualGenerator(seed=self.seed + 1),
-            "temporal": TemporalGenerator(seed=self.seed + 2, count=temporal),
-            "conversational": ConversationalGenerator(seed=self.seed + 3),
-            "graph": GraphGenerator(seed=self.seed + 4),
-            "adversarial": AdversarialGenerator(seed=self.seed + 5),
-        }
-        for name, gen in generators.items():
-            count = locals()[name]
+        # Explicit (name, generator, count) triples — no introspection magic.
+        spec = [
+            ("episodic",       EpisodicGenerator(seed=self.seed, count=episodic),         episodic),
+            ("factual",        FactualGenerator(seed=self.seed + 1),                       factual),
+            ("temporal",       TemporalGenerator(seed=self.seed + 2, count=temporal),     temporal),
+            ("conversational", ConversationalGenerator(seed=self.seed + 3),                conversational),
+            ("graph",          GraphGenerator(seed=self.seed + 4),                         graph),
+            ("adversarial",    AdversarialGenerator(seed=self.seed + 5),                   adversarial),
+        ]
+        for _name, gen, count in spec:
             for memory in gen.generate(count):
                 all_memories.append(memory)
 
@@ -855,12 +893,16 @@ class MasterDataset:
             if tier <= len(all_memories):
                 scales[tier] = all_memories[:tier]
             else:
-                # Scale up by cycling through generated data
+                # Scale up by cycling through generated data. F3 fix (audit
+                # 2026-05-13): `dict(mem)` is shallow — the inner `metadata`
+                # dict was still shared with the source list, so any later
+                # metadata mutation poisoned the seed pool and downstream
+                # scales. copy.deepcopy detaches metadata too.
+                import copy as _copy
                 repeats = (tier // len(all_memories)) + 1
                 scaled = (all_memories * repeats)[:tier]
-                # Add unique IDs to avoid collisions
                 for i, mem in enumerate(scaled):
-                    mem = dict(mem)
+                    mem = _copy.deepcopy(mem)
                     mem["id"] = f"scaled-{tier}-{i:07d}-{sha256(mem['text'])[:6]}"
                     scaled[i] = mem
                 scales[tier] = scaled
@@ -870,12 +912,21 @@ class MasterDataset:
 # ── CLI helpers ───────────────────────────────────────────────────────────────
 
 def load_or_generate_dataset(config=None, seed: int = 42) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Load from cache or generate fresh dataset.
-    Returns (memories, queries).
+    """Load from cache or generate fresh dataset. Returns (memories, queries).
+
+    F49 fix (audit 2026-05-13): the default cache path used to hard-code
+    `~/.neural_memory_benchmark/data/dataset.json` with no way to
+    override outside the `config` arg. Now honours
+    NEURAL_BENCH_DATASET_CACHE env var and falls back to the historic
+    default. Note: this helper is NOT on the main benchmark flow today,
+    but exists for ad-hoc callers (notebooks, scripts).
     """
     cfg = config or {}
-    cache_path = Path(cfg.get("cache_path", "~/.neural_memory_benchmark/data/dataset.json")).expanduser()
+    cache_path = Path(
+        cfg.get("cache_path")
+        or os.environ.get("NEURAL_BENCH_DATASET_CACHE")
+        or "~/.neural_memory_benchmark/data/dataset.json"
+    ).expanduser()
 
     if cache_path.exists():
         data = json.loads(cache_path.read_text())

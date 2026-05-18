@@ -84,8 +84,26 @@ _STOPWORDS = frozenset({
 # was per-instance, so the continuity suite (which used a separate noise
 # generator) hit ~8 anchor collisions at the 5K noise tier and silently
 # polluted ground-truth lookup.
+#
+# F4 fix (audit 2026-05-13): persisting across runs in the same Python
+# process broke reproducibility — same seed → different output if a prior
+# run already populated the set. `reset_global_anchors()` is now called at
+# the top of every public dataset-generation helper, and callers that need
+# strict isolation (tests, mm_10m_eval) can call it explicitly. The lock
+# remains so concurrent generators stay safe.
 _GLOBAL_ANCHOR_LOCK = __import__("threading").Lock()
 _GLOBAL_ANCHORS: set[str] = set()
+
+
+def reset_global_anchors() -> None:
+    """Clear the cross-instance anchor registry.
+
+    Call this at the start of any benchmark run that expects deterministic
+    output from a fixed seed. Module-level state otherwise persists across
+    runs in the same Python process and breaks reproducibility.
+    """
+    with _GLOBAL_ANCHOR_LOCK:
+        _GLOBAL_ANCHORS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +371,12 @@ def generate_continuity_pairs(seed: int = 42, count: int = 50) -> List[Dict[str,
     early, then noise sessions store unrelated content (also paraphrase-style
     so retrieval has to discriminate by meaning, not recency). The query in
     'session N' asks for the original fact's answer.
+
+    F54 fix (audit 2026-05-13): reset the global anchor registry so a fixed
+    seed produces the same pairs regardless of prior generator calls in the
+    same Python process.
     """
+    reset_global_anchors()
     gen = ParaphraseGenerator(seed=seed)
     pairs: List[Dict[str, Any]] = []
     for _ in range(count):
@@ -524,7 +547,11 @@ def generate_concept_continuity_pairs(seed: int = 42, count: int = 50) -> List[D
       * looping count targets to mint statements,
       * for each noise tier > 0, picking 1-2 distractors per target, formatting
         with a freshly-coined anchor, and adding them to all retrievers.
+
+    F53 fix (audit 2026-05-13): reset the global anchor registry so a fixed
+    seed produces the same pairs regardless of prior generator calls.
     """
+    reset_global_anchors()
     gen = ParaphraseGenerator(seed=seed)
     rng = random.Random(seed)
 
@@ -579,7 +606,11 @@ def generate_conflict_pairs(seed: int = 42, count: int = 30) -> List[Dict[str, A
     The winner is always the REPLACEMENT (latest write). A correct system
     should rank the replacement above the original after both are stored.
     Both share an anchor so semantic retrieval finds both candidates.
+
+    F54 fix (audit 2026-05-13): reset the global anchor registry so a fixed
+    seed produces the same conflict pairs regardless of call order.
     """
+    reset_global_anchors()
     rng = random.Random(seed)
     out: List[Dict[str, Any]] = []
     pgen = ParaphraseGenerator(seed=seed + 1)

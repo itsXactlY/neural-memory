@@ -121,10 +121,15 @@ class LeanSkynetBenchmark:
             # Record the actual channel_weights the mode used so the
             # comparison is auditable (lean must show 0 for bm25/
             # temporal/salience).
-            try:
-                stats["channel_weights"] = dict(mem._sqlite_memory._channel_weights)
-            except Exception:
-                stats["channel_weights"] = None
+            # F78 fix (audit 2026-05-13): walk attributes defensively so
+            # the suite reports `unavailable` (not None) when the layout
+            # shifts, instead of silently zeroing a load-bearing field.
+            inner = getattr(mem, "_sqlite_memory", None) or mem
+            cw = getattr(inner, "_channel_weights", None)
+            if isinstance(cw, dict):
+                stats["channel_weights"] = dict(cw)
+            else:
+                stats["channel_weights"] = "unavailable (engine internal layout changed)"
             results["modes"][mode] = stats
             print(f"    R@{self.k}={stats['recall_at_k']}  MRR={stats['mrr']}  "
                   f"p50={stats['p50_ms']}ms  p95={stats['p95_ms']}ms")

@@ -62,11 +62,12 @@ class ConflictBenchmark:
             ("PPR uses teleportation probability 0.15.", "PPR teleportation is 0.3."),
         ]
 
-        for i, (orig, conflict) in enumerate(conflict_pairs):
-            # Store original
-            mid1 = nm.remember(orig, label="conflict_test", auto_connect=False)
-            # Store conflict — should be detected
-            mid2 = nm.remember(conflict, label="conflict_test", auto_connect=False)
+        # F100 fix (audit 2026-05-13): mid1/mid2 were assigned but never
+        # read. Drop the bindings so the loop is straightforwardly a
+        # side-effect on the store.
+        for orig, conflict in conflict_pairs:
+            nm.remember(orig, label="conflict_test", auto_connect=False)
+            nm.remember(conflict, label="conflict_test", auto_connect=False)
 
         print(f"  Stored {len(conflict_pairs) * 2} conflicting memories")
 
@@ -109,11 +110,18 @@ class ConflictBenchmark:
 
         results["recall_quality"] = quality_results
 
-        # 4. Salience decay simulation
+        # 4. Salience decay simulation.
+        # F61 fix (audit 2026-05-13): the previous code always queried
+        # `pair[0]` from each conflict tuple — i.e. only half the conflict
+        # facts ever got accessed, biasing salience telemetry. Sample a
+        # random side of each pair so both branches of every conflict
+        # appear roughly equally often.
         print("\n[4] Salience decay simulation...")
         t0 = time.perf_counter()
         for i in range(100):
-            nm.recall(random.choice(conflict_pairs)[0], k=3)
+            pair = random.choice(conflict_pairs)
+            side = pair[random.randrange(0, len(pair))]
+            nm.recall(side, k=3)
         access_time = time.perf_counter() - t0
 
         # Check if accessing memories changes their salience

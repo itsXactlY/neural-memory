@@ -74,9 +74,18 @@ class ConflictQualityBenchmark:
         # supersession enabled (default) and once with it forced off.
         results_per_arm: Dict[str, Dict[str, Any]] = {}
 
+        # F62 fix (audit 2026-05-13): the control arm used to live at
+        # `self.db_path + ".ctrl"` which PERSISTED between runs and
+        # silently carried prior memories into subsequent measurements.
+        # Use a fresh temp DB per arm and clean both up afterwards.
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix=".db", delete=False) as _f_a, \
+             _tf.NamedTemporaryFile(suffix=".db", delete=False) as _f_c:
+            _arm_a, _arm_c = _f_a.name, _f_c.name
+        self._tmp_arm_dbs = [_arm_a, _arm_c]
         for arm_label, dc_flag, db_path in (
-            ("with_supersession", True, self.db_path),
-            ("control_no_supersession", False, self.db_path + ".ctrl"),
+            ("with_supersession", True, _arm_a),
+            ("control_no_supersession", False, _arm_c),
         ):
             nm = Mazemaker(db_path=db_path, embedding_backend="auto")
             # Mazemaker.remember has a detect_conflicts kwarg; the control
@@ -130,6 +139,13 @@ class ConflictQualityBenchmark:
         out = self.output_dir / "conflict_quality_results.json"
         out.write_text(json.dumps(out_results, indent=2))
         print(f"  [saved] {out}")
+        # F62 cleanup: drop the temp arm DBs we created.
+        for _p in getattr(self, "_tmp_arm_dbs", []):
+            for ext in ("", "-wal", "-shm"):
+                try:
+                    Path(_p + ext).unlink(missing_ok=True)
+                except Exception:
+                    pass
         return out_results
 
     def _measure_one_arm(self, nm: Mazemaker, pairs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -139,10 +155,18 @@ class ConflictQualityBenchmark:
         loser_above_winner = 0
         per_topic: Dict[str, List[int]] = {}
 
+        # F97 fix (audit 2026-05-13): if _unique_token returned an empty
+        # string (no distinguishing token), the pair was silently
+        # counted as a miss. Track skipped pairs so the report can
+        # distinguish "real miss" from "no measurable marker".
+        n_skipped = 0
         for p in pairs:
             results = nm.recall(p["query"], k=self.k)
             winner_marker = self._unique_token(p["replacement"], p["original"])
             loser_marker = self._unique_token(p["original"], p["replacement"])
+            if not winner_marker and not loser_marker:
+                n_skipped += 1
+                continue
 
             wrank = _rank_of(winner_marker, results) if winner_marker else 0
             lrank = _rank_of(loser_marker, results) if loser_marker else 0
@@ -158,13 +182,18 @@ class ConflictQualityBenchmark:
 
             per_topic.setdefault(p["topic"], []).append(wrank)
 
-        n = len(pairs)
+        # F97: denominator is the number of pairs we actually measured,
+        # not the total pairs (which included unmeasurable ones).
+        n_measured = len(pairs) - n_skipped
+        n_for_rate = max(1, n_measured)
         return {
-            "n_conflict_pairs": n,
-            "winner_rank_1_rate": round(winner_top1 / n, 4) if n else 0.0,
-            "winner_in_top_3_rate": round(winner_top3 / n, 4) if n else 0.0,
-            "winner_anywhere_rate": round(winner_anywhere / n, 4) if n else 0.0,
-            "loser_above_winner_rate": round(loser_above_winner / n, 4) if n else 0.0,
+            "n_conflict_pairs": len(pairs),
+            "n_measured": n_measured,
+            "n_skipped_no_marker": n_skipped,
+            "winner_rank_1_rate": round(winner_top1 / n_for_rate, 4),
+            "winner_in_top_3_rate": round(winner_top3 / n_for_rate, 4),
+            "winner_anywhere_rate": round(winner_anywhere / n_for_rate, 4),
+            "loser_above_winner_rate": round(loser_above_winner / n_for_rate, 4),
             "per_topic_mean_winner_rank": {
                 t: round(statistics.mean([r for r in ranks if r > 0]), 2) if any(r > 0 for r in ranks) else None
                 for t, ranks in per_topic.items()

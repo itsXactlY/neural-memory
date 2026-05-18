@@ -53,7 +53,11 @@ def _measure(mem: Memory, queries: List[Dict[str, Any]], k: int = 5) -> Dict[str
     return {
         "recall_at_k": round(hits / n, 4),
         "mrr": round(statistics.mean(rrs), 4) if rrs else 0.0,
-        "p50_ms": round(sorted(latencies_ms)[len(latencies_ms) // 2], 3),
+        # F95 + F118 fix (audit 2026-05-13): use statistics.median for a
+        # proper interpolated median on even-sized samples (the lower
+        # median bias of `sorted(...)[len//2]` skews comparisons across
+        # suites that use different conventions).
+        "p50_ms": round(statistics.median(latencies_ms), 3) if latencies_ms else 0.0,
         "n": n,
     }
 
@@ -91,8 +95,22 @@ class ChannelAblationBenchmark:
         # IMPORTANT: pass channel_weights=None so Mazemaker uses its own
         # built-in defaults — that's what production callers do, and the
         # ablation arms must be measured against the same baseline.
-        baseline_mem = self._build(channel_weights=None)
-        baseline = _measure(baseline_mem, self.queries, self.k)
+        #
+        # F59 fix (audit 2026-05-13): the previous baseline reused the
+        # caller-provided self.db_path while each ablation arm minted a
+        # fresh temp DB. Different WAL/HNSW/FTS5 states made the
+        # comparison invalid. Build the baseline in its own temp DB too
+        # so the only varying factor is the channel weight set.
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile(suffix=".db", delete=False) as _f:
+            base_db = _f.name
+        self.db_path_orig = self.db_path
+        self.db_path = base_db
+        try:
+            baseline_mem = self._build(channel_weights=None)
+            baseline = _measure(baseline_mem, self.queries, self.k)
+        finally:
+            self.db_path = self.db_path_orig
         print(f"  all channels   : R@{self.k}={baseline['recall_at_k']}  MRR={baseline['mrr']}")
 
         # Resolve the actual default weight dict from the live instance

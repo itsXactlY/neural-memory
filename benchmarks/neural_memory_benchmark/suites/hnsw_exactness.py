@@ -92,8 +92,23 @@ def _build_and_query(
 
         # Belt-and-braces: even if the C++ bridge sneakily attached
         # itself, null it out so recall() takes pure-Python paths.
-        if getattr(nm, "_cpp", None) is not None:
-            nm._cpp = None
+        #
+        # F23 fix (audit 2026-05-13): the original blanket `nm._cpp = None`
+        # also disabled any C++ helpers used outside kNN (SIMD cosine,
+        # graph ops), giving a degraded "exact" baseline that wasn't
+        # comparable to the HNSW arm. Switch to use_cpp=False at engine
+        # construction (already done above) and only null _cpp if it
+        # exposes a search method — the kNN search path is what we want
+        # to suppress, not the auxiliary helpers.
+        cpp = getattr(nm, "_cpp", None)
+        if cpp is not None and hasattr(cpp, "search"):
+            # Wrap rather than null so other helpers keep working.
+            class _NoKnnCpp:
+                def __getattr__(self, name):
+                    if name == "search":
+                        raise AttributeError("kNN disabled for exactness control")
+                    return getattr(cpp, name)
+            nm._cpp = _NoKnnCpp()
 
         # Sanity: confirm config flags landed where we think they did.
         assert nm._rerank is False, "rerank flag did not propagate"
@@ -109,9 +124,12 @@ def _build_and_query(
 
         # Probe recall to materialize the HNSW index (lazy via _ensure_hnsw)
         # before we start timing query latency. We discard the result.
-        if queries:
+        # F75 fix (audit 2026-05-13): `if queries:` does not protect against
+        # an empty string at index 0 — guard explicitly.
+        _probe = next((q for q in queries if isinstance(q, str) and q.strip()), None)
+        if _probe is not None:
             try:
-                nm.recall(queries[0], k=k)
+                nm.recall(_probe, k=k)
             except Exception:
                 pass
 
@@ -141,13 +159,21 @@ def _build_and_query(
             )
 
         latencies: List[float] = []
-        ids_per_query: List[List[int]] = []
+        # F24 fix (audit 2026-05-13): recall results can carry non-numeric
+        # ids ("episodic-000000") under the synthetic dataset, so the
+        # blanket int() coercion crashed. Use whatever id-like key the
+        # backend exposes verbatim — overlap comparisons compare strings
+        # just as well as ints.
+        ids_per_query: List[List[Any]] = []
         if not hnsw_did_not_activate:
             for q in queries:
                 t0 = time.perf_counter()
                 results = nm.recall(q, k=k)
                 latencies.append(time.perf_counter() - t0)
-                ids_per_query.append([int(r.get("id", -1)) for r in results])
+                ids_per_query.append([
+                    r.get("id", r.get("memory_id", r.get("label")))
+                    for r in results
+                ])
 
         print(f"      [{arm}] retrieval_path: {retrieval_path}")
 
@@ -241,13 +267,21 @@ class HNSWExactnessBenchmark:
                 continue
 
             # Per-query overlap of HNSW's top-k with exact's top-k.
+            # F24 + F76 fix (audit 2026-05-13):
+            #   * Ids may be strings — filter on truthiness, not `>= 0`.
+            #   * Old metric `intersection / |exact|` was asymmetric: if
+            #     `exact` returned only 2 results and `hnsw` returned 10
+            #     wildly different ones, both could contain those 2 and
+            #     score 1.0. Use Jaccard over the union, which penalises
+            #     spurious extras AND missed hits symmetrically.
             overlaps: List[float] = []
             for ex_ids, ann_ids in zip(exact["ids_per_query"], ann["ids_per_query"]):
-                ex_set = set(i for i in ex_ids if i >= 0)
-                ann_set = set(i for i in ann_ids if i >= 0)
-                if not ex_set:
+                ex_set = {i for i in ex_ids if i not in (None, "", -1)}
+                ann_set = {i for i in ann_ids if i not in (None, "", -1)}
+                union = ex_set | ann_set
+                if not union:
                     continue
-                overlaps.append(len(ex_set & ann_set) / len(ex_set))
+                overlaps.append(len(ex_set & ann_set) / len(union))
 
             speedup_p50 = (
                 exact["p50_ms"] / ann["p50_ms"]
