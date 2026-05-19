@@ -28,6 +28,167 @@ That's it. The rest of this README goes deeper the further you scroll.
 
 ---
 
+## 🚀 Official Beta — 2026-05-19
+
+> **Free for the entire beta.** No credit card, no quota gate, no "trial" countdown.
+> Self-host the community engine forever under AGPLv3, or take the managed Pro stack
+> while we burn the launch budget. We'll tell you well in advance when billing turns on.
+
+The cognition stack went from **three layers to six.** The audit-grade v8
+LongMemEval-S R@5 = 0.9787 number stands. On top of it, a 100-iteration
+benchmark-driven engineering loop crossed every internal stretch target on
+the harder full-corpus oracle harness:
+
+| Headline metric                           | iter00 anchor | **iter100 champion** | Δ          |
+|-------------------------------------------|:-------------:|:--------------------:|:----------:|
+| R@5  (LongMemEval-oracle 500q, full corpus) | 0.6851       | **0.8426**           | **+15.75 pp** |
+| R@10                                       | 0.7383        | **0.9000**           | **+16.17 pp** |
+| R@1                                        | 0.5000        | **0.6255**           | **+12.55 pp** |
+| MRR                                        | 0.5777        | **0.7124**           | **+13.47 pp** |
+| ssu R@10 (single-session-user)             | 0.7344        | **1.0000**           | **+26.56 pp** |
+
+The full 1.6 GB claim-evidence bundle (pg_dump of the oracle corpus + every
+iteration's JSON + the 8-round v8 audit transcripts) is downloadable from
+[ProtonDrive](https://drive.proton.me/urls/J2T53B95XC#gtbM3E2mTvjt) ·
+SHA-256 `263e2494…`. Run the same numbers on your machine end-to-end.
+
+### What shipped between v8 and beta — six layers, in order
+
+1. **Sponge ingestion** *(community)* — turn-by-turn absorption + session-end
+   atomic fact extraction. Conflict detection at write time.
+2. **Atomic Fact Extraction (AFE)** *(Pro)* — four-stage formation pipeline.
+   Stage A (markdown structure) · Stage B (spaCy NER) · Stage C (one local
+   LLM call per session, sub-1B model, user-state focused — `user prefers X`,
+   `user owns Y`) · Stage S (synthesis crystallization during dream).
+   **Bulk-write refactor: 88 min → 75 s per 500 sources, a 70× speedup.**
+3. **Embedding — semantic + late-interaction + graph-aware** *(community: BGE-M3
+   + ColBERT; Pro: + DAE)*. ColBERT@1.5 stays load-bearing (-13 pp R@5 without
+   it). DAE (Dream-Augmented Embeddings) — second embedding built during NREM
+   that weights toward graph neighbours — now wired through PostgresStore end
+   to end (was silently disabled on PG until 2026-05-14).
+4. **Three-phase dream consolidation** *(community: NREM; Pro: + REM + Insight)*
+   — GPU-accelerated. NREM Personalized PageRank ran ~38 s for a 193 k-corpus
+   full cycle on RTX-class CUDA (down from "never finished" on CPU). REM bulk
+   bridge writes via single staged transaction. Insight clusters via Louvain
+   over the consolidated graph.
+5. **Synthesis crystallization (Stage S)** *(Pro)* — selective LLM-distilled
+   memory formation. ~10 % yield by design — the dilution dance is real and
+   bounded.
+6. **Targeted re-formation** *(Pro)* — the lever that broke the R@5 = 0.7404
+   retrieval-tuning ceiling. Identify per-question-type gold sessions that
+   aren't in top-5, surgical query-conditional Stage C rebake on just those
+   sessions. ~$0.07 in API spend lifted ssp R@5 0.3667 → 0.7000 (+33 pp),
+   ssu R@5 0.6406 → 0.9375 (+30 pp), tr R@5 0.6535 → 0.7874 (+13 pp).
+
+The community engine ships layers 1, 3 (partial), and 4. The full six-layer
+stack — the one that ran the 100-iteration loop to R@5 = 0.8426 — ships on
+the managed Pro tier.
+
+### Introducing the Inception Bench
+
+The most important thing we shipped this cycle isn't an engine improvement,
+it's a benchmark methodology. **The published memory benchmarks we tested
+against had a measured ~50 % rubric-defect rate on update-tracking items
+and a ~20 % defect rate on BEAM-10M conv-1.** External LLM judges drift by
+**16 percentage points on identical answers** depending on which judge you
+pick. We documented every failure mode (transcripts in
+[`benchmarks/audit/`](benchmarks/audit/)) and then we did the only thing
+that makes sense after you watch your scoreboard rot in real time: we
+inception'd the benchmark.
+
+**Inception Benchmarking** is the discipline we now ship as
+[`benchmarks/mazemaker_memory_bench.py`](benchmarks/mazemaker_memory_bench.py):
+
+- **One file. 12 deterministic scenarios. No LLM in the scoring loop.**
+- Score is `label in [r["label"] for r in top_k]`. Substring + unit-aware
+  match against a canonical gold string. Deterministic. Reproducible
+  bit-for-bit.
+- Scenarios include needle-in-100k-haystack (R@1 = 1.000 on 100,010-fact
+  corpus), conflict-fuse, distractor-resistance, negation, multi-fact
+  retrieval, latency at 10k, and a dream-ablation control arm.
+- Macro mean: R@1 = 0.888 / R@5 = 0.924 / R@10 = 0.972.
+- Failure modes are documented, not hidden — S9 graph-traversal still
+  scores R@1 = 0.000 and we say so.
+
+Run it yourself in 60 seconds:
+
+```bash
+git clone https://github.com/itsXactlY/mazemaker && cd mazemaker
+pip install -r requirements.txt
+python benchmarks/mazemaker_memory_bench.py
+```
+
+The blog post [Inception Benchmarking — the benchmark that did not exist](https://mazemaker.online/blog/inception-benchmarking/)
+walks through every external rubric defect we found, every judge calibration
+spread we measured, and why the only honest path forward is to publish your
+own scorer alongside your own engine.
+
+### Engineering deliverables — non-exhaustive, since v8
+
+- **Postgres + pgvector** is now the primary backend for Pro/Enterprise.
+  `MM_DB_BACKEND=postgres` flips it; the community SQLite-WAL path stays.
+- **Atomic Fact Extraction bulk-write** — 70× speedup, single bulk embed +
+  `executemany` INSERT, single commit per cycle.
+- **DAE end-to-end wiring** — read path (`PostgresStore.fetch_dae_vectors`)
+  + compute path (`dae_bulk_compute` is now store-agnostic) + cadence knob
+  (`_dae_recompute_every`, default 5).
+- **GPU dream cycle** — full 193 k-corpus cycle in ~38 s. NREM PPR via
+  `torch.sparse.mm` + `topk` on GPU. REM batched recall + bulk bridge writes.
+  CPU fallback automatic for non-CUDA installs.
+- **REM FK guard** — `add_bridges_batch` anti-joins against `memories` on
+  both endpoints. NREM can prune mid-cycle without aborting the whole REM
+  phase. (`bug:rem-fk-violation-stale-gpu-ids`, patched 2026-05-17.)
+- **`prune_orphans` rewritten** as NOT EXISTS — 10 min hang → milliseconds on
+  the same 333 k-memory corpus.
+- **Embed-server collision fix** — `MM_EMBED_SOCK_PATH` env var documented;
+  bench orchestrators run convs sequentially by default.
+- **Inception Bench corpus** — single `pg_restore`, four BEAM scales plus the
+  full LongMemEval triplet, SHA-256-provenanced. 957 MB snapshot, ~3 s
+  restore. The blog post
+  [The Mazemaker bench corpus now lives in Postgres](https://mazemaker.online/blog/why-our-bench-corpus-now-lives-in-postgres/)
+  has the full migration story.
+
+### Beyond the engine — the surrounding surface
+
+- **The Architect cockpit** — [architect.mazemaker.dev](https://architect.mazemaker.dev/),
+  a 12-monitor SPA inspired by *The Matrix Reloaded*. Hosted UI, local data
+  (loopback to your pod), zero compromise. Read the
+  [page-deep-dive](https://mazemaker.online/architect/).
+- **Hermes Skill Indexing** — one button in the Architect indexes every
+  Hermes skill (~230 on a typical operator install) as a memory with
+  `skill:<source>:<name>` label. Public-prefix gate in `wonderland/daemon.py`
+  skips AES so the embedding stays semantically searchable.
+- **Four-domain topology** — `mazemaker.online` (marketing + install) ·
+  `mazemaker.dev` (passkey dev console + `mzm-*` API keys) ·
+  `api.mazemaker.dev` (Hetzner-backed license/onboard, never sees memory
+  content) · `architect.mazemaker.dev` (the cockpit SPA). Memory data never
+  crosses the network. The [topology page](https://mazemaker.online/topology/)
+  has the request-flow diagram and the data-segregation table.
+- **Onboarding deep-dive** — the
+  [onboarding page](https://mazemaker.online/onboarding/) walks the install
+  one-liner through ten idempotent stages (pre-flight → fingerprint init →
+  browser handoff → license JWT → embedding choice → Quadlet render →
+  pod boot → health check).
+- **The 1.6 GB reproducibility bundle** — restorable `pg_dump` + 100-iter
+  JSONs + 8-round audit transcripts + bench-loop logs.
+  [ProtonDrive link](https://drive.proton.me/urls/J2T53B95XC#gtbM3E2mTvjt) ·
+  SHA-256 `263e2494…`.
+
+### Bench-noise discipline (read before citing any number)
+
+godbench R@5 has ±0.5 pp run-to-run noise at n=500. ssp at n=30 has
+3.3 pp per-question granularity. Real wins require either a delta clearly
+above the noise band or multi-iteration replication. iter34/35/37/38 all
+hit ssp R@5 = 0.3667 — that's a real signal because it appeared four
+times. Single-run outliers shouldn't anchor "best" claims.
+
+External judge attribution is mandatory: the same 442 mm_10m_eval answers
+read 0.36 (nano), 0.49 (Opus), 0.53 (Haiku), or 0.64 (gpt-5.4-mini)
+depending on judge. If you see a memory-benchmark number without judge
+attribution, treat it as decoration.
+
+---
+
 ## Get it running
 
 > **TL;DR.** Easiest path is the one-line managed install — it sets up
@@ -135,6 +296,15 @@ A vector database with cosine similarity will do the first row of the table belo
 
 R@10 = "the right answer is in the top-10 results", scored 0..1. Higher is better.
 Full numbers, the JSON dumps, and the suite catalog: [`benchmarks/README.md`](benchmarks/README.md).
+
+> **Beta — May 2026.** The headline numbers in this section come from the
+> v8 audit (per-question ephemeral harness). They still stand. The harder
+> full-corpus oracle harness, plus the new Inception Bench results from
+> the 100-iteration loop, are at the
+> [top of this README](#-official-beta--2026-05-19).
+> The two harness families measure different things — see
+> [`invariant:godbench-vs-v8-harness-mismatch`](#) below before
+> comparing the numbers side-by-side.
 
 ### Public benchmark numbers — LongMemEval-S 500-question retrieval
 
