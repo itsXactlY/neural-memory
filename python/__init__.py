@@ -138,9 +138,148 @@ MAZEMAKER_GRAPH_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
+MAZEMAKER_RECALL_MULTI_SCHEMA = {
+    "name": "mazemaker_recall_multi",
+    "description": (
+        "MULTI-ANGLE recall: run two-or-more query phrasings in parallel "
+        "and fuse the results via Reciprocal Rank Fusion. Call this when "
+        "you suspect one phrasing might miss the right memory because the "
+        "user phrased the stored fact differently. Example: gold memory "
+        "says 'I love espresso', user later asks 'what coffee do I "
+        "prefer' — single-shot recall on either phrasing alone may miss "
+        "the other; multi-angle with both phrasings catches both. "
+        "Two-to-five angles is the sweet spot; more is rarely worth the "
+        "tokens. Falls back to plain recall on engines without the "
+        "multi-recall feature."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "angles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Two or more query phrasings to recall in parallel. "
+                    "Vary entity wording, time framing, and explicit-vs-"
+                    "implicit framing across angles."
+                ),
+            },
+            "k": {
+                "type": "integer",
+                "description": "Max fused results to return (default 5).",
+            },
+            "fuse": {
+                "type": "boolean",
+                "description": (
+                    "Default true (RRF-fused flat list). Set false to "
+                    "receive raw per-angle results as a list of lists."
+                ),
+            },
+        },
+        "required": ["angles"],
+    },
+}
+
+MAZEMAKER_RECALL_ADVANCED_SCHEMA = {
+    "name": "mazemaker_recall_advanced",
+    "description": (
+        "ADVANCED recall — same query/answer shape as mazemaker_recall, "
+        "but exposes per-call channel tuning: ColBERT and DAE weights, "
+        "temporal weight, MMR lambda for diversity, score-percentile "
+        "filter, and retrieval mode. Use only when the default calibration "
+        "of mazemaker_recall is missing a result you know exists. The "
+        "engine's default channel weights are bench-tuned for the median "
+        "corpus; overriding them is a debugging tool, not the hot path."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search phrase.",
+            },
+            "k": {
+                "type": "integer",
+                "description": "Max results to return (default 5).",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["semantic", "hybrid", "advanced", "skynet", "lean", "trim"],
+                "description": (
+                    "Retrieval mode. Default inherits the engine setting; "
+                    "use 'lean' for fast prose recall, 'skynet' for the "
+                    "full multi-channel fusion."
+                ),
+            },
+            "colbert_weight": {
+                "type": "number",
+                "description": (
+                    "Per-call ColBERT@1.5 rerank weight. 0 = off, >1 = "
+                    "emphasised. Bench champion is 2.5–3.0."
+                ),
+            },
+            "dae_weight": {
+                "type": "number",
+                "description": (
+                    "Per-call Dream-Augmented Embeddings channel weight. "
+                    "0 = off, 1 = baseline."
+                ),
+            },
+            "temporal_weight": {
+                "type": "number",
+                "description": (
+                    "Recency-decay weight in the relevance formula. "
+                    "Default 0.2; higher emphasises freshly-stored memories."
+                ),
+            },
+            "score_percentile": {
+                "type": "number",
+                "description": (
+                    "Drop the bottom X fraction of candidates by rank "
+                    "before truncating to k. Range [0, 1)."
+                ),
+            },
+            "mmr_lambda": {
+                "type": "number",
+                "description": (
+                    "Maximal-marginal-relevance diversity weight. "
+                    "0 = off (default), higher = more diversity."
+                ),
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+MAZEMAKER_CLASSIFY_INTENT_SCHEMA = {
+    "name": "mazemaker_classify_intent",
+    "description": (
+        "CLASSIFY a query's intent without running a recall. Returns one of "
+        "{preference, temporal, factual, general}. Cheap regex — no LLM, "
+        "no embedding. Useful as a routing decision: preference-intent "
+        "queries benefit from mazemaker_recall_multi with rephrased "
+        "angles; factual-intent queries are usually one-shot; temporal-"
+        "intent queries benefit from a higher temporal_weight in "
+        "mazemaker_recall_advanced."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The query to classify.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 ALL_TOOL_SCHEMAS = [
     MAZEMAKER_REMEMBER_SCHEMA,
     MAZEMAKER_RECALL_SCHEMA,
+    MAZEMAKER_RECALL_MULTI_SCHEMA,
+    MAZEMAKER_RECALL_ADVANCED_SCHEMA,
+    MAZEMAKER_CLASSIFY_INTENT_SCHEMA,
     MAZEMAKER_THINK_SCHEMA,
     MAZEMAKER_GRAPH_SCHEMA,
 ]
@@ -993,6 +1132,12 @@ memory?") call `neural_graph` to summarise.
             return self._handle_remember(args)
         elif tool_name == "mazemaker_recall":
             return self._handle_recall(args)
+        elif tool_name == "mazemaker_recall_multi":
+            return self._handle_recall_multi(args)
+        elif tool_name == "mazemaker_recall_advanced":
+            return self._handle_recall_advanced(args)
+        elif tool_name == "mazemaker_classify_intent":
+            return self._handle_classify_intent(args)
         elif tool_name == "mazemaker_think":
             return self._handle_think(args)
         elif tool_name == "mazemaker_graph":
@@ -1256,6 +1401,91 @@ memory?") call `neural_graph` to summarise.
             return json.dumps({"results": results, "count": len(results)})
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
+        except Exception as exc:
+            return tool_error(str(exc))
+
+    def _handle_recall_multi(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
+        try:
+            angles = args.get("angles")
+            if not isinstance(angles, list) or not angles:
+                return tool_error("angles must be a non-empty list of strings")
+            angles = [a for a in angles if isinstance(a, str) and a.strip()]
+            if not angles:
+                return tool_error("angles must contain at least one non-empty string")
+            k = self._coerce_int(args.get("k"), 5)
+            k = max(1, min(k, 50))
+            fuse = bool(args.get("fuse", True))
+            results = self._memory.recall_multi(angles, k=k, fuse=fuse)
+            return json.dumps({"results": results, "count": len(results),
+                               "angles": angles, "fused": fuse})
+        except Exception as exc:
+            return tool_error(str(exc))
+
+    def _handle_recall_advanced(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
+        try:
+            query = args.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return tool_error("query must be a non-empty string")
+            k = self._coerce_int(args.get("k"), 5)
+            k = max(1, min(k, 50))
+            kwargs: Dict[str, Any] = {}
+            for fname, ftype in (
+                ("mode", str),
+                ("colbert_weight", float),
+                ("dae_weight", float),
+                ("temporal_weight", float),
+                ("score_percentile", float),
+                ("mmr_lambda", float),
+            ):
+                v = args.get(fname)
+                if v is None:
+                    continue
+                try:
+                    kwargs[fname if fname != "mode" else "_mode"] = ftype(v)
+                except (TypeError, ValueError):
+                    return tool_error(f"{fname} must be coercible to {ftype.__name__}")
+            # `mode` doesn't map to a recall() kwarg directly — it sets
+            # the engine's retrieval_mode for this call's hybrid/skynet
+            # routing. We translate via `hybrid` + `rerank` heuristics.
+            mode = kwargs.pop("_mode", None)
+            if mode is not None:
+                if mode in {"hybrid", "advanced", "skynet", "lean", "trim"}:
+                    kwargs["hybrid"] = True
+                elif mode == "semantic":
+                    kwargs["hybrid"] = False
+            # Map ColBERT/DAE weights → enable flags too.
+            if "colbert_weight" in kwargs:
+                kwargs["enable_colbert"] = kwargs["colbert_weight"] > 0
+            if "dae_weight" in kwargs:
+                kwargs["enable_dae"] = kwargs["dae_weight"] > 0
+            results = self._memory.recall(query, k=k, **kwargs)
+            return json.dumps({"results": results, "count": len(results),
+                               "applied": {k: v for k, v in kwargs.items()
+                                           if k not in {"hybrid"}}})
+        except Exception as exc:
+            return tool_error(str(exc))
+
+    def _handle_classify_intent(self, args: dict) -> str:
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
+        try:
+            query = args.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return tool_error("query must be a non-empty string")
+            # _classify_intent is a classmethod on the Mazemaker class.
+            # _memory is the Memory wrapper; reach the underlying Mazemaker
+            # via its `_inner` attribute when present, else use the class
+            # of the wrapper itself.
+            inner = getattr(self._memory, "_inner", self._memory)
+            classify = getattr(inner, "_classify_intent", None)
+            if classify is None:
+                return tool_error("intent classifier not available")
+            intent = classify(query)
+            return json.dumps({"query": query, "intent": intent})
         except Exception as exc:
             return tool_error(str(exc))
 
