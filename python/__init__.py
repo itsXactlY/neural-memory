@@ -274,6 +274,70 @@ MAZEMAKER_CLASSIFY_INTENT_SCHEMA = {
     },
 }
 
+# Per-phase dream-trigger tools — fission of mazemaker_dream's phase
+# enum into a flat tool surface. Each tool takes no params and
+# dispatches to Memory.dream(phase=<X>) via the engine. Pro-only
+# phases (afe / synthesis / dae) return a structured skipped payload
+# on community licenses.
+_DREAM_PHASE_TOOL_DESCRIPTIONS = {
+    "mazemaker_dream_nrem": (
+        "Run NREM only: replay + strengthen active edges + prune "
+        "inactive ones. Three-slice sampling (recent / random / "
+        "low-salience). Ships in Community."
+    ),
+    "mazemaker_dream_supersedes": (
+        "Run SUPERSEDES phase only: cross-session conflict detection "
+        "via cosine similarity + numeric-token overlap. Marks the "
+        "older memory '[SUPERSEDED]' and records the revision. "
+        "Ships in Community."
+    ),
+    "mazemaker_dream_rem": (
+        "Run REM phase only: bridge-discovery between isolated "
+        "memories via batched semantic recall. Returns bridges found "
+        "+ isolated-memory queue depth. Ships in Community."
+    ),
+    "mazemaker_dream_insight": (
+        "Run Insight phase only: Louvain community detection on the "
+        "connection graph + cluster-summary memories with anchor "
+        "samples. Ships in Community."
+    ),
+    "mazemaker_dream_afe": (
+        "Run AFE phase only: Atomic Fact Extraction Stage A (markdown) "
+        "→ Stage B (NER) → Stage C (LLM user-state). Bulk-writes "
+        "atomic facts with 'afe:auto' label. Pro feature; community "
+        "calls return a structured skipped payload."
+    ),
+    "mazemaker_dream_synthesize": (
+        "Run Stage S synthesis phase only: LLM-distilled "
+        "crystallisation of cross-source patterns from AFE-candidate "
+        "clusters. ~10% yield by design. Pro feature."
+    ),
+    "mazemaker_dream_dae": (
+        "Run DAE phase only: recompute Dream-Augmented Embeddings — "
+        "the second embedding vector weighted toward graph neighbours. "
+        "Full-corpus pass. Pro feature."
+    ),
+}
+DREAM_PHASE_TOOL_ALIAS = {
+    "mazemaker_dream_nrem":       "nrem",
+    "mazemaker_dream_supersedes": "supersedes",
+    "mazemaker_dream_rem":        "rem",
+    "mazemaker_dream_insight":    "insight",
+    "mazemaker_dream_afe":        "afe",
+    "mazemaker_dream_synthesize": "synthesis",
+    "mazemaker_dream_dae":        "dae",
+}
+
+_DREAM_PHASE_SCHEMAS = [
+    {
+        "name": tool_name,
+        "description": _DREAM_PHASE_TOOL_DESCRIPTIONS[tool_name],
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }
+    for tool_name in DREAM_PHASE_TOOL_ALIAS
+]
+
+
 ALL_TOOL_SCHEMAS = [
     MAZEMAKER_REMEMBER_SCHEMA,
     MAZEMAKER_RECALL_SCHEMA,
@@ -282,6 +346,7 @@ ALL_TOOL_SCHEMAS = [
     MAZEMAKER_CLASSIFY_INTENT_SCHEMA,
     MAZEMAKER_THINK_SCHEMA,
     MAZEMAKER_GRAPH_SCHEMA,
+    *_DREAM_PHASE_SCHEMAS,
 ]
 
 
@@ -1142,7 +1207,25 @@ memory?") call `neural_graph` to summarise.
             return self._handle_think(args)
         elif tool_name == "mazemaker_graph":
             return self._handle_graph(args)
+        elif tool_name in DREAM_PHASE_TOOL_ALIAS:
+            return self._handle_dream_phase(DREAM_PHASE_TOOL_ALIAS[tool_name])
         return tool_error(f"Unknown tool: {tool_name}")
+
+    def _handle_dream_phase(self, phase: str) -> str:
+        """Per-phase dream trigger.  Dispatches to Memory.dream(phase=<X>).
+
+        Pro-gated phases (afe / synthesis / dae) return their own
+        structured 'skipped: pro_feature' payload on community licenses
+        via the engine — we don't gate here so the response shape stays
+        consistent across tiers.
+        """
+        if self._memory is None:
+            return tool_error("Neural memory provider not initialized")
+        try:
+            result = self._memory.dream(phase=phase)
+            return json.dumps({"phase": phase, "result": result})
+        except Exception as exc:
+            return tool_error(str(exc))
 
     def _strip_injected_context(self, content: str) -> str:
         """Remove ephemeral memory/tool context wrappers before extraction."""
