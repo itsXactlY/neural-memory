@@ -900,8 +900,9 @@ class Memory:
     def dream(self, phase: str = "all") -> dict:
         """Run a single dream cycle synchronously.
 
-        phase: 'nrem' | 'rem' | 'insight' | 'all' (default).
-        Returns the per-phase stats dict the engine logs.
+        phase: one of 'nrem', 'supersedes', 'rem', 'insight', 'afe',
+        'synthesis', 'dae', or 'all' (default — orchestrated 7-phase
+        cycle).  Returns the per-phase stats dict.
         """
         # When MM_DREAM_DISABLED is set, return a structured "skipped"
         # response instead of raising — the architect dashboard's M02
@@ -926,10 +927,18 @@ class Memory:
             return eng.dream_now()
         if phase == "nrem":
             return {"nrem": eng._phase_nrem()}
+        if phase == "supersedes":
+            return {"supersedes": eng._phase_supersedes()}
         if phase == "rem":
             return {"rem": eng._phase_rem()}
         if phase == "insight":
             return {"insights": eng._phase_insights()}
+        if phase == "afe":
+            return {"afe": eng._phase_afe()}
+        if phase == "synthesis":
+            return {"synthesis": eng._phase_synthesis()}
+        if phase == "dae":
+            return {"dae": eng._phase_dae()}
         raise ValueError(f"unknown dream phase: {phase}")
 
     def dream_stats(self) -> dict:

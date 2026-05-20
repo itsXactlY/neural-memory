@@ -4224,8 +4224,12 @@ class Mazemaker:
     def dream(self, phase: str = "all") -> dict:
         """Run a single dream cycle synchronously.
 
-        phase: 'nrem' | 'rem' | 'insight' | 'all' (default).
-        Returns the per-phase stats dict.
+        phase: one of 'nrem', 'supersedes', 'rem', 'insight', 'afe',
+        'synthesis', 'dae', or 'all' (default — runs the orchestrated
+        7-phase cycle).  Returns the per-phase stats dict.  Pro-only
+        phases (afe / synthesis / dae) return their own
+        skipped-because-of-tier shape on community licenses; the call
+        does not raise.
         """
         # See mazemaker.Memory.dream — same MM_DREAM_DISABLED guard so the
         # MCP wrapper returns a structured "skipped" response instead of
@@ -4248,10 +4252,18 @@ class Mazemaker:
             return eng.dream_now()
         if phase == "nrem":
             return {"nrem": eng._phase_nrem()}
+        if phase == "supersedes":
+            return {"supersedes": eng._phase_supersedes()}
         if phase == "rem":
             return {"rem": eng._phase_rem()}
         if phase == "insight":
             return {"insights": eng._phase_insights()}
+        if phase == "afe":
+            return {"afe": eng._phase_afe()}
+        if phase == "synthesis":
+            return {"synthesis": eng._phase_synthesis()}
+        if phase == "dae":
+            return {"dae": eng._phase_dae()}
         raise ValueError(f"unknown dream phase: {phase}")
 
     def dream_stats(self) -> dict:
