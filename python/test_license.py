@@ -168,25 +168,51 @@ class LicenseLoaderTests(_BaseTestCase):
         self.assertTrue(license_.has("rem"))
         self.assertFalse(license_.has("postgres"))
 
-    def test_payg_tier_no_pro_features(self) -> None:
-        # Lite tier — managed install of the community feature set;
-        # Pro features stay locked.
+    def test_payg_tier_normalises_to_lite_no_pro_features(self) -> None:
+        # Legacy payg vocabulary normalises to "lite".
         os.environ["MM_LICENSE_JWT"] = _make_jwt(self.priv,
                                                  tier="payg",
                                                  backend="sqlite")
         license_ = lic.load_license(self.pubkey_pem)
-        self.assertEqual(license_.tier, "payg")
+        self.assertEqual(license_.tier, "lite")
         self.assertFalse(license_.has("colbert"))
         self.assertFalse(license_.has("rem"))
         self.assertFalse(license_.has("architect"))
 
-    def test_free_tier_no_pro_features(self) -> None:
+    def test_free_tier_normalises_to_community_no_pro_features(self) -> None:
         os.environ["MM_LICENSE_JWT"] = _make_jwt(self.priv,
                                                  tier="free",
                                                  backend="sqlite")
         license_ = lic.load_license(self.pubkey_pem)
-        self.assertEqual(license_.tier, "free")
+        self.assertEqual(license_.tier, "community")
         self.assertFalse(license_.has("colbert"))
+
+    def test_lite_tier_jwt_passes_through(self) -> None:
+        # New backend vocabulary — minted after 2026-05-20.
+        os.environ["MM_LICENSE_JWT"] = _make_jwt(self.priv,
+                                                 tier="lite",
+                                                 backend="sqlite")
+        license_ = lic.load_license(self.pubkey_pem)
+        self.assertEqual(license_.tier, "lite")
+        self.assertFalse(license_.has("colbert"))
+
+    def test_community_tier_jwt_passes_through(self) -> None:
+        os.environ["MM_LICENSE_JWT"] = _make_jwt(self.priv,
+                                                 tier="community",
+                                                 backend="sqlite")
+        license_ = lic.load_license(self.pubkey_pem)
+        self.assertEqual(license_.tier, "community")
+        self.assertFalse(license_.has("colbert"))
+
+    def test_normalize_tier_helper(self) -> None:
+        self.assertEqual(lic._normalize_tier("free"), "community")
+        self.assertEqual(lic._normalize_tier("payg"), "lite")
+        self.assertEqual(lic._normalize_tier("community"), "community")
+        self.assertEqual(lic._normalize_tier("lite"), "lite")
+        self.assertEqual(lic._normalize_tier("pro"), "pro")
+        self.assertEqual(lic._normalize_tier("enterprise"), "enterprise")
+        # Unknown values pass through unchanged.
+        self.assertEqual(lic._normalize_tier("future_tier"), "future_tier")
 
     # ---- expiry ---------------------------------------------------------
 

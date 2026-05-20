@@ -42,7 +42,7 @@ _NUMERIC_TOKEN_RE = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
-from license import has_feature  # Pro feature gate for REM + Insight phases
+from license import has_feature  # Pro feature gates (dae, synthesis, …)
 
 try:
     import networkx as nx
@@ -1833,18 +1833,11 @@ class DreamEngine:
         2. Search via embedding similarity for unconnected but similar
         3. Create tentative bridge connections (weight 0.1-0.3)
 
-        Pro feature.  Community installs early-return without touching
-        the dream-session table — they get NREM-only consolidation.
+        All tiers — the bridge-discovery phase ships with the
+        community build.  Pro-only enhancements (DAE-augmented
+        candidate scoring, Stage S synthesis on top of bridged
+        clusters) live behind their own gates.
         """
-        if not has_feature("rem"):
-            logger.info(
-                "REM phase skipped — Pro feature.  Engine running "
-                "NREM-only consolidation.  See "
-                "https://mazemaker.online/#pricing"
-            )
-            return {"skipped": "pro_feature", "explored": 0,
-                    "bridges": 0, "rejected": 0}
-
         stats = {"explored": 0, "bridges": 0, "rejected": 0}
         session_id = self._backend.start_session("rem")
 
@@ -1954,16 +1947,13 @@ class DreamEngine:
           5. Emit cluster insights with capped theme-sample SQL.
           6. Emit bridge insights, all batched into one transaction.
           7. Flush all dream_insights rows via add_insights_batch (1 commit).
+
+        All tiers — community detection + cluster summarisation
+        ship with the community build.  Stage S LLM-distilled
+        synthesis on top of these clusters is the Pro layer-5
+        feature, gated separately in `_phase_synthesis`.
         """
         import numpy as np
-        if not has_feature("insight"):
-            logger.info(
-                "Insight phase skipped — Pro feature.  No derived:* "
-                "cluster memories will be crystallised this cycle.  "
-                "See https://mazemaker.online/#pricing"
-            )
-            return {"skipped": "pro_feature", "communities": 0,
-                    "bridges": 0, "insights": 0, "derived_facts": 0}
         stats = {"communities": 0, "bridges": 0, "insights": 0, "derived_facts": 0}
         session_id = self._backend.start_session("insight")
         t_phase = time.perf_counter()

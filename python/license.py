@@ -30,19 +30,20 @@ license_schema.py for the canonical Pydantic model).  Required claims:
 
 * iss        = "mazemaker.dev"
 * aud        = "mazemaker-pod"
-* tier       ∈ {free, payg, pro, enterprise}
+* tier       ∈ {community, lite, pro, enterprise}
+                 (legacy: {free, payg} accepted as aliases for
+                 {community, lite} — see `_normalize_tier`)
 * exp, nbf, iat, jti, sub, kid, user_id
 * grace_until = exp + 7 days
 * backend    ∈ {sqlite, postgres}
 
 Tier → feature mapping (engine-side derivation):
 
-* community (no JWT)         → no Pro features
-* free                       → no Pro features
-* payg (Lite)                → no Pro features (Lite = managed install
-                                of the community feature set)
-* pro                        → all features
-* enterprise                 → all features
+* community (no JWT, or JWT tier=community/free) → no Pro features
+* lite (JWT tier=lite/payg)                      → no Pro features (Lite = managed install
+                                                    of the community feature set)
+* pro                                            → all features
+* enterprise                                     → all features
 
 The Postgres backend is additionally gated by ``claims.backend ==
 "postgres"`` — Pro/Enterprise tiers can opt-in or out via JWT.
@@ -100,10 +101,29 @@ JWT_AUDIENCE = "mazemaker-pod"
 JWT_ALGORITHM = "EdDSA"
 JWT_ISSUER = "mazemaker.dev"
 
-# Tiers that grant Pro features.  "free" and "payg" are paid/onboarded
-# but get the same engine feature set as community — the Lite (payg)
-# tier upsells managed install + email support, not engine features.
+# Tiers that grant Pro features.  Community and Lite carry no Pro
+# features — Lite upsells managed install + email support, not engine
+# capability.
 PRO_TIERS = frozenset({"pro", "enterprise"})
+
+# Legacy JWT tier vocabulary → current vocabulary.  Backend started
+# minting community/lite tier values 2026-05-20; existing JWTs in the
+# wild still carry free/payg until they refresh.  Both are honored.
+_TIER_ALIASES = {
+    "free": "community",
+    "payg": "lite",
+}
+
+
+def _normalize_tier(jwt_tier: str) -> str:
+    """Map a JWT-emitted tier string to the engine's canonical tier.
+
+    Accepts both the new vocabulary (community/lite/pro/enterprise) and
+    the legacy vocabulary (free/payg/pro/enterprise).  Unknown values
+    pass through unchanged so future tier names can roll out without an
+    engine update first.
+    """
+    return _TIER_ALIASES.get(jwt_tier, jwt_tier)
 
 # All feature names recognised by the engine.  Additions are
 # forward-compatible (new gate sites can be introduced without
@@ -354,13 +374,14 @@ def load_license(pubkey_pem: Optional[bytes] = None) -> License:
     if claims is None:
         log.warning(
             "license verification failed; engine is running in community "
-            "mode (hybrid recall, NREM-only dream, SQLite, CLI/MCP). "
-            "Pro features (ColBERT, REM/Insight phases, Architect UI, "
-            "dream-worker, Postgres) are disabled."
+            "mode (hybrid recall, three-phase dream consolidation, "
+            "SQLite, CLI/MCP). Pro features (ColBERT@1.5, DAE, AFE "
+            "Stage C, Stage S synthesis, Architect UI, dream-worker "
+            "daemon, Postgres backend) are disabled."
         )
         return License()
 
-    tier = str(claims.get("tier", "community"))
+    tier = _normalize_tier(str(claims.get("tier", "community")))
     backend = str(claims.get("backend", "sqlite"))
     features = _features_for_tier(tier, backend)
 
